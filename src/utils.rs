@@ -3,14 +3,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
+use k8s_openapi::api::core::v1::{Container, Namespace, Pod, PodSpec};
 use kube::{
     api::{ObjectMeta, PostParams},
     config::{KubeConfigOptions, Kubeconfig},
     Api, Client, Config, ResourceExt,
 };
 
-const NGINX_POD: LazyCell<Pod> = LazyCell::new(|| Pod {
+pub const NGINX_POD: LazyCell<Pod> = LazyCell::new(|| Pod {
     metadata: ObjectMeta {
         name: Some(String::from("nginx-pod")),
         ..Default::default()
@@ -33,6 +33,31 @@ pub async fn setup_client(kubeconfig_path: &Path) -> anyhow::Result<Client> {
     let client = Client::try_from(config)?;
     Ok(client)
 }
+
+pub async fn create_namespace_if_not_exists(client: Client, namespace: &str) -> anyhow::Result<()> {
+    let namespaces_api: Api<Namespace> = Api::all(client);
+    let namespace_list = namespaces_api.list(&Default::default()).await?;
+    if namespace_list
+        .items
+        .iter()
+        .any(|ns| ns.metadata.name.as_deref() == Some(namespace))
+    {
+        return Ok(());
+    }
+
+    let namespace = Namespace {
+        metadata: ObjectMeta {
+            name: Some(String::from(namespace)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    namespaces_api
+        .create(&PostParams::default(), &namespace)
+        .await?;
+    Ok(())
+}
 pub async fn create_pod_in_default_namespace(
     client: Client,
     pod: &Pod,
@@ -45,6 +70,7 @@ pub async fn create_pod_in_namespace(
     pod: &Pod,
     namespace: &str,
 ) -> anyhow::Result<Api<Pod>> {
+    create_namespace_if_not_exists(client.clone(), namespace).await?;
     create_pod(client, pod, Some(namespace)).await
 }
 
@@ -60,6 +86,26 @@ pub async fn create_pod(
 
     pods_api.create(&PostParams::default(), &pod).await?;
     Ok(pods_api)
+}
+
+pub async fn get_pod_in_namespace(
+    client: Client,
+    pod_name: &str,
+    namespace: &str,
+) -> anyhow::Result<Pod> {
+    let pods_api = Api::<Pod>::namespaced(client, namespace);
+    let pod = pods_api.get(pod_name).await?;
+    Ok(pod)
+}
+
+pub async fn delete_pod_in_namespace(
+    client: Client,
+    pod_name: &str,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    let pods_api = Api::<Pod>::namespaced(client, namespace);
+    pods_api.delete(pod_name, &Default::default()).await?;
+    Ok(())
 }
 
 #[cfg(test)]
