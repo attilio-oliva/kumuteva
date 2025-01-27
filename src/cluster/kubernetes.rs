@@ -1,11 +1,13 @@
-use anyhow::Result;
-use k8s_openapi::api::core::v1::{Namespace, Pod};
+use anyhow::{Error, Result};
+use k8s_openapi::api::core::v1::{Namespace, Pod, ServiceAccount};
 use kube::api::{ListParams, ObjectList, ObjectMeta};
 use kube::config::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{api::PostParams, Api, Client};
+use tokio::time::sleep;
 
 use std::path::Path;
+use std::time::Duration;
 
 /// An abstraction over a Kubernetes client.
 /// This struct is used to interact with a Kubernetes cluster using `kube` crate.
@@ -79,6 +81,25 @@ impl KubernetesCluster {
         let pods = api.list(&ListParams::default()).await?;
         Ok(pods)
     }
+
+    async fn ensure_cluster_is_ready(&self) -> anyhow::Result<()> {
+        let service_accounts: Api<ServiceAccount> = Api::namespaced(self.client.clone(), "default");
+
+        for _ in 0..5 {
+            match service_accounts.get("default").await {
+                Ok(_) => {
+                    //Cluster is ready
+                    return Ok(());
+                }
+                Err(_) => {
+                    //Waiting for cluster to be ready...
+                    sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+
+        Err(Error::msg("Cluster did not become ready in time"))
+    }
 }
 
 impl From<Client> for KubernetesCluster {
@@ -94,22 +115,46 @@ impl From<KubernetesCluster> for Client {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::LazyCell, path::PathBuf};
+    use std::path::PathBuf;
 
+    use kube::runtime::wait;
+
+    use crate::cluster::KindCluster;
     use crate::cluster::KubernetesCluster;
     use crate::cluster::NGINX_POD;
 
-    const TEMP_KUBECONFIG_PATH: LazyCell<PathBuf> = LazyCell::new(|| {
+    const CLUSTER_NAME_PREFIX: &str = "test-k8s";
+
+    fn temp_kubeconfig_path(name: &str) -> PathBuf {
         let mut path = PathBuf::new();
         path.push(std::env::temp_dir());
-        path.push("kubeconfig");
+        path.push(format!("{}.kubeconfig", name));
         path
-    });
+    }
+
+    fn setup_kind_cluster(name: &str) -> anyhow::Result<()> {
+        let kubeconfig_path = temp_kubeconfig_path(name);
+        let kind_cluster = KindCluster::create(name)?;
+        kind_cluster.export_kubeconfig(&kubeconfig_path)
+    }
+
+    async fn teardown_kind_cluster(name: &str) -> anyhow::Result<()> {
+        let kind_cluster = KindCluster::load(name)?;
+        kind_cluster.delete()
+    }
 
     #[tokio::test]
     async fn setup_and_use_client() {
-        let cluster = KubernetesCluster::load(&TEMP_KUBECONFIG_PATH).await;
+        let temp_cluster_name = format!("{}-setup", CLUSTER_NAME_PREFIX);
+        let setup_temp_cluster = setup_kind_cluster(&temp_cluster_name);
+        assert!(
+            setup_temp_cluster.is_ok(),
+            "Failed to setup kind cluster: {:?}",
+            setup_temp_cluster.err()
+        );
 
+        let kubeconfig_path = temp_kubeconfig_path(&temp_cluster_name);
+        let cluster = KubernetesCluster::load(&kubeconfig_path).await;
         assert!(
             cluster.is_ok(),
             "Failed to create client: {:?}",
@@ -117,6 +162,7 @@ mod tests {
         );
 
         let cluster = cluster.unwrap();
+        cluster.ensure_cluster_is_ready().await.unwrap();
 
         let pod_list_operation = cluster.list_all_pods().await;
         assert!(
@@ -127,11 +173,28 @@ mod tests {
 
         let pods = pod_list_operation.unwrap();
         assert!(!pods.items.is_empty(), "Pod list should not be empty");
+
+        let teardown_temp_cluster = teardown_kind_cluster(&temp_cluster_name).await;
+        assert!(
+            teardown_temp_cluster.is_ok(),
+            "Failed to teardown kind cluster: {:?}",
+            teardown_temp_cluster.err()
+        );
     }
 
     #[tokio::test]
     async fn create_and_delete_pod() {
-        let client = KubernetesCluster::load(&TEMP_KUBECONFIG_PATH).await;
+        let temp_cluster_name = format!("{}-create-delete", CLUSTER_NAME_PREFIX);
+        let setup_temp_cluster = setup_kind_cluster(&temp_cluster_name);
+
+        assert!(
+            setup_temp_cluster.is_ok(),
+            "Failed to setup kind cluster: {:?}",
+            setup_temp_cluster.err()
+        );
+
+        let kubeconfig_path = temp_kubeconfig_path(&temp_cluster_name);
+        let client = KubernetesCluster::load(&kubeconfig_path).await;
         assert!(
             client.is_ok(),
             "Failed to create client: {:?}",
@@ -139,6 +202,7 @@ mod tests {
         );
 
         let client = client.unwrap();
+        client.ensure_cluster_is_ready().await.unwrap();
 
         let pod_creation = client.create_pod_in_default_namespace(&NGINX_POD).await;
         assert!(
@@ -161,6 +225,13 @@ mod tests {
             delete_result.is_ok(),
             "Failed to delete the created pod: {:?}",
             delete_result.err()
+        );
+
+        let teardown_temp_cluster = teardown_kind_cluster(&temp_cluster_name).await;
+        assert!(
+            teardown_temp_cluster.is_ok(),
+            "Failed to teardown kind cluster: {:?}",
+            teardown_temp_cluster.err()
         );
     }
 }
