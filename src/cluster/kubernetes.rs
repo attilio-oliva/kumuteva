@@ -49,10 +49,10 @@ impl KubernetesCluster {
         Ok(())
     }
 
-    pub async fn get_pod_in_namespace(&self, pod_name: &str, namespace: &str) -> Result<Api<Pod>> {
+    pub async fn get_pod_in_namespace(&self, pod_name: &str, namespace: &str) -> Result<Pod> {
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
-        pods_api.get(pod_name).await?;
-        Ok(pods_api)
+        let pod = pods_api.get(pod_name).await?;
+        Ok(pod)
     }
 
     pub async fn delete_pod_in_namespace(&self, pod_name: &str, namespace: &str) -> Result<()> {
@@ -61,18 +61,18 @@ impl KubernetesCluster {
         Ok(())
     }
 
-    pub async fn create_pod(&self, pod: &Pod, namespace: Option<&str>) -> Result<Api<Pod>> {
+    pub async fn create_pod(&self, pod: &Pod, namespace: Option<&str>) -> Result<Pod> {
         let namespace = namespace.unwrap_or("default");
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
-        pods_api.create(&PostParams::default(), pod).await?;
-        Ok(pods_api)
+        let pod: Pod = pods_api.create(&PostParams::default(), pod).await?;
+        Ok(pod)
     }
 
-    pub async fn create_pod_in_default_namespace(&self, pod: &Pod) -> Result<Api<Pod>> {
+    pub async fn create_pod_in_default_namespace(&self, pod: &Pod) -> Result<Pod> {
         self.create_pod(pod, None).await
     }
 
-    pub async fn create_pod_in_namespace(&self, pod: &Pod, namespace: &str) -> Result<Api<Pod>> {
+    pub async fn create_pod_in_namespace(&self, pod: &Pod, namespace: &str) -> Result<Pod> {
         self.create_pod(pod, Some(namespace)).await
     }
 
@@ -201,26 +201,27 @@ mod tests {
             client.err()
         );
 
-        let client = client.unwrap();
-        client.ensure_cluster_is_ready().await.unwrap();
+        let cluster = client.unwrap();
+        cluster.ensure_cluster_is_ready().await.unwrap();
 
-        let pod_creation = client.create_pod_in_default_namespace(&NGINX_POD).await;
+        let pod_creation = cluster.create_pod_in_default_namespace(&NGINX_POD).await;
         assert!(
             pod_creation.is_ok(),
             "Failed to create pod: {:?}",
             pod_creation.err()
         );
 
-        let pod_api = pod_creation.unwrap();
-        let pod_name = NGINX_POD.metadata.name.clone().unwrap();
-        let pod_result = pod_api.get(pod_name.as_str()).await;
+        let pod = pod_creation.unwrap();
+        let pod_name = pod.metadata.name.as_deref().unwrap_or("unnamed");
+        let retrieved_pod = cluster.get_pod_in_namespace(pod_name, "default").await;
+
         assert!(
-            pod_result.is_ok(),
+            retrieved_pod.is_ok(),
             "Failed to get the created pod: {:?}",
-            pod_result.err()
+            retrieved_pod.err()
         );
 
-        let delete_result = pod_api.delete(pod_name.as_str(), &Default::default()).await;
+        let delete_result = cluster.delete_pod_in_namespace(pod_name, "default").await;
         assert!(
             delete_result.is_ok(),
             "Failed to delete the created pod: {:?}",
