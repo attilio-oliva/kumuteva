@@ -1,3 +1,4 @@
+mod builder;
 mod kind;
 mod kubernetes;
 

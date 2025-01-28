@@ -9,6 +9,8 @@ use tokio::time::sleep;
 use std::path::Path;
 use std::time::Duration;
 
+use super::KindCluster;
+
 /// An abstraction over a Kubernetes client.
 /// This struct is used to interact with a Kubernetes cluster using `kube` crate.
 pub struct KubernetesCluster {
@@ -82,7 +84,7 @@ impl KubernetesCluster {
         Ok(pods)
     }
 
-    async fn ensure_cluster_is_ready(&self) -> anyhow::Result<()> {
+    pub async fn ensure_cluster_is_ready(&self) -> anyhow::Result<()> {
         let service_accounts: Api<ServiceAccount> = Api::namespaced(self.client.clone(), "default");
 
         for _ in 0..5 {
@@ -116,8 +118,6 @@ impl From<KubernetesCluster> for Client {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-
-    use kube::runtime::wait;
 
     use crate::cluster::KindCluster;
     use crate::cluster::KubernetesCluster;

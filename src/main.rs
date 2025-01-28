@@ -1,4 +1,5 @@
 mod cluster;
+mod verifier;
 
 use std::path::PathBuf;
 
@@ -18,37 +19,13 @@ pub struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
-    let first_client = KubernetesCluster::load(&args.first_kubeconfig_path).await?;
-    let second_client = KubernetesCluster::load(&args.second_kubeconfig_path).await?;
+    let first_cluster = KubernetesCluster::load(&args.first_kubeconfig_path).await?;
+    let second_cluster = KubernetesCluster::load(&args.second_kubeconfig_path).await?;
 
-    //list_pods(first_client.clone()).await?;
-    //list_pods(second_client.clone()).await?;
+    let obj_isolation_result =
+        verifier::check_object_isolation(&first_cluster, &second_cluster).await?;
 
-    let pod_name = NGINX_POD
-        .metadata
-        .name
-        .clone()
-        .unwrap_or(String::from("nginx"));
-
-    // deploy nginx pod in first cluster
-    first_client
-        .create_pod_in_namespace(&NGINX_POD, "t1")
-        .await?;
-    // check if pod is available in first cluster by the first tenant
-    let pod_seen_by_tenant1 = first_client.get_pod_in_namespace(&pod_name, "t1").await?;
-
-    // check if pod is available in first cluster by the second tenant
-    let pod_seen_by_tenant2 = second_client.get_pod_in_namespace(&pod_name, "t1").await;
-    if pod_seen_by_tenant2.is_ok() {
-        println!("Pod is visible to tenant2");
-    } else {
-        println!("Pod is not visible to tenant2");
-    }
-
-    // clean up
-    first_client
-        .delete_pod_in_namespace(&pod_name, "t1")
-        .await?;
+    println!("Object isolation test result: {:?}", obj_isolation_result);
 
     Ok(())
 }
