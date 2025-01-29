@@ -1,10 +1,7 @@
-use std::{
-    path::{self, Path, PathBuf},
-    process::Command,
-};
+use std::{path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{Context, Ok};
-use yaml_rust2::YamlLoader;
+use tokio::time::sleep;
 
 use super::{KindCluster, KubernetesCluster};
 
@@ -117,7 +114,8 @@ impl KubernetesClusterBuilder {
             .collect();
 
         for control_plane_isolation_technology in control_plane_isolation_technologies {
-            self.apply_control_plane_isolation_technology(control_plane_isolation_technology)?;
+            self.apply_control_plane_isolation_technology(control_plane_isolation_technology)
+                .await?;
         }
 
         for data_plane_isolation_technology in data_plane_isolation_technologies {
@@ -128,7 +126,7 @@ impl KubernetesClusterBuilder {
         Ok(kubernetes_cluster)
     }
 
-    fn apply_control_plane_isolation_technology(
+    async fn apply_control_plane_isolation_technology(
         &self,
         control_plane_isolation_technology: ControlPlaneIsolationTechnology,
     ) -> anyhow::Result<()> {
@@ -142,35 +140,74 @@ impl KubernetesClusterBuilder {
                 let vcluster_values_path = "vcluster.yaml";
                 save_vcluster_helm_values(vcluster_values_path)?;
 
+                let release_name = format!("vcluster-{}", namespace);
+                let chart_name = "vcluster";
+
                 let output = Command::new("helm")
                     .arg("upgrade")
                     .arg("--install")
-                    .arg(&format!("vcluster-{}", namespace))
-                    .arg("vcluster")
+                    .arg(&release_name)
+                    .arg(chart_name)
                     .arg("--values")
                     .arg("vcluster.yaml")
                     .arg("--repo")
                     .arg("https://charts.loft.sh")
                     .arg("--namespace")
-                    .arg(namespace)
-                    .arg("--repository-config=")
-                    .arg("")
+                    .arg(&namespace)
                     .arg("--create-namespace")
+                    .arg("--kubeconfig")
+                    .arg(&self.kubeconfig_path)
                     .output()
                     .context("Failed to execute helm upgrade command")?;
 
                 if output.status.success() {
+                    let cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
+                    // wait for vcluster to be ready
+                    // watch the pod with label app=vcluster
+                    //use the watch api to watch the pod
+                    let label = "app=vcluster";
+                    let mut pods = cluster.list_pods_with_label(label).await?;
+
+                    // retry up to 5 times
+
+                    for _ in 0..5 {
+                        if !pods.items.is_empty() {
+                            break;
+                        }
+                        sleep(Duration::from_secs(5)).await;
+                        pods = cluster.list_pods_with_label(label).await?;
+                    }
+
+                    println!(
+                        "Waiting for vcluster pod to be ready {:?}",
+                        pods.items[0].metadata.name
+                    );
+
+                    let pod_name = pods.items[0]
+                        .metadata
+                        .name
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Pod name not found"))?;
+                    cluster
+                        .wait_for_pod_to_be_ready(&pod_name, &namespace)
+                        .await?;
+
+                    let vcluster_kubeconfig =
+                        Self::get_vcluster_kubeconfig(&cluster, &namespace, &release_name).await?;
+                    // save new kubeconfig
+                    std::fs::write(&self.kubeconfig_path, vcluster_kubeconfig)?;
+
                     return Ok(());
                 } else {
                     return Err(terminal_stderr_to_error(output));
                 };
             }
+
             ControlPlaneIsolationTechnology::KubeVirt => {
                 // apply kubevirt isolation
                 return Err(anyhow::anyhow!("KubeVirt isolation is not implemented yet"));
             }
-        };
-        Ok(())
+        }
     }
 
     fn apply_data_plane_isolation_technology(
@@ -178,6 +215,42 @@ impl KubernetesClusterBuilder {
         data_plane_isolation_technology: DataPlaneIsolationTechnology,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+    async fn get_vcluster_kubeconfig(
+        cluster: &KubernetesCluster,
+        namespace: &str,
+        vcluster_name: &str,
+    ) -> anyhow::Result<String> {
+        let secret_name = format!("vc-{}", vcluster_name);
+
+        // Wait for secret to be created up to 5 times
+        let mut tries = 0;
+        let secret = loop {
+            let secret = cluster
+                .get_secret_in_namespace(&secret_name, namespace)
+                .await;
+            if secret.is_ok() {
+                break secret;
+            } else if tries >= 5 {
+                return Err(anyhow::anyhow!(
+                    "Secret {} not found in namespace {}",
+                    secret_name,
+                    namespace
+                ));
+            }
+            sleep(Duration::from_secs(5)).await;
+            tries += 1;
+        }?;
+        // Extract and decode config
+        let config_b64 = secret
+            .data
+            .and_then(|data| data.get("config").cloned())
+            .ok_or_else(|| anyhow::anyhow!("Config data not found in secret"))?;
+
+        // Parse as string (kube-rs already decodes from base64)
+        let config = String::from_utf8(config_b64.0)
+            .context("Failed to parse config data from secret as UTF-8 string")?;
+        Ok(config)
     }
 }
 
@@ -188,32 +261,7 @@ fn terminal_stderr_to_error(output: std::process::Output) -> anyhow::Error {
         String::from_utf8_lossy(&output.stderr)
     )
 }
-/*
-controlPlane:
-  # Distro holds virtual cluster related distro options. A distro cannot be changed after vCluster is deployed.
-  distro:
-    k8s:
-      # Enabled specifies if the K8s distro should be enabled. Only one distro can be enabled at the same time.
-      enabled: true
-  backingStore:
-    etcd:
-      deploy:
-          # Enabled defines if a dedicated etcd cluster should be deployed.
-        enabled: true
-policies:
-  # empty, baseline, restricted can be used here
-  podSecurityStandard: baseline
 
-  # TODO: customize the following policies
-  resourceQuota:
-    enabled: true
-
-  limitRange:
-    enabled: true
-# This does not work with deployed etcd because it blocks all traffic to local service and pod cidr
-#  networkPolicy:
-#    enabled: true
-*/
 fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
     let json_values = json!({
         "controlPlane": {
@@ -230,15 +278,21 @@ fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
                 }
             }
         },
-        "policies": {
-            "podSecurityStandard": "baseline",
-            "resourceQuota": {
-                "enabled": true
-            },
-            "limitRange": {
-                "enabled": true
-            }
-        }
+        // "policies": {
+        //     "podSecurityStandard": "baseline",
+        //     "resourceQuota": {
+        //         "enabled": true
+        //     },
+        //     "limitRange": {
+        //         "enabled": true
+        //     }
+        // },
+        // "exportKubeConfig": {
+        //     "context": "vcluster-context",
+        //     "secret": {
+        //         "name": "vc-kubeconfig"
+        //     }
+        // }
     });
 
     let yaml_values = serde_yaml::from_str::<serde_yaml::Value>(&json_values.to_string())?;
@@ -248,22 +302,35 @@ fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::runtime::Handle;
+
     use super::*;
     use std::path::PathBuf;
 
     const CLUSTER_NAME_PREFIX: &str = "k8s-env";
+
+    struct TestCluster {
+        pub name: String,
+        pub kubeconfig_path: PathBuf,
+    }
+
+    impl TestCluster {
+        async fn create(name: &str) -> anyhow::Result<Self> {
+            let kubeconfig_path = temp_kubeconfig_path(name);
+            let kind_cluster = KindCluster::create(name)?;
+            let _ = kind_cluster.export_kubeconfig(&kubeconfig_path)?;
+            Ok(Self {
+                name: name.to_string(),
+                kubeconfig_path,
+            })
+        }
+    }
 
     fn temp_kubeconfig_path(name: &str) -> PathBuf {
         let mut path = PathBuf::new();
         path.push(std::env::temp_dir());
         path.push(format!("{}.kubeconfig", name));
         path
-    }
-
-    fn setup_kind_cluster(name: &str) -> anyhow::Result<()> {
-        let kubeconfig_path = temp_kubeconfig_path(name);
-        let kind_cluster = KindCluster::create(name)?;
-        kind_cluster.export_kubeconfig(&kubeconfig_path)
     }
 
     async fn teardown_kind_cluster(name: &str) -> anyhow::Result<()> {
@@ -274,16 +341,11 @@ mod tests {
     #[tokio::test]
     async fn setup_vcluster() {
         let temp_cluster_name = format!("{}-vcluster", CLUSTER_NAME_PREFIX);
-        let setup_temp_cluster = setup_kind_cluster(&temp_cluster_name);
-        assert!(
-            setup_temp_cluster.is_ok(),
-            "Failed to setup kind cluster: {:?}",
-            setup_temp_cluster.err()
-        );
+        let temp_cluster = TestCluster::create(&temp_cluster_name).await.unwrap();
+
         let namespace = "tenant1";
-        let kubeconfig_path = temp_kubeconfig_path(&temp_cluster_name);
         let cluster = KubernetesClusterBuilder::new(KindCluster::load(&temp_cluster_name).unwrap())
-            .with_kubeconfig_path(kubeconfig_path.clone())
+            .with_kubeconfig_path(temp_cluster.kubeconfig_path.clone())
             .with_isolation_technology(IsolationTechnology::ControlPlane(
                 ControlPlaneIsolationTechnology::VCluster(String::from(namespace)),
             ))
@@ -299,11 +361,6 @@ mod tests {
         let pods = cluster.list_all_pods().await;
         assert!(pods.is_ok(), "Failed to get pods: {:?}", pods.err());
 
-        let teardown_temp_cluster = teardown_kind_cluster(&temp_cluster_name).await;
-        assert!(
-            teardown_temp_cluster.is_ok(),
-            "Failed to teardown kind cluster: {:?}",
-            teardown_temp_cluster.err()
-        );
+        let _ = teardown_kind_cluster(&temp_cluster_name).await;
     }
 }

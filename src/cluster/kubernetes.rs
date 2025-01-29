@@ -1,9 +1,12 @@
 use anyhow::{Error, Result};
-use k8s_openapi::api::core::v1::{Namespace, Pod, ServiceAccount};
-use kube::api::{ListParams, ObjectList, ObjectMeta};
+use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, ServiceAccount};
+use kube::api::{ListParams, ObjectList, ObjectMeta, WatchEvent, WatchParams};
 use kube::config::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{api::PostParams, Api, Client};
+
+use futures::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
 use std::path::Path;
@@ -82,6 +85,50 @@ impl KubernetesCluster {
         let api: Api<Pod> = Api::all(self.client.clone());
         let pods = api.list(&ListParams::default()).await?;
         Ok(pods)
+    }
+
+    pub async fn list_pods_with_label(&self, label: &str) -> Result<ObjectList<Pod>> {
+        let api: Api<Pod> = Api::all(self.client.clone());
+        let pods = api
+            .list(&ListParams {
+                label_selector: Some(String::from(label)),
+                ..Default::default()
+            })
+            .await?;
+        Ok(pods)
+    }
+
+    pub async fn get_secret_in_namespace(
+        &self,
+        secret_name: &str,
+        namespace: &str,
+    ) -> Result<Secret> {
+        let secrets_api = Api::<Secret>::namespaced(self.client.clone(), namespace);
+        let secret = secrets_api.get(secret_name).await?;
+
+        Ok(secret)
+    }
+
+    pub async fn wait_for_pod_to_be_ready(&self, pod_name: &str, namespace: &str) -> Result<()> {
+        // use the Job API to wait for the pod to be ready
+        let jobs: Api<Job> = Api::namespaced(self.client.clone(), namespace);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", pod_name))
+            .timeout(200); // upper bound of how long we watch for
+
+        let mut stream = jobs.watch(&lp, "0").await?.boxed();
+        while let Some(status) = stream.try_next().await? {
+            if let WatchEvent::Modified(s) = status {
+                if s.status.unwrap().ready == Some(1) {
+                    return Ok(());
+                }
+            } else {
+                println!("New event on pod: {:?}", status);
+            }
+        }
+        println!("Pod did not become ready in time");
+        Ok(())
     }
 
     pub async fn ensure_cluster_is_ready(&self) -> anyhow::Result<()> {

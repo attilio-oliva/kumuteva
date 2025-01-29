@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, Error, Result};
 
+#[derive(Debug, Clone)]
 pub struct KindCluster {
     name: String,
 }

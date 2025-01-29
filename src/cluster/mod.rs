@@ -2,6 +2,7 @@ mod builder;
 mod kind;
 mod kubernetes;
 
+pub use builder::*;
 pub use kind::KindCluster;
 pub use kubernetes::KubernetesCluster;
 
