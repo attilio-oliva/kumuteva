@@ -1,9 +1,13 @@
 use anyhow::{Error, Result};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, ServiceAccount};
-use kube::api::{ListParams, ObjectList, ObjectMeta, WatchEvent, WatchParams};
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use k8s_openapi::{Metadata, NamespaceResourceScope, Resource};
+use kube::api::{ListParams, ObjectList, ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams};
 use kube::config::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::runtime::reflector::Lookup;
+use kube::CustomResourceExt;
 use kube::{api::PostParams, Api, Client};
 
 use futures::{StreamExt, TryStreamExt};
@@ -12,7 +16,7 @@ use tokio::time::sleep;
 use std::path::Path;
 use std::time::Duration;
 
-use super::KindCluster;
+use super::{Foo, KindCluster};
 
 /// An abstraction over a Kubernetes client.
 /// This struct is used to interact with a Kubernetes cluster using `kube` crate.
@@ -128,6 +132,22 @@ impl KubernetesCluster {
             }
         }
         println!("Pod did not become ready in time");
+        Ok(())
+    }
+    pub async fn publish_namespaced_crd<C>(&self) -> Result<()>
+    where
+        C: CustomResourceExt + Resource<Scope = NamespaceResourceScope> + Metadata<Ty = ObjectMeta>,
+    {
+        let crd = C::crd();
+        let crd_name = crd.name().unwrap();
+        let crds: Api<CustomResourceDefinition> = Api::all(self.client.clone());
+        crds.patch(
+            &crd_name,
+            &PatchParams::apply("myapp"),
+            &Patch::Apply(C::crd()),
+        )
+        .await?;
+
         Ok(())
     }
 

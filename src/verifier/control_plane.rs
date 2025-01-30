@@ -1,6 +1,8 @@
 use crate::cluster::{KubernetesCluster, NGINX_POD};
 use anyhow::{Context, Result};
 
+use super::TransparentIsolationLevel;
+
 const TENANT1_NS: &str = "t1";
 const POD_DEFAULT_NAME: &str = "nginx";
 
@@ -19,6 +21,81 @@ pub async fn check_object_isolation(
 
     // Cleanup
     cleanup_tenant_pod(tenant1_cluster, &pod_name).await
+}
+
+pub async fn check_transparent_isolation_level(
+    tenant1_cluster: &KubernetesCluster,
+    tenant2_cluster: &KubernetesCluster,
+    level: TransparentIsolationLevel,
+) -> Result<()> {
+    match level {
+        TransparentIsolationLevel::Namespace => {
+            check_namespace_isolation(tenant1_cluster, tenant2_cluster).await
+        }
+        TransparentIsolationLevel::Node => {
+            check_node_isolation(tenant1_cluster, tenant2_cluster).await
+        }
+        TransparentIsolationLevel::Cluster => {
+            check_cluster_isolation(tenant1_cluster, tenant2_cluster).await
+        }
+    }
+}
+
+async fn check_namespace_isolation(
+    tenant1_cluster: &KubernetesCluster,
+    tenant2_cluster: &KubernetesCluster,
+) -> Result<()> {
+    unimplemented!("Namespace isolation test is not implemented")
+}
+
+async fn check_node_isolation(
+    tenant1_cluster: &KubernetesCluster,
+    tenant2_cluster: &KubernetesCluster,
+) -> Result<()> {
+    unimplemented!("Node isolation test is not implemented")
+}
+
+async fn check_cluster_isolation(
+    tenant1_cluster: &KubernetesCluster,
+    tenant2_cluster: &KubernetesCluster,
+) -> Result<()> {
+    // attempt to create a CRD in tenant1
+    // attempt to get the CRD in tenant2
+    // attempt to create the same
+    // ensure no name collision happens in tenant2
+
+    let crd_name = "mycrd";
+    let crd = r#"
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: mycrd
+spec:
+    group: example.com
+    names:
+        kind: MyCRD
+        listKind: MyCRDList
+        plural: mycrds
+        singular: mycrd
+    scope: Namespaced
+    versions:
+    - name: v1
+        served: true
+        storage: true
+        schema:
+        openAPIV3Schema:
+            type: object
+            properties:
+            spec:
+                type: object
+                properties:
+                foo:
+                    type: string
+            required:
+            - spec
+    "#;
+
+    anyhow::Ok(())
 }
 
 fn get_pod_name() -> String {

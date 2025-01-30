@@ -8,6 +8,9 @@ pub use kubernetes::KubernetesCluster;
 
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
 use kube::api::ObjectMeta;
+use kube::CustomResource;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 pub static NGINX_POD: LazyLock<Pod> = LazyLock::new(|| Pod {
     metadata: ObjectMeta {
@@ -24,3 +27,9 @@ pub static NGINX_POD: LazyLock<Pod> = LazyLock::new(|| Pod {
     }),
     ..Default::default()
 });
+
+#[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[kube(group = "example.dev", version = "v1", kind = "Foo", namespaced)]
+pub struct FooSpec {
+    info: String,
+}
