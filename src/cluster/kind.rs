@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::{self, Command},
     str,
 };
@@ -10,11 +10,12 @@ use anyhow::{Context, Error, Result};
 
 #[derive(Debug, Clone)]
 pub struct KindCluster {
-    name: String,
+    pub name: String,
+    pub kubeconfig_path: PathBuf,
 }
 
 impl KindCluster {
-    pub fn create(name: &str) -> Result<Self> {
+    pub fn create(name: &str, kubeconfig_path: PathBuf) -> Result<Self> {
         let output = Command::new("kind")
             .arg("create")
             .arg("cluster")
@@ -25,13 +26,32 @@ impl KindCluster {
 
         if output.status.success() {
             let name = String::from(name);
-            Ok(Self { name })
+            Self::export_kubeconfig(&name, &kubeconfig_path)?;
+            Ok(Self {
+                name,
+                kubeconfig_path,
+            })
+        } else {
+            Err(terminal_stderr_to_error(output))
+        }
+    }
+    pub fn exists(name: &str) -> Result<bool> {
+        let output = Command::new("kind")
+            .arg("get")
+            .arg("clusters")
+            .output()
+            .context("Failed to execute kind get clusters command")?;
+
+        if output.status.success() {
+            let clusters = str::from_utf8(&output.stdout)
+                .context("Failed to parse kind get clusters output")?;
+            Ok(clusters.contains(name))
         } else {
             Err(terminal_stderr_to_error(output))
         }
     }
 
-    pub fn load(name: &str) -> Result<Self> {
+    pub fn load(name: &str, kubeconfig_path: PathBuf) -> Result<Self> {
         // Check if the cluster exists
         let output = Command::new("kind")
             .arg("get")
@@ -44,7 +64,11 @@ impl KindCluster {
                 .context("Failed to parse kind get clusters output")?;
             if clusters.contains(name) {
                 let name = String::from(name);
-                Ok(Self { name })
+                Self::export_kubeconfig(&name, &kubeconfig_path)?;
+                Ok(Self {
+                    name,
+                    kubeconfig_path,
+                })
             } else {
                 Err(Error::msg("Cluster does not exist"))
             }
@@ -53,12 +77,12 @@ impl KindCluster {
         }
     }
 
-    pub fn export_kubeconfig(&self, path: &Path) -> Result<()> {
+    fn export_kubeconfig(name: &str, path: &Path) -> Result<()> {
         let output = Command::new("kind")
             .arg("get")
             .arg("kubeconfig")
             .arg("--name")
-            .arg(&self.name)
+            .arg(name)
             .output()
             .context("Failed to execute kind get kubeconfig command")?;
 
@@ -107,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_create_and_delete_kind_cluster() {
-        let cluster = KindCluster::create(CLUSTER_NAME);
+        let cluster = KindCluster::create(CLUSTER_NAME, PathBuf::from(TEMP_KUBECONFIG_PATH));
         assert!(
             cluster.is_ok(),
             "Failed to create a Kind cluster: {:?}",
@@ -116,19 +140,12 @@ mod tests {
 
         let cluster = cluster.unwrap();
 
-        // check if the new cluster exists
-        let loaded_cluster = KindCluster::load(CLUSTER_NAME);
+        // check if the new cluster exists and can be loaded
+        let load_cluster = KindCluster::load(CLUSTER_NAME, PathBuf::from(TEMP_KUBECONFIG_PATH));
         assert!(
-            loaded_cluster.is_ok(),
+            load_cluster.is_ok(),
             "Failed to load Kind cluster: {:?}",
-            loaded_cluster.err()
-        );
-
-        let kubeconfig_extraction = cluster.export_kubeconfig(Path::new(TEMP_KUBECONFIG_PATH));
-        assert!(
-            kubeconfig_extraction.is_ok(),
-            "Failed to extract kubeconfig: {:?}",
-            kubeconfig_extraction.err()
+            load_cluster.err()
         );
 
         let deletion = cluster.delete();

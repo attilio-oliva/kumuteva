@@ -1,6 +1,6 @@
 use anyhow::{Error, Result};
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, ServiceAccount};
+use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service, ServiceAccount};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::{Metadata, NamespaceResourceScope, Resource};
 use kube::api::{ListParams, ObjectList, ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams};
@@ -31,6 +31,63 @@ impl KubernetesCluster {
         let config = Config::from_custom_kubeconfig(kubeconfig, &options).await?;
         let client = Client::try_from(config)?;
         Ok(Self { client })
+    }
+
+    pub async fn create_nodeport_service(&self, namespace: &str) -> Result<Service> {
+        /*
+                // create a NodePort service to access the vcluster
+                            let service_name = "vcluster-service";
+                            let service_port = 6443;
+                            let service_type = "NodePort";
+                            let service_manifest = format!(
+                                r#"
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: {service_name}
+          namespace: {namespace}
+        spec:
+          selector:
+            app: vcluster
+            release: {release_name}
+          ports:
+            - name: https
+              port: 443
+              targetPort: 8443
+              protocol: TCP
+          type: NodePort
+        "#, */
+        let api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let service = Service {
+            metadata: ObjectMeta {
+                name: Some("vcluster-service".to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            spec: Some(k8s_openapi::api::core::v1::ServiceSpec {
+                selector: Some({
+                    let mut map = std::collections::BTreeMap::new();
+                    map.insert("app".to_string(), "vcluster".to_string());
+                    map.insert("release".to_string(), "vcluster-tenant1".to_string());
+                    map
+                }),
+                ports: Some(vec![k8s_openapi::api::core::v1::ServicePort {
+                    name: Some("https".to_string()),
+                    port: 443,
+                    target_port: Some(
+                        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8443),
+                    ),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+                type_: Some("NodePort".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let service = api.create(&PostParams::default(), &service).await?;
+        Ok(service)
     }
 
     pub async fn create_namespace_if_not_exists(&self, namespace: &str) -> Result<()> {
@@ -113,27 +170,51 @@ impl KubernetesCluster {
         Ok(secret)
     }
 
+    async fn is_pod_ready(&self, pod_name: &str, namespace: &str) -> Result<bool> {
+        let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
+        let pod = pods_api.get(pod_name).await?;
+        let status = pod.status.ok_or(Error::msg("Pod status not found"))?;
+        println!("Pod status check: {:?}", status.phase);
+        println!(
+            "is running: {:?}",
+            status.phase == Some("Running".to_string())
+        );
+        Ok(status.phase == Some("Running".to_string()))
+    }
+
     pub async fn wait_for_pod_to_be_ready(&self, pod_name: &str, namespace: &str) -> Result<()> {
         // use the Job API to wait for the pod to be ready
         let jobs: Api<Job> = Api::namespaced(self.client.clone(), namespace);
 
         let lp = WatchParams::default()
             .fields(&format!("metadata.name={}", pod_name))
-            .timeout(200); // upper bound of how long we watch for
+            .timeout(290); // upper bound of how long we watch for
+
+        let pod_ready = self.is_pod_ready(pod_name, namespace).await?;
+
+        if pod_ready {
+            return Ok(());
+        }
 
         let mut stream = jobs.watch(&lp, "0").await?.boxed();
+
         while let Some(status) = stream.try_next().await? {
             if let WatchEvent::Modified(s) = status {
+                println!("Pod modified: {:?}", s.status);
                 if s.status.unwrap().ready == Some(1) {
                     return Ok(());
                 }
             } else {
                 println!("New event on pod: {:?}", status);
+                if (self.is_pod_ready(pod_name, namespace)).await? {
+                    return Ok(());
+                }
             }
         }
-        println!("Pod did not become ready in time");
+        println!("Pod become ready in time");
         Ok(())
     }
+
     pub async fn publish_namespaced_crd<C>(&self) -> Result<()>
     where
         C: CustomResourceExt + Resource<Scope = NamespaceResourceScope> + Metadata<Ty = ObjectMeta>,
@@ -154,7 +235,7 @@ impl KubernetesCluster {
     pub async fn ensure_cluster_is_ready(&self) -> anyhow::Result<()> {
         let service_accounts: Api<ServiceAccount> = Api::namespaced(self.client.clone(), "default");
 
-        for _ in 0..5 {
+        for _ in 0..10 {
             match service_accounts.get("default").await {
                 Ok(_) => {
                     //Cluster is ready
@@ -199,15 +280,13 @@ mod tests {
         path
     }
 
-    fn setup_kind_cluster(name: &str) -> anyhow::Result<()> {
+    fn setup_kind_cluster(name: &str) -> anyhow::Result<KindCluster> {
         let kubeconfig_path = temp_kubeconfig_path(name);
-        let kind_cluster = KindCluster::create(name)?;
-        kind_cluster.export_kubeconfig(&kubeconfig_path)
+        KindCluster::create(name, kubeconfig_path)
     }
 
-    async fn teardown_kind_cluster(name: &str) -> anyhow::Result<()> {
-        let kind_cluster = KindCluster::load(name)?;
-        kind_cluster.delete()
+    async fn teardown_kind_cluster(cluster: KindCluster) -> anyhow::Result<()> {
+        cluster.delete()
     }
 
     #[tokio::test]
@@ -219,6 +298,8 @@ mod tests {
             "Failed to setup kind cluster: {:?}",
             setup_temp_cluster.err()
         );
+
+        let temp_cluster = setup_temp_cluster.unwrap();
 
         let kubeconfig_path = temp_kubeconfig_path(&temp_cluster_name);
         let cluster = KubernetesCluster::load(&kubeconfig_path).await;
@@ -241,7 +322,7 @@ mod tests {
         let pods = pod_list_operation.unwrap();
         assert!(!pods.items.is_empty(), "Pod list should not be empty");
 
-        let teardown_temp_cluster = teardown_kind_cluster(&temp_cluster_name).await;
+        let teardown_temp_cluster = teardown_kind_cluster(temp_cluster).await;
         assert!(
             teardown_temp_cluster.is_ok(),
             "Failed to teardown kind cluster: {:?}",
@@ -259,6 +340,8 @@ mod tests {
             "Failed to setup kind cluster: {:?}",
             setup_temp_cluster.err()
         );
+
+        let temp_cluster = setup_temp_cluster.unwrap();
 
         let kubeconfig_path = temp_kubeconfig_path(&temp_cluster_name);
         let client = KubernetesCluster::load(&kubeconfig_path).await;
@@ -295,7 +378,7 @@ mod tests {
             delete_result.err()
         );
 
-        let teardown_temp_cluster = teardown_kind_cluster(&temp_cluster_name).await;
+        let teardown_temp_cluster = teardown_kind_cluster(temp_cluster).await;
         assert!(
             teardown_temp_cluster.is_ok(),
             "Failed to teardown kind cluster: {:?}",

@@ -134,7 +134,7 @@ impl KubernetesClusterBuilder {
             ControlPlaneIsolationTechnology::None => Ok(()),
             ControlPlaneIsolationTechnology::Capsule => {
                 // apply capsule isolation
-                return Err(anyhow::anyhow!("Capsule isolation is not implemented yet"));
+                Err(anyhow::anyhow!("Capsule isolation is not implemented yet"))
             }
             ControlPlaneIsolationTechnology::VCluster(namespace) => {
                 let vcluster_values_path = "vcluster.yaml";
@@ -156,12 +156,13 @@ impl KubernetesClusterBuilder {
                     .arg(&namespace)
                     .arg("--create-namespace")
                     .arg("--kubeconfig")
-                    .arg(&self.kubeconfig_path)
+                    .arg(&self.kind_cluster.kubeconfig_path)
                     .output()
                     .context("Failed to execute helm upgrade command")?;
 
                 if output.status.success() {
-                    let cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
+                    let cluster =
+                        KubernetesCluster::load(&self.kind_cluster.kubeconfig_path).await?;
                     // wait for vcluster to be ready
                     // watch the pod with label app=vcluster
                     //use the watch api to watch the pod
@@ -189,18 +190,31 @@ impl KubernetesClusterBuilder {
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("Pod name not found"))?;
                     cluster
-                        .wait_for_pod_to_be_ready(&pod_name, &namespace)
+                        .wait_for_pod_to_be_ready(pod_name, &namespace)
                         .await?;
 
-                    let vcluster_kubeconfig =
+                    let vcluster_kubeconfig: String =
                         Self::get_vcluster_kubeconfig(&cluster, &namespace, &release_name).await?;
                     // save new kubeconfig
                     std::fs::write(&self.kubeconfig_path, vcluster_kubeconfig)?;
 
-                    return Ok(());
+                    let service = cluster.create_nodeport_service(&namespace).await?;
+
+                    // adjust kubeconfig to use the new port
+                    let kubeconfig = std::fs::read_to_string(&self.kubeconfig_path)?;
+                    //get the nodeport
+                    let ports = service.spec.and_then(|spec| spec.ports.clone());
+                    let nodeport = ports
+                        .and_then(|ports| ports.first().cloned())
+                        .and_then(|port| port.node_port)
+                        .ok_or_else(|| anyhow::anyhow!("Nodeport not found"))?;
+                    println!("Nodeport: {}", nodeport);
+                    let kubeconfig = kubeconfig.replace("8443", &nodeport.to_string());
+                    std::fs::write(&self.kubeconfig_path, kubeconfig)?;
+                    Ok(())
                 } else {
-                    return Err(terminal_stderr_to_error(output));
-                };
+                    Err(terminal_stderr_to_error(output))
+                }
             }
 
             ControlPlaneIsolationTechnology::KubeVirt => {
@@ -248,7 +262,7 @@ impl KubernetesClusterBuilder {
             .ok_or_else(|| anyhow::anyhow!("Config data not found in secret"))?;
 
         // Parse as string (kube-rs already decodes from base64)
-        let config = String::from_utf8(config_b64.0)
+        let config: String = String::from_utf8(config_b64.0)
             .context("Failed to parse config data from secret as UTF-8 string")?;
         Ok(config)
     }
@@ -317,8 +331,7 @@ mod tests {
     impl TestCluster {
         async fn create(name: &str) -> anyhow::Result<Self> {
             let kubeconfig_path = temp_kubeconfig_path(name);
-            let kind_cluster = KindCluster::create(name)?;
-            let _ = kind_cluster.export_kubeconfig(&kubeconfig_path)?;
+            let _ = KindCluster::create(name, kubeconfig_path.clone())?;
             Ok(Self {
                 name: name.to_string(),
                 kubeconfig_path,
@@ -333,8 +346,8 @@ mod tests {
         path
     }
 
-    async fn teardown_kind_cluster(name: &str) -> anyhow::Result<()> {
-        let kind_cluster = KindCluster::load(name)?;
+    async fn teardown_kind_cluster(cluster: TestCluster) -> anyhow::Result<()> {
+        let kind_cluster = KindCluster::load(&cluster.name, cluster.kubeconfig_path)?;
         kind_cluster.delete()
     }
 
@@ -343,14 +356,20 @@ mod tests {
         let temp_cluster_name = format!("{}-vcluster", CLUSTER_NAME_PREFIX);
         let temp_cluster = TestCluster::create(&temp_cluster_name).await.unwrap();
 
+        let kind_kubeconfig_path = temp_cluster.kubeconfig_path.clone();
+        let vcluster_kubeconfig_path =
+            temp_kubeconfig_path(format!("{}-inner", temp_cluster_name).as_str());
+
         let namespace = "tenant1";
-        let cluster = KubernetesClusterBuilder::new(KindCluster::load(&temp_cluster_name).unwrap())
-            .with_kubeconfig_path(temp_cluster.kubeconfig_path.clone())
-            .with_isolation_technology(IsolationTechnology::ControlPlane(
-                ControlPlaneIsolationTechnology::VCluster(String::from(namespace)),
-            ))
-            .build()
-            .await;
+        let cluster = KubernetesClusterBuilder::new(
+            KindCluster::load(&temp_cluster_name, kind_kubeconfig_path).unwrap(),
+        )
+        .with_kubeconfig_path(vcluster_kubeconfig_path)
+        .with_isolation_technology(IsolationTechnology::ControlPlane(
+            ControlPlaneIsolationTechnology::VCluster(String::from(namespace)),
+        ))
+        .build()
+        .await;
         assert!(
             cluster.is_ok(),
             "Failed to create client: {:?}",
@@ -361,6 +380,6 @@ mod tests {
         let pods = cluster.list_all_pods().await;
         assert!(pods.is_ok(), "Failed to get pods: {:?}", pods.err());
 
-        let _ = teardown_kind_cluster(&temp_cluster_name).await;
+        let _ = teardown_kind_cluster(temp_cluster).await;
     }
 }
