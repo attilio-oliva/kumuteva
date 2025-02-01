@@ -245,7 +245,7 @@ impl KubernetesClusterBuilder {
                 .await;
             if secret.is_ok() {
                 break secret;
-            } else if tries >= 5 {
+            } else if tries >= 10 {
                 return Err(anyhow::anyhow!(
                     "Secret {} not found in namespace {}",
                     secret_name,
@@ -282,7 +282,7 @@ fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
             "distro": {
                 "k8s": {
                     "enabled": true
-                }
+                },
             },
             "backingStore": {
                 "etcd": {
@@ -290,8 +290,17 @@ fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
                         "enabled": true
                     }
                 }
+            },
+            "proxy": {
+                "port": 30080,
+                "extraSANs": ["localhost", "172.23.0.3"]
             }
         },
+        "exportKubeConfig": {
+            "server": "https://172.23.0.3:30080",
+            "insecure": true,
+        },
+
         // "policies": {
         //     "podSecurityStandard": "baseline",
         //     "resourceQuota": {

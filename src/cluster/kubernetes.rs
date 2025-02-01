@@ -78,6 +78,7 @@ impl KubernetesCluster {
                         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8443),
                     ),
                     protocol: Some("TCP".to_string()),
+                    node_port: Some(30080),
                     ..Default::default()
                 }]),
                 type_: Some("NodePort".to_string()),

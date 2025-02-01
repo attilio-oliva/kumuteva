@@ -16,11 +16,34 @@ pub struct KindCluster {
 
 impl KindCluster {
     pub fn create(name: &str, kubeconfig_path: PathBuf) -> Result<Self> {
+        let config = format!(
+            r#"
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: {cluster_name}
+nodes:
+  - role: control-plane
+    extraPortMappings:
+    - containerPort: {api_server_port1}
+      hostPort: {api_server_port1}
+    - containerPort: {api_server_port2}
+      hostPort: {api_server_port2}
+"#,
+            cluster_name = name,
+            api_server_port1 = 30080,
+            api_server_port2 = 30443
+        );
+
+        let config_path = Path::new("/tmp/kind-config.yaml");
+        let mut file = File::create(config_path).context("Failed to create kind config file")?;
+        file.write_all(config.as_bytes())
+            .context("Failed to write kind config to file")?;
+
         let output = Command::new("kind")
             .arg("create")
             .arg("cluster")
-            .arg("--name")
-            .arg(name)
+            .arg("--config")
+            .arg(config_path)
             .output()
             .context("Failed to execute kind create command")?;
 
