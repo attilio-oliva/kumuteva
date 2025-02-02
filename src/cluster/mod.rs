@@ -3,7 +3,7 @@ mod kind;
 mod kubernetes;
 
 pub use builder::*;
-pub use kind::KindCluster;
+pub use kind::*;
 pub use kubernetes::KubernetesCluster;
 
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};

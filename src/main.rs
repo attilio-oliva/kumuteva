@@ -3,14 +3,15 @@ mod verifier;
 
 use std::path::PathBuf;
 
+use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use cluster::TenantsPortMapping;
 use cluster::{
-    ControlPlaneIsolationTechnology, IsolationTechnology, KindCluster, KubernetesCluster,
-    KubernetesClusterBuilder, NGINX_POD,
+    ControlPlaneIsolation, IsolationTechnology, KindCluster, KubernetesCluster,
+    KubernetesClusterBuilder,
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
-
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
 pub struct Cli {
@@ -26,6 +27,12 @@ enum Commands {
         existing_cluster: bool,
         #[clap(long, default_value = "test-vcluster")]
         cluster_name: String,
+        // Extra port mappings required for a kind cluster
+        // Expected format: "containerPort:hostPort"
+        #[clap(long, value_parser = parse_mapping, default_value = "30010:30001")]
+        tenant1_mapping: (u16, u16),
+        #[clap(long, value_parser = parse_mapping, default_value = "30020:30002")]
+        tenant2_mapping: (u16, u16),
     },
     /// Verify isolation between two clusters
     Verify {
@@ -44,9 +51,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Setup {
             existing_cluster,
             cluster_name,
+            tenant1_mapping,
+            tenant2_mapping,
         } => {
             println!("Setting up test environment...");
-            setup_test_environment(existing_cluster, &cluster_name).await?;
+            let tenants_port_mapings =
+                TenantsPortMapping::from_tuple(tenant1_mapping, tenant2_mapping);
+            setup_test_environment(existing_cluster, &cluster_name, tenants_port_mapings).await?;
             println!("Test environment setup complete");
         }
         Commands::Verify {
@@ -96,9 +107,7 @@ async fn get_or_create_tenant_vcluster(
     println!("Creating {} cluster", tenant);
 
     let tenant_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-        .with_isolation_technology(IsolationTechnology::ControlPlane(
-            ControlPlaneIsolationTechnology::VCluster(tenant.to_string()),
-        ))
+        .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant.to_string()))
         .with_kubeconfig_path(kubeconfig_path)
         .build()
         .await?;
@@ -106,7 +115,11 @@ async fn get_or_create_tenant_vcluster(
     Ok(tenant_cluster)
 }
 
-async fn setup_test_environment(existing_cluster: bool, cluster_name: &str) -> anyhow::Result<()> {
+async fn setup_test_environment(
+    existing_cluster: bool,
+    cluster_name: &str,
+    port_mappings: TenantsPortMapping,
+) -> anyhow::Result<()> {
     let test_kubeconfig = PathBuf::from("/tmp/test-vcluster.kubeconfig");
 
     let kind_cluster = if existing_cluster {
@@ -114,7 +127,7 @@ async fn setup_test_environment(existing_cluster: bool, cluster_name: &str) -> a
         KindCluster::load(cluster_name, test_kubeconfig.clone())?
     } else {
         println!("Creating new kind cluster '{}'", cluster_name);
-        KindCluster::create(cluster_name, test_kubeconfig.clone())?
+        KindCluster::create(cluster_name, test_kubeconfig.clone(), port_mappings)?
     };
 
     let tenant1_kubeconfig = PathBuf::from("/tmp/tenant1-vcluster.kubeconfig");
@@ -146,4 +159,14 @@ pub async fn list_pods(client: Client) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_mapping(s: &str) -> anyhow::Result<(u16, u16)> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return Err(anyhow!("Invalid format, expected 'containerPort:hostPort'"));
+    }
+    let container = parts[0].parse().context("Invalid container port")?;
+    let host = parts[1].parse().context("Invalid host port")?;
+    Ok((container, host))
 }

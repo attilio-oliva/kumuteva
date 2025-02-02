@@ -369,7 +369,7 @@ mod tests {
 
     fn setup_kind_cluster(name: &str) -> anyhow::Result<KindCluster> {
         let kubeconfig_path = temp_kubeconfig_path(name);
-        KindCluster::create(name, kubeconfig_path)
+        KindCluster::create(name, kubeconfig_path, Default::default())
     }
 
     async fn teardown_kind_cluster(cluster: KindCluster) -> anyhow::Result<()> {

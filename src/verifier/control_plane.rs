@@ -148,7 +148,7 @@ async fn cleanup_tenant_pod(cluster: &KubernetesCluster, pod_name: &str) -> Resu
 mod tests {
     use super::*;
     use crate::cluster::{
-        ControlPlaneIsolationTechnology, IsolationTechnology, KindCluster, KubernetesClusterBuilder,
+        ControlPlaneIsolation, IsolationTechnology, KindCluster, KubernetesClusterBuilder,
     };
     use std::path::PathBuf;
 
@@ -184,8 +184,13 @@ mod tests {
     async fn test_native_object_isolation() {
         let config =
             TestClusterConfig::new(&format!("{}-obj-isolation-native", CLUSTER_NAME_PREFIX));
-        let kind_cluster =
-            KindCluster::create(&config.name, config.kubeconfig_path.clone()).unwrap();
+
+        let kind_cluster = KindCluster::create(
+            &config.name,
+            config.kubeconfig_path.clone(),
+            Default::default(),
+        )
+        .unwrap();
 
         let tenant1_cluster = setup_test_cluster(&config).await.unwrap();
         let tenant2_cluster = setup_test_cluster(&config).await.unwrap();
@@ -200,16 +205,18 @@ mod tests {
     async fn test_vcluster_object_isolation() {
         let base_config =
             TestClusterConfig::new(&format!("{}-obj-isolation-vcluster", CLUSTER_NAME_PREFIX));
-        let kind_cluster =
-            KindCluster::create(&base_config.name, base_config.kubeconfig_path.clone()).unwrap();
+        let kind_cluster = KindCluster::create(
+            &base_config.name,
+            base_config.kubeconfig_path.clone(),
+            Default::default(),
+        )
+        .unwrap();
 
         let tenant1_config = TestClusterConfig::new(&format!("tenant1-{}", base_config.name));
         let tenant2_config = TestClusterConfig::new(&format!("tenant2-{}", base_config.name));
 
         let tenant1_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-            .with_isolation_technology(IsolationTechnology::ControlPlane(
-                ControlPlaneIsolationTechnology::VCluster(tenant1_config.name.clone()),
-            ))
+            .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant1_config.name.clone()))
             .with_kubeconfig_path(tenant1_config.kubeconfig_path)
             .build()
             .await
@@ -218,9 +225,7 @@ mod tests {
         tenant1_cluster.ensure_cluster_is_ready().await.unwrap();
 
         let tenant2_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-            .with_isolation_technology(IsolationTechnology::ControlPlane(
-                ControlPlaneIsolationTechnology::VCluster(tenant2_config.name.clone()),
-            ))
+            .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant2_config.name.clone()))
             .with_kubeconfig_path(tenant2_config.kubeconfig_path)
             .build()
             .await

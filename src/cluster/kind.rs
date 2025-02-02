@@ -7,36 +7,95 @@ use std::{
 };
 
 use anyhow::{Context, Error, Result};
+use serde_json::json;
 
 #[derive(Debug, Clone)]
 pub struct KindCluster {
     pub name: String,
     pub kubeconfig_path: PathBuf,
+    pub port_mappings: TenantsPortMapping,
+}
+
+#[derive(Debug, Clone)]
+pub struct TenantsPortMapping {
+    pub tenant1: PortMapping,
+    pub tenant2: PortMapping,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortMapping {
+    pub container_port: u16,
+    pub host_port: u16,
+}
+
+impl Default for TenantsPortMapping {
+    fn default() -> Self {
+        Self {
+            tenant1: PortMapping {
+                container_port: 30010,
+                host_port: 30001,
+            },
+            tenant2: PortMapping {
+                container_port: 30020,
+                host_port: 30002,
+            },
+        }
+    }
+}
+
+impl TenantsPortMapping {
+    pub fn new(tenant1: PortMapping, tenant2: PortMapping) -> Self {
+        Self { tenant1, tenant2 }
+    }
+
+    pub fn from_tuple(tenant1: (u16, u16), tenant2: (u16, u16)) -> Self {
+        Self {
+            tenant1: PortMapping {
+                container_port: tenant1.0,
+                host_port: tenant1.1,
+            },
+            tenant2: PortMapping {
+                container_port: tenant2.0,
+                host_port: tenant2.1,
+            },
+        }
+    }
 }
 
 impl KindCluster {
-    pub fn create(name: &str, kubeconfig_path: PathBuf) -> Result<Self> {
-        let config = format!(
-            r#"
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-name: {cluster_name}
-nodes:
-  - role: control-plane
-    extraPortMappings:
-    - containerPort: {api_server_port1}
-      hostPort: 30000
-    - containerPort: {api_server_port2}
-      hostPort: 30001
-"#,
-            cluster_name = name,
-            api_server_port1 = 30080,
-            api_server_port2 = 30443
-        );
+    pub fn create(
+        name: &str,
+        kubeconfig_path: PathBuf,
+        tenants_port_mapping: TenantsPortMapping,
+    ) -> Result<Self> {
+        let (tenant1_mapping, tenant2_mapping) =
+            (&tenants_port_mapping.tenant1, &tenants_port_mapping.tenant2);
+
+        let config_json = json!({
+            "kind": "Cluster",
+            "apiVersion": "kind.x-k8s.io/v1alpha4",
+            "name": name,
+            "nodes": [{
+                "role": "control-plane",
+                "extraPortMappings": [
+                    {
+                        "containerPort": tenant1_mapping.container_port,
+                        "hostPort": tenant1_mapping.host_port
+                    },
+                    {
+                        "containerPort": tenant2_mapping.container_port,
+                        "hostPort": tenant2_mapping.host_port
+                    }
+                ]
+            }]
+        });
+
+        let yaml_config =
+            serde_yaml::to_string(&config_json).context("Failed to convert JSON config to YAML")?;
 
         let config_path = Path::new("/tmp/kind-config.yaml");
         let mut file = File::create(config_path).context("Failed to create kind config file")?;
-        file.write_all(config.as_bytes())
+        file.write_all(yaml_config.as_bytes())
             .context("Failed to write kind config to file")?;
 
         let output = Command::new("kind")
@@ -53,6 +112,7 @@ nodes:
             Ok(Self {
                 name,
                 kubeconfig_path,
+                port_mappings: tenants_port_mapping,
             })
         } else {
             Err(terminal_stderr_to_error(output))
@@ -91,6 +151,8 @@ nodes:
                 Ok(Self {
                     name,
                     kubeconfig_path,
+                    // TODO: load port mappings by parsing the kind cluster config
+                    port_mappings: TenantsPortMapping::default(),
                 })
             } else {
                 Err(Error::msg("Cluster does not exist"))
@@ -154,7 +216,21 @@ mod tests {
 
     #[test]
     fn test_create_and_delete_kind_cluster() {
-        let cluster = KindCluster::create(CLUSTER_NAME, PathBuf::from(TEMP_KUBECONFIG_PATH));
+        let dummy_port_mapping = TenantsPortMapping {
+            tenant1: PortMapping {
+                container_port: 31111,
+                host_port: 32222,
+            },
+            tenant2: PortMapping {
+                container_port: 33333,
+                host_port: 34444,
+            },
+        };
+        let cluster = KindCluster::create(
+            CLUSTER_NAME,
+            PathBuf::from(TEMP_KUBECONFIG_PATH),
+            dummy_port_mapping,
+        );
         assert!(
             cluster.is_ok(),
             "Failed to create a Kind cluster: {:?}",

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{anyhow, Context, Ok};
 use k8s_openapi::api::core::v1::Secret;
@@ -11,12 +11,12 @@ use serde_json::json;
 
 #[derive(Debug, Clone)]
 pub enum IsolationTechnology {
-    ControlPlane(ControlPlaneIsolationTechnology),
-    DataPlane(DataPlaneIsolationTechnology),
+    ControlPlane(ControlPlaneIsolation),
+    DataPlane(DataPlaneIsolation),
 }
 
 #[derive(Debug, Clone)]
-pub enum ControlPlaneIsolationTechnology {
+pub enum ControlPlaneIsolation {
     Capsule,
     /// vCluster virtual control plane in the given namespace
     VCluster(String),
@@ -24,10 +24,10 @@ pub enum ControlPlaneIsolationTechnology {
 }
 
 #[derive(Debug, Clone)]
-pub enum DataPlaneIsolationTechnology {
+pub enum DataPlaneIsolation {
     Network(NetworkIsolationStrategy),
-    Storage(StorageIsolationTechnology),
-    Workload(WorkloadIsolationTechnology),
+    Storage(StorageIsolationStrategy),
+    Workload(WorkloadIsolation),
 }
 
 #[derive(Debug, Clone)]
@@ -36,13 +36,13 @@ pub enum NetworkIsolationStrategy {
 }
 
 #[derive(Debug, Clone)]
-pub enum StorageIsolationTechnology {
+pub enum StorageIsolationStrategy {
     SeparateStorageClass,
     ReclaimPolicySetToDelete,
 }
 
 #[derive(Debug, Clone)]
-pub enum WorkloadIsolationTechnology {
+pub enum WorkloadIsolation {
     VM(VirtualMachineSandboxing),
     UserspaceKernel(UserspaceKernelSandboxing),
 }
@@ -55,6 +55,18 @@ pub enum VirtualMachineSandboxing {
 #[derive(Debug, Clone)]
 pub enum UserspaceKernelSandboxing {
     GVisor,
+}
+
+impl From<ControlPlaneIsolation> for IsolationTechnology {
+    fn from(tech: ControlPlaneIsolation) -> Self {
+        IsolationTechnology::ControlPlane(tech)
+    }
+}
+
+impl From<DataPlaneIsolation> for IsolationTechnology {
+    fn from(tech: DataPlaneIsolation) -> Self {
+        IsolationTechnology::DataPlane(tech)
+    }
 }
 
 pub struct KubernetesClusterBuilder {
@@ -72,8 +84,12 @@ impl KubernetesClusterBuilder {
         }
     }
 
-    pub fn with_isolation_technology(mut self, isolation_technology: IsolationTechnology) -> Self {
-        self.isolation_technologies.push(isolation_technology);
+    // A single builder method taking any type that converts into IsolationTechnology.
+    pub fn with_isolation_technology<T: Into<IsolationTechnology>>(
+        mut self,
+        technology: T,
+    ) -> Self {
+        self.isolation_technologies.push(technology.into());
         self
     }
 
@@ -83,10 +99,7 @@ impl KubernetesClusterBuilder {
     }
 
     pub async fn build(self) -> anyhow::Result<KubernetesCluster> {
-        // for each isolation technology, apply the necessary configuration
-
-        // take first the control plane isolation technologies
-        let control_plane_isolation_technologies: Vec<ControlPlaneIsolationTechnology> = self
+        let control_plane_isolation_technologies: Vec<ControlPlaneIsolation> = self
             .isolation_technologies
             .iter()
             .filter_map(|isolation_technology| match isolation_technology {
@@ -97,7 +110,7 @@ impl KubernetesClusterBuilder {
             })
             .collect();
 
-        let data_plane_isolation_technologies: Vec<DataPlaneIsolationTechnology> = self
+        let data_plane_isolation_technologies: Vec<DataPlaneIsolation> = self
             .isolation_technologies
             .iter()
             .filter_map(|isolation_technology| match isolation_technology {
@@ -123,19 +136,15 @@ impl KubernetesClusterBuilder {
 
     async fn apply_control_plane_isolation_technology(
         &self,
-        control_plane_isolation_technology: ControlPlaneIsolationTechnology,
+        control_plane_isolation_technology: ControlPlaneIsolation,
     ) -> anyhow::Result<()> {
         match control_plane_isolation_technology {
-            ControlPlaneIsolationTechnology::Capsule => {
-                // apply capsule isolation
+            ControlPlaneIsolation::Capsule => {
                 Err(anyhow!("Capsule isolation is not implemented yet"))
             }
-            ControlPlaneIsolationTechnology::VCluster(namespace) => {
-                self.deploy_vcluster(&namespace).await
-            }
+            ControlPlaneIsolation::VCluster(namespace) => self.deploy_vcluster(&namespace).await,
 
-            ControlPlaneIsolationTechnology::KubeVirt => {
-                // apply kubevirt isolation
+            ControlPlaneIsolation::KubeVirt => {
                 Err(anyhow!("KubeVirt isolation is not implemented yet"))
             }
         }
@@ -143,18 +152,16 @@ impl KubernetesClusterBuilder {
 
     fn apply_data_plane_isolation_technology(
         &self,
-        data_plane_isolation_technology: DataPlaneIsolationTechnology,
+        data_plane_isolation_technology: DataPlaneIsolation,
     ) -> anyhow::Result<()> {
         match data_plane_isolation_technology {
-            DataPlaneIsolationTechnology::Network(network_isolation_strategy) => {
-                // apply network isolation
+            DataPlaneIsolation::Network(network_isolation_strategy) => {
                 Err(anyhow!("Network isolation is not implemented yet"))
             }
-            DataPlaneIsolationTechnology::Storage(storage_isolation_technology) => {
-                // apply storage isolation
+            DataPlaneIsolation::Storage(storage_isolation_technology) => {
                 Err(anyhow!("Storage isolation is not implemented yet"))
             }
-            DataPlaneIsolationTechnology::Workload(workload_isolation_technology) => {
+            DataPlaneIsolation::Workload(workload_isolation_technology) => {
                 Err(anyhow!("Workload isolation is not implemented yet"))
             }
         }
@@ -230,19 +237,17 @@ impl KubernetesClusterBuilder {
         // kind cluster exposes the api server on a different port
         // We need to force the API server port to be on a specific port
         // because the kind mapping takes it and maps it to a different host port
-        let kind_port_mapping = [("tenant1", 30080, 30000), ("tenant2", 30443, 30001)];
-        let nodeport = kind_port_mapping
-            .iter()
-            .find(|(ns, _, _)| *ns == namespace)
-            .map(|(_, kind_port, _)| kind_port)
-            .ok_or_else(|| anyhow!("Nodeport not found"))?;
-        let host_port = kind_port_mapping
-            .iter()
-            .find(|(ns, _, _)| *ns == namespace)
-            .map(|(_, _, host_port)| host_port)
-            .ok_or_else(|| anyhow!("Host port not found"))?;
+        let tenant_mapping = match namespace {
+            "tenant1" => &self.kind_cluster.port_mappings.tenant1,
+            "tenant2" => &self.kind_cluster.port_mappings.tenant2,
+            _ => return Err(anyhow!("No port mapping for namespace {}", namespace)),
+        };
+
+        let nodeport = tenant_mapping.container_port;
+        let host_port = tenant_mapping.host_port;
+
         let selector = Some({
-            let mut map = std::collections::BTreeMap::new();
+            let mut map = BTreeMap::new();
             map.insert("app".to_string(), "vcluster".to_string());
             map.insert(
                 "release".to_string(),
@@ -251,7 +256,7 @@ impl KubernetesClusterBuilder {
             map
         });
         let service = cluster
-            .create_nodeport_service(namespace, selector, Some(*nodeport))
+            .create_nodeport_service(namespace, selector, Some(nodeport.into()))
             .await?;
 
         //get the nodeport
@@ -262,7 +267,7 @@ impl KubernetesClusterBuilder {
             .ok_or_else(|| anyhow!("Nodeport not found"))?;
         println!("Nodeport: {}", nodeport);
 
-        // adjust kubeconfig to use the new port
+        // adjust kubeconfig to use the new port (8443 is the default one)
         let kubeconfig = std::fs::read_to_string(&self.kubeconfig_path)?;
         let kubeconfig = kubeconfig.replace("8443", &host_port.to_string());
         std::fs::write(&self.kubeconfig_path, kubeconfig)?;
@@ -368,7 +373,7 @@ mod tests {
     impl TestCluster {
         async fn create(name: &str) -> anyhow::Result<Self> {
             let kubeconfig_path = temp_kubeconfig_path(name);
-            let _ = KindCluster::create(name, kubeconfig_path.clone())?;
+            let _ = KindCluster::create(name, kubeconfig_path.clone(), Default::default())?;
             Ok(Self {
                 name: name.to_string(),
                 kubeconfig_path,
@@ -402,9 +407,7 @@ mod tests {
             KindCluster::load(&temp_cluster_name, kind_kubeconfig_path).unwrap(),
         )
         .with_kubeconfig_path(vcluster_kubeconfig_path)
-        .with_isolation_technology(IsolationTechnology::ControlPlane(
-            ControlPlaneIsolationTechnology::VCluster(String::from(namespace)),
-        ))
+        .with_isolation_technology(ControlPlaneIsolation::VCluster(String::from(namespace)))
         .build()
         .await;
         assert!(
