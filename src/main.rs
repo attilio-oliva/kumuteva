@@ -10,6 +10,7 @@ use cluster::{
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
+
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
 pub struct Cli {
@@ -73,44 +74,60 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn get_or_create_tenant_vcluster(
+    kind_cluster: &KindCluster,
+    tenant: &str,
+    kubeconfig_path: PathBuf,
+) -> anyhow::Result<KubernetesCluster> {
+    if let Ok(existing_cluster) = KubernetesCluster::load(&kubeconfig_path).await {
+        println!("Tenant {} cluster already exists", tenant);
+        if let Ok(health) = existing_cluster.list_all_pods().await {
+            println!(
+                "Tenant {} cluster is healthy ({} pods)",
+                tenant,
+                health.items.len()
+            );
+            return Ok(existing_cluster);
+        } else {
+            println!("Tenant {} cluster is not healthy, recreating...", tenant);
+        }
+    }
+
+    println!("Creating {} cluster", tenant);
+
+    let tenant_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
+        .with_isolation_technology(IsolationTechnology::ControlPlane(
+            ControlPlaneIsolationTechnology::VCluster(tenant.to_string()),
+        ))
+        .with_kubeconfig_path(kubeconfig_path)
+        .build()
+        .await?;
+    tenant_cluster.ensure_cluster_is_ready().await?;
+    Ok(tenant_cluster)
+}
+
 async fn setup_test_environment(existing_cluster: bool, cluster_name: &str) -> anyhow::Result<()> {
-    let name = "test-vcluster";
-    let kubeconfig_path = PathBuf::from("/tmp/test-vcluster.kubeconfig");
+    let test_kubeconfig = PathBuf::from("/tmp/test-vcluster.kubeconfig");
 
     let kind_cluster = if existing_cluster {
         println!("Using existing kind cluster '{}'", cluster_name);
-        KindCluster::load(cluster_name, kubeconfig_path.clone())?
+        KindCluster::load(cluster_name, test_kubeconfig.clone())?
     } else {
         println!("Creating new kind cluster '{}'", cluster_name);
-        KindCluster::create(cluster_name, kubeconfig_path.clone())?
+        KindCluster::create(cluster_name, test_kubeconfig.clone())?
     };
 
-    let tenant1_kubeconfig_path = PathBuf::from("/tmp/tenant1-vcluster.kubeconfig");
-    let tenant2_kubeconfig_path = PathBuf::from("/tmp/tenant2-vcluster.kubeconfig");
+    let tenant1_kubeconfig = PathBuf::from("/tmp/tenant1-vcluster.kubeconfig");
+    let tenant2_kubeconfig = PathBuf::from("/tmp/tenant2-vcluster.kubeconfig");
 
-    let tenant1_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-        .with_isolation_technology(IsolationTechnology::ControlPlane(
-            ControlPlaneIsolationTechnology::VCluster("tenant1".to_string()),
-        ))
-        .with_kubeconfig_path(tenant1_kubeconfig_path)
-        .build()
-        .await?;
-
-    tenant1_cluster.ensure_cluster_is_ready().await?;
-
-    let tenant2_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-        .with_isolation_technology(IsolationTechnology::ControlPlane(
-            ControlPlaneIsolationTechnology::VCluster("tenant2".to_string()),
-        ))
-        .with_kubeconfig_path(tenant2_kubeconfig_path)
-        .build()
-        .await?;
-
-    tenant2_cluster.ensure_cluster_is_ready().await?;
+    let _tenant1_cluster =
+        get_or_create_tenant_vcluster(&kind_cluster, "tenant1", tenant1_kubeconfig.clone()).await?;
+    let _tenant2_cluster =
+        get_or_create_tenant_vcluster(&kind_cluster, "tenant2", tenant2_kubeconfig.clone()).await?;
 
     println!("Created test clusters:");
-    println!("Tenant 1 kubeconfig: /tmp/tenant1-vcluster.kubeconfig");
-    println!("Tenant 2 kubeconfig: /tmp/tenant2-vcluster.kubeconfig");
+    println!("Tenant 1 kubeconfig: {}", tenant1_kubeconfig.display());
+    println!("Tenant 2 kubeconfig: {}", tenant2_kubeconfig.display());
 
     Ok(())
 }

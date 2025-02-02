@@ -13,6 +13,7 @@ use kube::{api::PostParams, Api, Client};
 use futures::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -33,30 +34,12 @@ impl KubernetesCluster {
         Ok(Self { client })
     }
 
-    pub async fn create_nodeport_service(&self, namespace: &str) -> Result<Service> {
-        /*
-                // create a NodePort service to access the vcluster
-                            let service_name = "vcluster-service";
-                            let service_port = 6443;
-                            let service_type = "NodePort";
-                            let service_manifest = format!(
-                                r#"
-        apiVersion: v1
-        kind: Service
-        metadata:
-          name: {service_name}
-          namespace: {namespace}
-        spec:
-          selector:
-            app: vcluster
-            release: {release_name}
-          ports:
-            - name: https
-              port: 443
-              targetPort: 8443
-              protocol: TCP
-          type: NodePort
-        "#, */
+    pub async fn create_nodeport_service(
+        &self,
+        namespace: &str,
+        selector: Option<BTreeMap<String, String>>,
+        chosen_port: Option<i32>,
+    ) -> Result<Service> {
         let api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let service = Service {
             metadata: ObjectMeta {
@@ -65,12 +48,7 @@ impl KubernetesCluster {
                 ..Default::default()
             },
             spec: Some(k8s_openapi::api::core::v1::ServiceSpec {
-                selector: Some({
-                    let mut map = std::collections::BTreeMap::new();
-                    map.insert("app".to_string(), "vcluster".to_string());
-                    map.insert("release".to_string(), "vcluster-tenant1".to_string());
-                    map
-                }),
+                selector,
                 ports: Some(vec![k8s_openapi::api::core::v1::ServicePort {
                     name: Some("https".to_string()),
                     port: 443,
@@ -78,7 +56,7 @@ impl KubernetesCluster {
                         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8443),
                     ),
                     protocol: Some("TCP".to_string()),
-                    node_port: Some(30080),
+                    node_port: chosen_port,
                     ..Default::default()
                 }]),
                 type_: Some("NodePort".to_string()),
@@ -149,6 +127,21 @@ impl KubernetesCluster {
         Ok(pods)
     }
 
+    pub async fn list_pods_with_label_in_namespace(
+        &self,
+        label: &str,
+        namespace: &str,
+    ) -> Result<ObjectList<Pod>> {
+        let api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pods = api
+            .list(&ListParams {
+                label_selector: Some(String::from(label)),
+                ..Default::default()
+            })
+            .await?;
+        Ok(pods)
+    }
+
     pub async fn list_pods_with_label(&self, label: &str) -> Result<ObjectList<Pod>> {
         let api: Api<Pod> = Api::all(self.client.clone());
         let pods = api
@@ -181,6 +174,99 @@ impl KubernetesCluster {
             status.phase == Some("Running".to_string())
         );
         Ok(status.phase == Some("Running".to_string()))
+    }
+
+    /*
+    pub async fn wait_for_resource_to_be_ready<R>(
+        &self,
+        resource_name: &str,
+        namespace: &str,
+    ) -> Result<()>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Metadata<Ty = ObjectMeta>
+            + Clone
+            + std::fmt::Debug
+            + serde::de::DeserializeOwned,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", resource_name))
+            .timeout(290); // upper bound of how long we watch for
+
+        let resource_ready = api.get(resource_name).await.is_ok();
+
+        if resource_ready {
+            return Ok(());
+        }
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(status) = stream.try_next().await? {
+            if let WatchEvent::Modified(s) = status {
+                println!("Resource modified: {:?}", s);
+                // Add your custom logic to check if the resource is ready
+                // For example, if the resource has a condition field, you can check it here
+                if let Some(conditions) =
+                    s.metadata().annotations.clone().unwrap().get("conditions")
+                {
+                    if conditions.contains("Ready") {
+                        return Ok(());
+                    }
+                }
+                return Ok(());
+            } else {
+                println!("New event on resource: {:?}", status);
+                if api.get(resource_name).await.is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        println!("Resource become ready in time");
+        Ok(())
+    }
+    */
+
+    pub async fn wait_for_resource_to_be_created<R>(
+        &self,
+        resource_name: &str,
+        namespace: &str,
+    ) -> Result<()>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Metadata<Ty = ObjectMeta>
+            + Clone
+            + std::fmt::Debug
+            + serde::de::DeserializeOwned,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", resource_name))
+            .timeout(290); // upper bound of how long we watch for
+
+        let resource_created = api.get(resource_name).await.is_ok();
+
+        if resource_created {
+            return Ok(());
+        }
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(status) = stream.try_next().await? {
+            if let WatchEvent::Added(s) = status {
+                println!("Resource added: {:?}", s.name());
+                return Ok(());
+            } else {
+                println!("New event on resource: {:?}", status);
+                if api.get(resource_name).await.is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        println!("Resource created in time");
+        Ok(())
     }
 
     pub async fn wait_for_pod_to_be_ready(&self, pod_name: &str, namespace: &str) -> Result<()> {

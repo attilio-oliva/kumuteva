@@ -25,9 +25,9 @@ nodes:
   - role: control-plane
     extraPortMappings:
     - containerPort: {api_server_port1}
-      hostPort: {api_server_port1}
+      hostPort: 30000
     - containerPort: {api_server_port2}
-      hostPort: {api_server_port2}
+      hostPort: 30001
 "#,
             cluster_name = name,
             api_server_port1 = 30080,

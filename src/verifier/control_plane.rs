@@ -14,7 +14,7 @@ pub async fn check_object_isolation(
     let pod_name = get_pod_name();
 
     // Deploy and verify pod for tenant1
-    deploy_tenant_pod(tenant1_cluster, &pod_name).await?;
+    deploy_tenant_pod(tenant1_cluster, &pod_name, TENANT1_NS).await?;
 
     // Verify tenant2 cannot access tenant1's pod
     assert_pod_isolation(tenant2_cluster, &pod_name).await?;
@@ -106,14 +106,19 @@ fn get_pod_name() -> String {
         .unwrap_or_else(|| POD_DEFAULT_NAME.to_string())
 }
 
-async fn deploy_tenant_pod(cluster: &KubernetesCluster, pod_name: &str) -> Result<()> {
+async fn deploy_tenant_pod(
+    cluster: &KubernetesCluster,
+    pod_name: &str,
+    namespace: &str,
+) -> Result<()> {
+    cluster.create_namespace_if_not_exists(namespace).await?;
     cluster
-        .create_pod_in_namespace(&NGINX_POD, TENANT1_NS)
+        .create_pod_in_namespace(&NGINX_POD, namespace)
         .await
         .context("Failed to create tenant pod")?;
 
     cluster
-        .get_pod_in_namespace(pod_name, TENANT1_NS)
+        .get_pod_in_namespace(pod_name, namespace)
         .await
         .context("Failed to verify tenant pod creation")?;
 
