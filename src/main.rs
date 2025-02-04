@@ -49,40 +49,68 @@ enum Commands {
 struct Tenant1SetupConfig {
     /// Short style: Provide tenant namespace and optional mapping.
     /// Example: --tenant1 tenant1-namespace [TENANT1_MAPPING]
-    #[clap(long = "tenant1", value_names = &["TENANT1_NAMESPACE", "TENANT1_MAPPING"], num_args = 1..=2, conflicts_with_all = &["tenant1_ns", "tenant1_mapping"])]
+    #[clap(
+        long = "tenant1",
+        name = "tenant1",
+        value_names = &["TENANT1_NAMESPACE", "TENANT1_MAPPING"],
+        num_args = 1..=2,
+        conflicts_with_all = &["tenant1_ns", "tenant1_mapping"]
+    )]
     tenant1_short: Option<Vec<String>>,
 
     /// Long style: Tenant namespace.
-    #[clap(long = "tenant1-ns", conflicts_with = "tenant1_short")]
-    tenant1_ns: Option<String>,
+    #[clap(
+        long = "tenant1-ns",
+        default_value = "tenant1",
+        conflicts_with = "tenant1"
+    )]
+    tenant1_ns: String,
 
     /// Long style: Port mapping in format containerPort:hostPort.
-    #[clap(long = "tenant1-mapping", value_parser = parse_mapping, conflicts_with = "tenant1_short")]
-    tenant1_mapping: Option<(u16, u16)>,
+    #[clap(
+        long = "tenant1-mapping",
+        value_parser = parse_mapping,
+        default_value = "30010:30001",
+        conflicts_with = "tenant1"
+    )]
+    tenant1_mapping: (u16, u16),
 }
 
 #[derive(Debug, Parser)]
 struct Tenant2SetupConfig {
     /// Short style: Provide tenant namespace and optional mapping.
     /// Example: --tenant2 tenant2-namespace [TENANT2_MAPPING]
-    #[clap(long = "tenant2", value_names = &["TENANT2_NAMESPACE", "TENANT2_MAPPING"], num_args = 1..=2, conflicts_with_all = &["tenant2_ns", "tenant2_mapping"])]
+    #[clap(
+        long = "tenant2",
+        name = "tenant2",
+        value_names = &["TENANT2_NAMESPACE", "TENANT2_MAPPING"],
+        num_args = 1..=2,
+        conflicts_with_all = &["tenant2_ns", "tenant2_mapping"]
+    )]
     tenant2_short: Option<Vec<String>>,
 
     /// Long style: Tenant namespace.
-    #[clap(long = "tenant2-ns", conflicts_with = "tenant2_short")]
-    tenant2_ns: Option<String>,
+    #[clap(
+        long = "tenant2-ns",
+        default_value = "tenant2",
+        conflicts_with = "tenant2"
+    )]
+    tenant2_ns: String,
 
     /// Long style: Port mapping in format containerPort:hostPort.
-    #[clap(long = "tenant2-mapping", value_parser = parse_mapping, conflicts_with = "tenant2_short")]
-    tenant2_mapping: Option<(u16, u16)>,
+    #[clap(
+        long = "tenant2-mapping",
+        value_parser = parse_mapping,
+        default_value = "30020:30002",
+        conflicts_with = "tenant2"
+    )]
+    tenant2_mapping: (u16, u16),
 }
 
 fn resolve_tenant_config(
     short: &Option<Vec<String>>,
-    ns: &Option<String>,
-    mapping: &Option<(u16, u16)>,
     default_ns: &str,
-    default_mapping: &str,
+    default_mapping: &(u16, u16),
 ) -> anyhow::Result<(String, (u16, u16))> {
     let tenant_ns = if let Some(short_values) = short {
         short_values
@@ -90,19 +118,17 @@ fn resolve_tenant_config(
             .cloned()
             .unwrap_or_else(|| default_ns.to_string())
     } else {
-        ns.clone().unwrap_or_else(|| default_ns.to_string())
+        String::from(default_ns)
     };
 
     let tenant_mapping = if let Some(short_values) = short {
         if short_values.len() > 1 {
             parse_mapping(&short_values[1])?
         } else {
-            parse_mapping(default_mapping)?
+            *default_mapping
         }
-    } else if let Some(m) = mapping {
-        *m
     } else {
-        parse_mapping(default_mapping)?
+        *default_mapping
     };
 
     Ok((tenant_ns, tenant_mapping))
@@ -110,25 +136,13 @@ fn resolve_tenant_config(
 
 impl Tenant1SetupConfig {
     fn get_config(&self) -> anyhow::Result<(String, (u16, u16))> {
-        resolve_tenant_config(
-            &self.tenant1_short,
-            &self.tenant1_ns,
-            &self.tenant1_mapping,
-            "tenant1",
-            "30010:30001",
-        )
+        resolve_tenant_config(&self.tenant1_short, &self.tenant1_ns, &self.tenant1_mapping)
     }
 }
 
 impl Tenant2SetupConfig {
     fn get_config(&self) -> anyhow::Result<(String, (u16, u16))> {
-        resolve_tenant_config(
-            &self.tenant2_short,
-            &self.tenant2_ns,
-            &self.tenant2_mapping,
-            "tenant2",
-            "30020:30002",
-        )
+        resolve_tenant_config(&self.tenant2_short, &self.tenant2_ns, &self.tenant2_mapping)
     }
 }
 
