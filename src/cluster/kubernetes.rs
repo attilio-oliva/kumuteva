@@ -2,7 +2,7 @@ use anyhow::{Error, Result};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service, ServiceAccount};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-use k8s_openapi::{Metadata, NamespaceResourceScope, Resource};
+use k8s_openapi::{ClusterResourceScope, Metadata, NamespaceResourceScope, Resource};
 use kube::api::{ListParams, ObjectList, ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams};
 use kube::config::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use super::{Foo, KindCluster};
+use super::{DummyCRD, KindCluster};
 
 /// An abstraction over a Kubernetes client.
 /// This struct is used to interact with a Kubernetes cluster using `kube` crate.
@@ -119,6 +119,47 @@ impl KubernetesCluster {
 
     pub async fn create_pod_in_namespace(&self, pod: &Pod, namespace: &str) -> Result<Pod> {
         self.create_pod(pod, Some(namespace)).await
+    }
+
+    pub async fn create_namespaced_resource<R>(&self, namespace: &str, resource: &R) -> Result<R>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+        let created = api.create(&PostParams::default(), resource).await?;
+        Ok(created)
+    }
+
+    pub async fn create_cluster_resource<R>(&self, resource: &R) -> Result<R>
+    where
+        R: Resource<Scope = ClusterResourceScope>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::all(self.client.clone());
+        let created = api.create(&PostParams::default(), resource).await?;
+        Ok(created)
+    }
+
+    pub async fn create_dummy_crd_resource(
+        &self,
+        namespace: &str,
+        resource: DummyCRD,
+    ) -> Result<()> {
+        let crd_api: Api<DummyCRD> = Api::namespaced(self.client.clone(), namespace);
+        let crd_name = resource.name().unwrap();
+        let patch_params = PatchParams::apply(&crd_name);
+        let patch = Patch::Apply(resource.clone());
+        crd_api.patch(&crd_name, &patch_params, &patch).await?;
+        Ok(())
     }
 
     pub async fn list_all_pods(&self) -> Result<ObjectList<Pod>> {
@@ -298,19 +339,38 @@ impl KubernetesCluster {
         Ok(())
     }
 
-    pub async fn publish_namespaced_crd<C>(&self) -> Result<()>
+    pub async fn publish_crd<C>(&self) -> Result<()>
     where
-        C: CustomResourceExt + Resource<Scope = NamespaceResourceScope> + Metadata<Ty = ObjectMeta>,
+        C: CustomResourceExt,
     {
-        let crd = C::crd();
-        let crd_name = crd.name().unwrap();
+        let crd_name = C::crd_name();
         let crds: Api<CustomResourceDefinition> = Api::all(self.client.clone());
-        crds.patch(
-            &crd_name,
-            &PatchParams::apply("myapp"),
-            &Patch::Apply(C::crd()),
-        )
-        .await?;
+
+        let crd_exists = crds.get(crd_name).await.is_ok();
+
+        if crd_exists {
+            return Err(Error::msg("CRD already exists"));
+        }
+
+        crds.create(&PostParams::default(), &C::crd()).await?;
+
+        Ok(())
+    }
+
+    pub async fn unpublish_crd<C>(&self) -> Result<()>
+    where
+        C: CustomResourceExt,
+    {
+        let crd_name = C::crd_name();
+        let crds: Api<CustomResourceDefinition> = Api::all(self.client.clone());
+
+        let crd_exists = crds.get(crd_name).await.is_ok();
+
+        if !crd_exists {
+            return Err(Error::msg("CRD does not exist"));
+        }
+
+        crds.delete(crd_name, &Default::default()).await?;
 
         Ok(())
     }

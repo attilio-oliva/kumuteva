@@ -29,7 +29,7 @@ pub static NGINX_POD: LazyLock<Pod> = LazyLock::new(|| Pod {
 });
 
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[kube(group = "example.dev", version = "v1", kind = "Foo", namespaced)]
-pub struct FooSpec {
-    info: String,
+#[kube(group = "example.dev", version = "v1", kind = "DummyCRD", namespaced)]
+pub struct DummyCRDSpec {
+    pub info: String,
 }

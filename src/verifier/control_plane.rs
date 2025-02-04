@@ -1,9 +1,8 @@
-use crate::cluster::{KubernetesCluster, NGINX_POD};
+use crate::cluster::{DummyCRD, DummyCRDSpec, KubernetesCluster, NGINX_POD};
 use anyhow::{Context, Result};
 
 use super::TransparentIsolationLevel;
 
-const TENANT1_NS: &str = "t1";
 const POD_DEFAULT_NAME: &str = "nginx";
 
 /// Verifies that object isolation works between two tenant clusters
@@ -30,6 +29,8 @@ pub async fn check_transparent_isolation_level(
     tenant1_cluster: &KubernetesCluster,
     tenant2_cluster: &KubernetesCluster,
     level: TransparentIsolationLevel,
+    tenant1_ns: &str,
+    tenant2_ns: &str,
 ) -> Result<()> {
     match level {
         TransparentIsolationLevel::Namespace => {
@@ -39,7 +40,7 @@ pub async fn check_transparent_isolation_level(
             check_node_isolation(tenant1_cluster, tenant2_cluster).await
         }
         TransparentIsolationLevel::Cluster => {
-            check_cluster_isolation(tenant1_cluster, tenant2_cluster).await
+            check_cluster_isolation(tenant1_cluster, tenant2_cluster, tenant1_ns, tenant2_ns).await
         }
     }
 }
@@ -58,45 +59,45 @@ async fn check_node_isolation(
     unimplemented!("Node isolation test is not implemented")
 }
 
+/// Verifies that the solution is transparently isolated at cluster level
+/// by creating a CRD in each tenant cluster and verifying that it's possible
 async fn check_cluster_isolation(
     tenant1_cluster: &KubernetesCluster,
     tenant2_cluster: &KubernetesCluster,
+    tenant1_ns: &str,
+    tenant2_ns: &str,
 ) -> Result<()> {
-    // attempt to create a CRD in tenant1
-    // attempt to get the CRD in tenant2
-    // attempt to create the same
-    // ensure no name collision happens in tenant2
+    tenant1_cluster
+        .publish_crd::<DummyCRD>()
+        .await
+        .context("Failed to create CRD in tenant1")?;
 
-    let crd_name = "mycrd";
-    let crd = r#"
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: mycrd
-spec:
-    group: example.com
-    names:
-        kind: MyCRD
-        listKind: MyCRDList
-        plural: mycrds
-        singular: mycrd
-    scope: Namespaced
-    versions:
-    - name: v1
-        served: true
-        storage: true
-        schema:
-        openAPIV3Schema:
-            type: object
-            properties:
-            spec:
-                type: object
-                properties:
-                foo:
-                    type: string
-            required:
-            - spec
-    "#;
+    tenant2_cluster
+        .publish_crd::<DummyCRD>()
+        .await
+        .context("Failed to create CRD in tenant2")?;
+
+    let spec = DummyCRDSpec {
+        info: "test".to_string(),
+    };
+
+    let metadata: kube::api::ObjectMeta = kube::api::ObjectMeta {
+        name: Some("mycrd".to_string()),
+        ..Default::default()
+    };
+
+    let crd_resource = DummyCRD { metadata, spec };
+
+    tenant1_cluster
+        .create_dummy_crd_resource(tenant1_ns, crd_resource.clone())
+        .await?;
+
+    tenant2_cluster
+        .create_dummy_crd_resource(tenant2_ns, crd_resource)
+        .await?;
+
+    tenant1_cluster.unpublish_crd::<DummyCRD>().await?;
+    tenant2_cluster.unpublish_crd::<DummyCRD>().await?;
 
     anyhow::Ok(())
 }
@@ -155,6 +156,7 @@ mod tests {
     use crate::cluster::{ControlPlaneIsolation, KindCluster, KubernetesClusterBuilder};
     use std::path::PathBuf;
 
+    const TENANT1_NS: &str = "t1";
     const CLUSTER_NAME_PREFIX: &str = "cp";
 
     struct TestClusterConfig {

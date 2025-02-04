@@ -9,6 +9,7 @@ use cluster::TenantsPortMapping;
 use cluster::{ControlPlaneIsolation, KindCluster, KubernetesCluster, KubernetesClusterBuilder};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
+use verifier::TransparentIsolationLevel;
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
@@ -168,12 +169,12 @@ async fn main() -> anyhow::Result<()> {
             tenant2_namespace,
         } => {
             println!("Verifying cluster isolation...");
-            let first_cluster = KubernetesCluster::load(&tenant1_kubeconfig_path).await?;
-            let second_cluster = KubernetesCluster::load(&tenant2_kubeconfig_path).await?;
+            let tenant1_cluster = KubernetesCluster::load(&tenant1_kubeconfig_path).await?;
+            let tenant2_cluster = KubernetesCluster::load(&tenant2_kubeconfig_path).await?;
 
             let obj_isolation_result = verifier::check_object_isolation(
-                &first_cluster,
-                &second_cluster,
+                &tenant1_cluster,
+                &tenant2_cluster,
                 &tenant1_namespace,
             )
             .await;
@@ -184,6 +185,20 @@ async fn main() -> anyhow::Result<()> {
                     println!("Object isolation test failed: tenant2 can access tenant1 objects")
                 }
                 Err(e) => println!("Object isolation could not be verified: {}", e),
+            }
+
+            let transparent_isolation_result = verifier::check_transparent_isolation_level(
+                &tenant1_cluster,
+                &tenant2_cluster,
+                TransparentIsolationLevel::Cluster,
+                &tenant1_namespace,
+                &tenant2_namespace,
+            )
+            .await;
+
+            match transparent_isolation_result {
+                Ok(_) => println!("Transparent isolation test passed"),
+                Err(e) => println!("Transparent isolation test failed: {}", e),
             }
         }
     }
