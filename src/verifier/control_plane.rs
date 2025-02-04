@@ -10,17 +10,20 @@ const POD_DEFAULT_NAME: &str = "nginx";
 pub async fn check_object_isolation(
     tenant1_cluster: &KubernetesCluster,
     tenant2_cluster: &KubernetesCluster,
-) -> Result<()> {
+    namespace: &str,
+) -> Result<bool> {
     let pod_name = get_pod_name();
 
     // Deploy and verify pod for tenant1
-    deploy_tenant_pod(tenant1_cluster, &pod_name, TENANT1_NS).await?;
+    deploy_tenant_pod(tenant1_cluster, &pod_name, namespace).await?;
 
     // Verify tenant2 cannot access tenant1's pod
-    assert_pod_isolation(tenant2_cluster, &pod_name).await?;
+    let is_isolated = assert_pod_isolation(tenant2_cluster, &pod_name, namespace).await;
 
     // Cleanup
-    cleanup_tenant_pod(tenant1_cluster, &pod_name).await
+    cleanup_tenant_pod(tenant1_cluster, &pod_name, namespace).await?;
+
+    Ok(is_isolated)
 }
 
 pub async fn check_transparent_isolation_level(
@@ -111,7 +114,6 @@ async fn deploy_tenant_pod(
     pod_name: &str,
     namespace: &str,
 ) -> Result<()> {
-    cluster.create_namespace_if_not_exists(namespace).await?;
     cluster
         .create_pod_in_namespace(&NGINX_POD, namespace)
         .await
@@ -125,21 +127,24 @@ async fn deploy_tenant_pod(
     Ok(())
 }
 
-async fn assert_pod_isolation(other_cluster: &KubernetesCluster, pod_name: &str) -> Result<()> {
-    match other_cluster
-        .get_pod_in_namespace(pod_name, TENANT1_NS)
+async fn assert_pod_isolation(
+    other_cluster: &KubernetesCluster,
+    pod_name: &str,
+    namespace: &str,
+) -> bool {
+    other_cluster
+        .get_pod_in_namespace(pod_name, namespace)
         .await
-    {
-        Ok(_) => Err(anyhow::anyhow!(
-            "Pod isolation failed: tenant2 can see tenant1's pod"
-        )),
-        Err(_) => Ok(()),
-    }
+        .is_err() // Expect an error if the pod is not found, meaning isolation is working
 }
 
-async fn cleanup_tenant_pod(cluster: &KubernetesCluster, pod_name: &str) -> Result<()> {
+async fn cleanup_tenant_pod(
+    cluster: &KubernetesCluster,
+    pod_name: &str,
+    namespace: &str,
+) -> Result<()> {
     cluster
-        .delete_pod_in_namespace(pod_name, TENANT1_NS)
+        .delete_pod_in_namespace(pod_name, namespace)
         .await
         .context("Failed to cleanup tenant pod")
 }
@@ -147,9 +152,7 @@ async fn cleanup_tenant_pod(cluster: &KubernetesCluster, pod_name: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::{
-        ControlPlaneIsolation, IsolationTechnology, KindCluster, KubernetesClusterBuilder,
-    };
+    use crate::cluster::{ControlPlaneIsolation, KindCluster, KubernetesClusterBuilder};
     use std::path::PathBuf;
 
     const CLUSTER_NAME_PREFIX: &str = "cp";
@@ -195,7 +198,7 @@ mod tests {
         let tenant1_cluster = setup_test_cluster(&config).await.unwrap();
         let tenant2_cluster = setup_test_cluster(&config).await.unwrap();
 
-        let result = check_object_isolation(&tenant1_cluster, &tenant2_cluster).await;
+        let result = check_object_isolation(&tenant1_cluster, &tenant2_cluster, TENANT1_NS).await;
         assert!(result.is_err(), "Native cluster should fail isolation test");
 
         kind_cluster.delete().unwrap();
@@ -233,7 +236,7 @@ mod tests {
 
         tenant2_cluster.ensure_cluster_is_ready().await.unwrap();
 
-        let result = check_object_isolation(&tenant1_cluster, &tenant2_cluster).await;
+        let result = check_object_isolation(&tenant1_cluster, &tenant2_cluster, TENANT1_NS).await;
         assert!(result.is_ok(), "VCluster should pass isolation test");
 
         kind_cluster.delete().unwrap();

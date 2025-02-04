@@ -169,10 +169,6 @@ impl KubernetesCluster {
         let pod = pods_api.get(pod_name).await?;
         let status = pod.status.ok_or(Error::msg("Pod status not found"))?;
         println!("Pod status check: {:?}", status.phase);
-        println!(
-            "is running: {:?}",
-            status.phase == Some("Running".to_string())
-        );
         Ok(status.phase == Some("Running".to_string()))
     }
 
@@ -292,7 +288,7 @@ impl KubernetesCluster {
                     return Ok(());
                 }
             } else {
-                println!("New event on pod: {:?}", status);
+                // println!("New event on pod: {:?}", status);
                 if (self.is_pod_ready(pod_name, namespace)).await? {
                     return Ok(());
                 }

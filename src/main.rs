@@ -6,12 +6,10 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use cluster::TenantsPortMapping;
-use cluster::{
-    ControlPlaneIsolation, IsolationTechnology, KindCluster, KubernetesCluster,
-    KubernetesClusterBuilder,
-};
+use cluster::{ControlPlaneIsolation, KindCluster, KubernetesCluster, KubernetesClusterBuilder};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
+
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
 pub struct Cli {
@@ -27,20 +25,111 @@ enum Commands {
         existing_cluster: bool,
         #[clap(long, default_value = "test-vcluster")]
         cluster_name: String,
-        // Extra port mappings required for a kind cluster
-        // Expected format: "containerPort:hostPort"
-        #[clap(long, value_parser = parse_mapping, default_value = "30010:30001")]
-        tenant1_mapping: (u16, u16),
-        #[clap(long, value_parser = parse_mapping, default_value = "30020:30002")]
-        tenant2_mapping: (u16, u16),
+
+        #[clap(flatten)]
+        tenant1: Tenant1SetupConfig,
+        #[clap(flatten)]
+        tenant2: Tenant2SetupConfig,
     },
     /// Verify isolation between two clusters
     Verify {
-        #[clap(short, long)]
-        first_kubeconfig_path: PathBuf,
-        #[clap(short, long)]
-        second_kubeconfig_path: PathBuf,
+        #[clap(short = 'f', long = "tenant1-kubeconfig")]
+        tenant1_kubeconfig_path: PathBuf,
+        #[clap(short = 's', long = "tenant2-kubeconfig")]
+        tenant2_kubeconfig_path: PathBuf,
+
+        #[clap(long = "tenant1-ns", default_value = "tenant1")]
+        tenant1_namespace: String,
+        #[clap(long = "tenant2-ns", default_value = "tenant2")]
+        tenant2_namespace: String,
     },
+}
+
+#[derive(Debug, Parser)]
+struct Tenant1SetupConfig {
+    /// Short style: Provide tenant namespace and optional mapping.
+    /// Example: --tenant1 tenant1-namespace [TENANT1_MAPPING]
+    #[clap(long = "tenant1", value_names = &["TENANT1_NAMESPACE", "TENANT1_MAPPING"], num_args = 1..=2, conflicts_with_all = &["tenant1_ns", "tenant1_mapping"])]
+    tenant1_short: Option<Vec<String>>,
+
+    /// Long style: Tenant namespace.
+    #[clap(long = "tenant1-ns", conflicts_with = "tenant1_short")]
+    tenant1_ns: Option<String>,
+
+    /// Long style: Port mapping in format containerPort:hostPort.
+    #[clap(long = "tenant1-mapping", value_parser = parse_mapping, conflicts_with = "tenant1_short")]
+    tenant1_mapping: Option<(u16, u16)>,
+}
+
+#[derive(Debug, Parser)]
+struct Tenant2SetupConfig {
+    /// Short style: Provide tenant namespace and optional mapping.
+    /// Example: --tenant2 tenant2-namespace [TENANT2_MAPPING]
+    #[clap(long = "tenant2", value_names = &["TENANT2_NAMESPACE", "TENANT2_MAPPING"], num_args = 1..=2, conflicts_with_all = &["tenant2_ns", "tenant2_mapping"])]
+    tenant2_short: Option<Vec<String>>,
+
+    /// Long style: Tenant namespace.
+    #[clap(long = "tenant2-ns", conflicts_with = "tenant2_short")]
+    tenant2_ns: Option<String>,
+
+    /// Long style: Port mapping in format containerPort:hostPort.
+    #[clap(long = "tenant2-mapping", value_parser = parse_mapping, conflicts_with = "tenant2_short")]
+    tenant2_mapping: Option<(u16, u16)>,
+}
+
+fn resolve_tenant_config(
+    short: &Option<Vec<String>>,
+    ns: &Option<String>,
+    mapping: &Option<(u16, u16)>,
+    default_ns: &str,
+    default_mapping: &str,
+) -> anyhow::Result<(String, (u16, u16))> {
+    let tenant_ns = if let Some(short_values) = short {
+        short_values
+            .first()
+            .cloned()
+            .unwrap_or_else(|| default_ns.to_string())
+    } else {
+        ns.clone().unwrap_or_else(|| default_ns.to_string())
+    };
+
+    let tenant_mapping = if let Some(short_values) = short {
+        if short_values.len() > 1 {
+            parse_mapping(&short_values[1])?
+        } else {
+            parse_mapping(default_mapping)?
+        }
+    } else if let Some(m) = mapping {
+        *m
+    } else {
+        parse_mapping(default_mapping)?
+    };
+
+    Ok((tenant_ns, tenant_mapping))
+}
+
+impl Tenant1SetupConfig {
+    fn get_config(&self) -> anyhow::Result<(String, (u16, u16))> {
+        resolve_tenant_config(
+            &self.tenant1_short,
+            &self.tenant1_ns,
+            &self.tenant1_mapping,
+            "tenant1",
+            "30010:30001",
+        )
+    }
+}
+
+impl Tenant2SetupConfig {
+    fn get_config(&self) -> anyhow::Result<(String, (u16, u16))> {
+        resolve_tenant_config(
+            &self.tenant2_short,
+            &self.tenant2_ns,
+            &self.tenant2_mapping,
+            "tenant2",
+            "30020:30002",
+        )
+    }
 }
 
 #[tokio::main]
@@ -51,33 +140,36 @@ async fn main() -> anyhow::Result<()> {
         Commands::Setup {
             existing_cluster,
             cluster_name,
-            tenant1_mapping,
-            tenant2_mapping,
+            tenant1,
+            tenant2,
         } => {
             println!("Setting up test environment...");
-            let tenants_port_mapings =
-                TenantsPortMapping::from_tuple(tenant1_mapping, tenant2_mapping);
-            setup_test_environment(existing_cluster, &cluster_name, tenants_port_mapings).await?;
+            setup_test_environment(existing_cluster, &cluster_name, tenant1, tenant2).await?;
             println!("Test environment setup complete");
         }
         Commands::Verify {
-            first_kubeconfig_path,
-            second_kubeconfig_path,
+            tenant1_kubeconfig_path,
+            tenant2_kubeconfig_path,
+            tenant1_namespace,
+            tenant2_namespace,
         } => {
             println!("Verifying cluster isolation...");
-            let first_cluster = KubernetesCluster::load(&first_kubeconfig_path).await?;
-            let second_cluster = KubernetesCluster::load(&second_kubeconfig_path).await?;
+            let first_cluster = KubernetesCluster::load(&tenant1_kubeconfig_path).await?;
+            let second_cluster = KubernetesCluster::load(&tenant2_kubeconfig_path).await?;
 
-            let obj_isolation_result =
-                verifier::check_object_isolation(&first_cluster, &second_cluster).await;
+            let obj_isolation_result = verifier::check_object_isolation(
+                &first_cluster,
+                &second_cluster,
+                &tenant1_namespace,
+            )
+            .await;
 
             match obj_isolation_result {
-                Ok(_) => {
-                    println!("Object isolation test passed");
+                Ok(true) => println!("Object isolation test passed"),
+                Ok(false) => {
+                    println!("Object isolation test failed: tenant2 can access tenant1 objects")
                 }
-                Err(e) => {
-                    println!("Object isolation test failed: {}", e);
-                }
+                Err(e) => println!("Object isolation could not be verified: {}", e),
             }
         }
     }
@@ -118,8 +210,15 @@ async fn get_or_create_tenant_vcluster(
 async fn setup_test_environment(
     existing_cluster: bool,
     cluster_name: &str,
-    port_mappings: TenantsPortMapping,
+    tenant1: Tenant1SetupConfig,
+    tenant2: Tenant2SetupConfig,
 ) -> anyhow::Result<()> {
+    let (tenant1_ns, tenant1_mapping) = tenant1.get_config()?;
+    let (tenant2_ns, tenant2_mapping) = tenant2.get_config()?;
+    println!("Tenant1: ns={}, mapping={:?}", tenant1_ns, tenant1_mapping);
+    println!("Tenant2: ns={}, mapping={:?}", tenant2_ns, tenant2_mapping);
+
+    let port_mappings = TenantsPortMapping::from_tuple(tenant1_mapping, tenant2_mapping);
     let test_kubeconfig = PathBuf::from("/tmp/test-vcluster.kubeconfig");
 
     let kind_cluster = if existing_cluster {
@@ -133,10 +232,17 @@ async fn setup_test_environment(
     let tenant1_kubeconfig = PathBuf::from("/tmp/tenant1-vcluster.kubeconfig");
     let tenant2_kubeconfig = PathBuf::from("/tmp/tenant2-vcluster.kubeconfig");
 
-    let _tenant1_cluster =
+    let tenant1_cluster =
         get_or_create_tenant_vcluster(&kind_cluster, "tenant1", tenant1_kubeconfig.clone()).await?;
-    let _tenant2_cluster =
+    let tenant2_cluster =
         get_or_create_tenant_vcluster(&kind_cluster, "tenant2", tenant2_kubeconfig.clone()).await?;
+
+    tenant1_cluster
+        .create_namespace_if_not_exists(&tenant1_ns)
+        .await?;
+    tenant2_cluster
+        .create_namespace_if_not_exists(&tenant2_ns)
+        .await?;
 
     println!("Created test clusters:");
     println!("Tenant 1 kubeconfig: {}", tenant1_kubeconfig.display());

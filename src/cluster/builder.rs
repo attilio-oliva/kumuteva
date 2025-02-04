@@ -213,11 +213,6 @@ impl KubernetesClusterBuilder {
             pods = cluster.list_pods_with_label(label).await?;
         }
 
-        println!(
-            "Waiting for vcluster pod to be ready {:?}",
-            pods.items[0].metadata.name
-        );
-
         let pod_name = pods
             .items
             .first()
@@ -265,7 +260,6 @@ impl KubernetesClusterBuilder {
             .and_then(|spec| spec.ports)
             .and_then(|ports| ports.first().and_then(|port| port.node_port))
             .ok_or_else(|| anyhow!("Nodeport not found"))?;
-        println!("Nodeport: {}", nodeport);
 
         // adjust kubeconfig to use the new port (8443 is the default one)
         let kubeconfig = std::fs::read_to_string(&self.kubeconfig_path)?;
