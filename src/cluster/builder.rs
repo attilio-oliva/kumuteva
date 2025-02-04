@@ -329,6 +329,14 @@ fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
             //"server": "https://172.23.0.3:30080",
             "insecure": true,
         },
+        "sync": {
+                "fromHost": {
+                    "nodes": {
+                        "enabled": true,
+                        "syncBackChanges": true
+                    }
+                }
+            }
 
         // "policies": {
         //     "podSecurityStandard": "baseline",

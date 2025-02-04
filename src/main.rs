@@ -197,8 +197,22 @@ async fn main() -> anyhow::Result<()> {
             .await;
 
             match transparent_isolation_result {
-                Ok(_) => println!("Transparent isolation test passed"),
-                Err(e) => println!("Transparent isolation test failed: {}", e),
+                Ok(_) => println!("Transparent isolation test at cluster level passed"),
+                Err(e) => println!("Transparent isolation test at cluster level failed: {}", e),
+            }
+
+            let transparent_isolation_result = verifier::check_transparent_isolation_level(
+                &tenant1_cluster,
+                &tenant2_cluster,
+                TransparentIsolationLevel::Node,
+                &tenant1_namespace,
+                &tenant2_namespace,
+            )
+            .await;
+
+            match transparent_isolation_result {
+                Ok(_) => println!("Transparent isolation test at node level passed"),
+                Err(e) => println!("Transparent isolation test at node level failed: {}", e),
             }
         }
     }

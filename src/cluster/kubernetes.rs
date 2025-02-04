@@ -1,6 +1,6 @@
 use anyhow::{Error, Result};
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Secret, Service, ServiceAccount};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::{ClusterResourceScope, Metadata, NamespaceResourceScope, Resource};
 use kube::api::{ListParams, ObjectList, ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams};
@@ -11,9 +11,11 @@ use kube::CustomResourceExt;
 use kube::{api::PostParams, Api, Client};
 
 use futures::{StreamExt, TryStreamExt};
+use serde_json::json;
 use tokio::time::sleep;
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -213,6 +215,38 @@ impl KubernetesCluster {
         Ok(status.phase == Some("Running".to_string()))
     }
 
+    pub async fn list_nodes(&self) -> Result<ObjectList<Node>> {
+        let api: Api<Node> = Api::all(self.client.clone());
+        let nodes = api.list(&ListParams::default()).await?;
+        Ok(nodes)
+    }
+
+    pub async fn get_node(&self, node_name: &str) -> Result<Node> {
+        let nodes_api = Api::<Node>::all(self.client.clone());
+        let node = nodes_api.get(node_name).await?;
+        Ok(node)
+    }
+
+    pub async fn set_label_to_node(
+        &self,
+        node_name: &str,
+        label_key: &str,
+        label_value: &str,
+    ) -> Result<()> {
+        let nodes_api = Api::<Node>::all(self.client.clone());
+        let patch_params = PatchParams::apply(node_name);
+        let patch = Patch::Merge(json!({
+            "metadata": {
+                "name": node_name,
+                "labels": {
+                    label_key: label_value
+                }
+            }
+        }));
+        nodes_api.patch(node_name, &patch_params, &patch).await?;
+        Ok(())
+    }
+
     /*
     pub async fn wait_for_resource_to_be_ready<R>(
         &self,
@@ -304,6 +338,34 @@ impl KubernetesCluster {
         }
         println!("Resource created in time");
         Ok(())
+    }
+
+    pub async fn watch_pod_until_condition<F, O>(
+        &self,
+        pod_name: &str,
+        namespace: &str,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: Fn(WatchEvent<Pod>) -> O,
+        O: Future<Output = bool>,
+    {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", pod_name))
+            .timeout(290); // upper bound of how long we watch for
+
+        let mut stream = pods.watch(&lp, "0").await.unwrap().boxed();
+
+        while let Some(status) = stream.try_next().await? {
+            let should_stop = on_event(status).await;
+            if should_stop {
+                return Ok(());
+            }
+        }
+
+        Err(Error::msg("Pod watch timed out"))
     }
 
     pub async fn wait_for_pod_to_be_ready(&self, pod_name: &str, namespace: &str) -> Result<()> {

@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
+
 use crate::cluster::{DummyCRD, DummyCRDSpec, KubernetesCluster, NGINX_POD};
 use anyhow::{Context, Result};
+use k8s_openapi::api::core::v1::{Pod, PodSpec};
+use kube::runtime::reflector::Lookup;
 
 use super::TransparentIsolationLevel;
 
@@ -34,34 +38,161 @@ pub async fn check_transparent_isolation_level(
 ) -> Result<()> {
     match level {
         TransparentIsolationLevel::Namespace => {
-            check_namespace_isolation(tenant1_cluster, tenant2_cluster).await
+            check_namespace_level_isolation(tenant1_cluster, tenant2_cluster).await
         }
         TransparentIsolationLevel::Node => {
-            check_node_isolation(tenant1_cluster, tenant2_cluster).await
+            check_node_level_isolation(tenant1_cluster, tenant2_cluster, tenant1_ns, tenant2_ns)
+                .await
         }
         TransparentIsolationLevel::Cluster => {
-            check_cluster_isolation(tenant1_cluster, tenant2_cluster, tenant1_ns, tenant2_ns).await
+            check_cluster_level_isolation(tenant1_cluster, tenant2_cluster, tenant1_ns, tenant2_ns)
+                .await
         }
     }
 }
 
-async fn check_namespace_isolation(
+async fn check_namespace_level_isolation(
     tenant1_cluster: &KubernetesCluster,
     tenant2_cluster: &KubernetesCluster,
 ) -> Result<()> {
     unimplemented!("Namespace isolation test is not implemented")
 }
 
-async fn check_node_isolation(
+/// Verifies that the solution is transparently isolated at node level
+/// Verify if the tenant can edit the node resources and other tenants will not be able to see the changes.
+/// The example imagine a new node label is added to the node by Tenant1 and then create a pod to be scheduled on that node using this label.
+/// Tenant2 should not be able to see the new label on the node nor be affected by the new label.
+async fn check_node_level_isolation(
     tenant1_cluster: &KubernetesCluster,
     tenant2_cluster: &KubernetesCluster,
+    tenant1_ns: &str,
+    tenant2_ns: &str,
 ) -> Result<()> {
-    unimplemented!("Node isolation test is not implemented")
+    let nodes = tenant1_cluster.list_nodes().await?;
+    let picked_node = nodes.items.first().context("No nodes found")?;
+    let node_name = picked_node.name().context("Node name not found")?;
+
+    let new_label = "tenant1-custom";
+    let new_label_value = "true";
+    tenant1_cluster
+        .set_label_to_node(&node_name, new_label, new_label_value)
+        .await
+        .context("Failed to set label to node")?;
+
+    let updated_node = tenant1_cluster.get_node(&node_name).await;
+
+    match updated_node {
+        Ok(node) => {
+            let labels = node.metadata.labels.unwrap_or_default();
+            let label_value = labels.get(new_label).context("Applied label not found")?;
+            if label_value != new_label_value {
+                anyhow::bail!(
+                    "Failed to set label to node. Expected: {}, Actual: {}",
+                    new_label_value,
+                    label_value
+                );
+            }
+        }
+        Err(e) => {
+            anyhow::bail!("Failed to get updated node: {}", e);
+        }
+    }
+
+    let pod_name = get_pod_name();
+    let pod = NGINX_POD.clone();
+
+    let pod_with_node_selector = Pod {
+        spec: Some(PodSpec {
+            node_selector: Some(BTreeMap::from_iter(vec![(
+                new_label.to_string(),
+                new_label_value.to_string(),
+            )])),
+            ..pod.spec.unwrap()
+        }),
+        ..pod
+    };
+
+    tenant1_cluster
+        .create_pod_in_namespace(&pod_with_node_selector, tenant1_ns)
+        .await?;
+
+    // watch the pod and if it is scheduled on the node
+    tenant1_cluster
+        .watch_pod_until_condition(&pod_name, tenant1_ns, |_| async {
+            let pod_update = tenant1_cluster
+                .get_pod_in_namespace(&pod_name, tenant1_ns)
+                .await;
+            if pod_update.is_err() {
+                return false;
+            }
+
+            let pod = pod_update.unwrap();
+            // check if pod is running
+            if let Some(status) = &pod.status {
+                if let Some(phase) = &status.phase {
+                    if phase == "Running" {
+                        return true;
+                    }
+                }
+            }
+
+            // or if pod is unschedulable
+            if let Some(status) = &pod.status {
+                if let Some(conditions) = &status.conditions {
+                    for condition in conditions {
+                        if condition.reason == Some("Unschedulable".to_string()) {
+                            println!("Pod is unschedulable, maybe because the label is not actually set on the node");
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            false
+        })
+        .await
+        .context("Failed to watch pod")?;
+
+    let pod = tenant1_cluster
+        .get_pod_in_namespace(&pod_name, tenant1_ns)
+        .await?;
+
+    // if the pod is not running, then it is unschedulable
+    if let Some(status) = &pod.status {
+        if let Some(phase) = &status.phase {
+            if phase != "Running" {
+                anyhow::bail!("Pod is not running. Phase: {:?}", phase);
+            }
+        }
+    }
+
+    // Cleanup the pod
+    tenant1_cluster
+        .delete_pod_in_namespace(&pod_name, tenant1_ns)
+        .await
+        .context("Failed to cleanup tenant pod")?;
+
+    // Verify tenant2 cannot access tenant1's node label
+    let is_isolated = tenant2_cluster
+        .get_node(&node_name)
+        .await
+        .map(|node| {
+            let labels = node.metadata.labels.unwrap_or_default();
+            let label_value = labels.get(new_label);
+            label_value.is_none() || label_value.unwrap() != new_label_value
+        })
+        .unwrap_or(true);
+
+    if !is_isolated {
+        anyhow::bail!("Nodes labels are not isolated, tenant2 can see tenant1's node label");
+    }
+
+    Ok(())
 }
 
-/// Verifies that the solution is transparently isolated at cluster level
-/// by creating a CRD in each tenant cluster and verifying that it's possible
-async fn check_cluster_isolation(
+/// Verifies that the solution is transparently isolated at cluster level.
+/// Creates a CRD in each tenant cluster and verifying that it's possible
+async fn check_cluster_level_isolation(
     tenant1_cluster: &KubernetesCluster,
     tenant2_cluster: &KubernetesCluster,
     tenant1_ns: &str,
