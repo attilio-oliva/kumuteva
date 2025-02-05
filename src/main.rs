@@ -9,7 +9,7 @@ use cluster::TenantsPortMapping;
 use cluster::{ControlPlaneIsolation, KindCluster, KubernetesCluster, KubernetesClusterBuilder};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
-use verifier::TransparentIsolationLevel;
+use verifier::{TenantClusterConfig, TransparentIsolationLevel};
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
@@ -169,15 +169,16 @@ async fn main() -> anyhow::Result<()> {
             tenant2_namespace,
         } => {
             println!("Verifying cluster isolation...");
-            let tenant1_cluster = KubernetesCluster::load(&tenant1_kubeconfig_path).await?;
-            let tenant2_cluster = KubernetesCluster::load(&tenant2_kubeconfig_path).await?;
-
-            let obj_isolation_result = verifier::check_object_isolation(
-                &tenant1_cluster,
-                &tenant2_cluster,
-                &tenant1_namespace,
-            )
-            .await;
+            let tenant1_config = TenantClusterConfig {
+                cluster: KubernetesCluster::load(&tenant1_kubeconfig_path).await?,
+                namespace: tenant1_namespace,
+            };
+            let tenant2_config = TenantClusterConfig {
+                cluster: KubernetesCluster::load(&tenant2_kubeconfig_path).await?,
+                namespace: tenant2_namespace,
+            };
+            let obj_isolation_result =
+                verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
 
             match obj_isolation_result {
                 Ok(true) => println!("Object isolation test passed"),
@@ -188,11 +189,9 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let transparent_isolation_result = verifier::check_transparent_isolation_level(
-                &tenant1_cluster,
-                &tenant2_cluster,
+                &tenant1_config,
+                &tenant2_config,
                 TransparentIsolationLevel::Cluster,
-                &tenant1_namespace,
-                &tenant2_namespace,
             )
             .await;
 
@@ -202,11 +201,9 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let transparent_isolation_result = verifier::check_transparent_isolation_level(
-                &tenant1_cluster,
-                &tenant2_cluster,
+                &tenant1_config,
+                &tenant2_config,
                 TransparentIsolationLevel::Node,
-                &tenant1_namespace,
-                &tenant2_namespace,
             )
             .await;
 

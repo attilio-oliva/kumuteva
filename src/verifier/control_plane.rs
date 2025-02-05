@@ -5,55 +5,48 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::{Pod, PodSpec};
 use kube::runtime::reflector::Lookup;
 
-use super::TransparentIsolationLevel;
+use super::{TenantClusterConfig, TransparentIsolationLevel};
 
 const POD_DEFAULT_NAME: &str = "nginx";
 
 /// Verifies that object isolation works between two tenant clusters
 pub async fn check_object_isolation(
-    tenant1_cluster: &KubernetesCluster,
-    tenant2_cluster: &KubernetesCluster,
-    namespace: &str,
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
 ) -> Result<bool> {
     let pod_name = get_pod_name();
 
     // Deploy and verify pod for tenant1
-    deploy_tenant_pod(tenant1_cluster, &pod_name, namespace).await?;
+    deploy_tenant_pod(&tenant1.cluster, &pod_name, &tenant1.namespace).await?;
 
     // Verify tenant2 cannot access tenant1's pod
-    let is_isolated = assert_pod_isolation(tenant2_cluster, &pod_name, namespace).await;
+    let is_isolated = assert_pod_isolation(&tenant2.cluster, &pod_name, &tenant1.namespace).await;
 
     // Cleanup
-    cleanup_tenant_pod(tenant1_cluster, &pod_name, namespace).await?;
+    cleanup_tenant_pod(&tenant1.cluster, &pod_name, &tenant1.namespace).await?;
 
     Ok(is_isolated)
 }
 
 pub async fn check_transparent_isolation_level(
-    tenant1_cluster: &KubernetesCluster,
-    tenant2_cluster: &KubernetesCluster,
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
     level: TransparentIsolationLevel,
-    tenant1_ns: &str,
-    tenant2_ns: &str,
 ) -> Result<()> {
     match level {
         TransparentIsolationLevel::Namespace => {
-            check_namespace_level_isolation(tenant1_cluster, tenant2_cluster).await
+            check_namespace_level_isolation(&tenant1, &tenant2).await
         }
-        TransparentIsolationLevel::Node => {
-            check_node_level_isolation(tenant1_cluster, tenant2_cluster, tenant1_ns, tenant2_ns)
-                .await
-        }
+        TransparentIsolationLevel::Node => check_node_level_isolation(&tenant1, &tenant2).await,
         TransparentIsolationLevel::Cluster => {
-            check_cluster_level_isolation(tenant1_cluster, tenant2_cluster, tenant1_ns, tenant2_ns)
-                .await
+            check_cluster_level_isolation(&tenant1, &tenant2).await
         }
     }
 }
 
 async fn check_namespace_level_isolation(
-    tenant1_cluster: &KubernetesCluster,
-    tenant2_cluster: &KubernetesCluster,
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
 ) -> Result<()> {
     unimplemented!("Namespace isolation test is not implemented")
 }
@@ -63,23 +56,22 @@ async fn check_namespace_level_isolation(
 /// The example imagine a new node label is added to the node by Tenant1 and then create a pod to be scheduled on that node using this label.
 /// Tenant2 should not be able to see the new label on the node nor be affected by the new label.
 async fn check_node_level_isolation(
-    tenant1_cluster: &KubernetesCluster,
-    tenant2_cluster: &KubernetesCluster,
-    tenant1_ns: &str,
-    tenant2_ns: &str,
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
 ) -> Result<()> {
-    let nodes = tenant1_cluster.list_nodes().await?;
+    let nodes = tenant1.cluster.list_nodes().await?;
     let picked_node = nodes.items.first().context("No nodes found")?;
     let node_name = picked_node.name().context("Node name not found")?;
 
     let new_label = "tenant1-custom";
     let new_label_value = "true";
-    tenant1_cluster
+    tenant1
+        .cluster
         .set_label_to_node(&node_name, new_label, new_label_value)
         .await
         .context("Failed to set label to node")?;
 
-    let updated_node = tenant1_cluster.get_node(&node_name).await;
+    let updated_node = tenant1.cluster.get_node(&node_name).await;
 
     match updated_node {
         Ok(node) => {
@@ -112,15 +104,16 @@ async fn check_node_level_isolation(
         ..pod
     };
 
-    tenant1_cluster
-        .create_pod_in_namespace(&pod_with_node_selector, tenant1_ns)
+    tenant1
+        .cluster
+        .create_pod_in_namespace(&pod_with_node_selector, &tenant1.namespace)
         .await?;
 
     // watch the pod and if it is scheduled on the node
-    tenant1_cluster
-        .watch_pod_until_condition(&pod_name, tenant1_ns, |_| async {
-            let pod_update = tenant1_cluster
-                .get_pod_in_namespace(&pod_name, tenant1_ns)
+    tenant1.cluster
+        .watch_pod_until_condition(&pod_name, &tenant1.namespace, |_| async {
+            let pod_update = tenant1.cluster
+                .get_pod_in_namespace(&pod_name, &tenant1.namespace)
                 .await;
             if pod_update.is_err() {
                 return false;
@@ -153,8 +146,9 @@ async fn check_node_level_isolation(
         .await
         .context("Failed to watch pod")?;
 
-    let pod = tenant1_cluster
-        .get_pod_in_namespace(&pod_name, tenant1_ns)
+    let pod = tenant1
+        .cluster
+        .get_pod_in_namespace(&pod_name, &tenant1.namespace)
         .await?;
 
     // if the pod is not running, then it is unschedulable
@@ -167,13 +161,15 @@ async fn check_node_level_isolation(
     }
 
     // Cleanup the pod
-    tenant1_cluster
-        .delete_pod_in_namespace(&pod_name, tenant1_ns)
+    tenant1
+        .cluster
+        .delete_pod_in_namespace(&pod_name, &tenant1.namespace)
         .await
         .context("Failed to cleanup tenant pod")?;
 
     // Verify tenant2 cannot access tenant1's node label
-    let is_isolated = tenant2_cluster
+    let is_isolated = tenant2
+        .cluster
         .get_node(&node_name)
         .await
         .map(|node| {
@@ -193,17 +189,17 @@ async fn check_node_level_isolation(
 /// Verifies that the solution is transparently isolated at cluster level.
 /// Creates a CRD in each tenant cluster and verifying that it's possible
 async fn check_cluster_level_isolation(
-    tenant1_cluster: &KubernetesCluster,
-    tenant2_cluster: &KubernetesCluster,
-    tenant1_ns: &str,
-    tenant2_ns: &str,
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
 ) -> Result<()> {
-    tenant1_cluster
+    tenant1
+        .cluster
         .publish_crd::<DummyCRD>()
         .await
         .context("Failed to create CRD in tenant1")?;
 
-    tenant2_cluster
+    tenant2
+        .cluster
         .publish_crd::<DummyCRD>()
         .await
         .context("Failed to create CRD in tenant2")?;
@@ -219,16 +215,18 @@ async fn check_cluster_level_isolation(
 
     let crd_resource = DummyCRD { metadata, spec };
 
-    tenant1_cluster
-        .create_dummy_crd_resource(tenant1_ns, crd_resource.clone())
+    tenant1
+        .cluster
+        .create_dummy_crd_resource(&tenant1.namespace, crd_resource.clone())
         .await?;
 
-    tenant2_cluster
-        .create_dummy_crd_resource(tenant2_ns, crd_resource)
+    tenant2
+        .cluster
+        .create_dummy_crd_resource(&tenant2.namespace, crd_resource)
         .await?;
 
-    tenant1_cluster.unpublish_crd::<DummyCRD>().await?;
-    tenant2_cluster.unpublish_crd::<DummyCRD>().await?;
+    tenant1.cluster.unpublish_crd::<DummyCRD>().await?;
+    tenant2.cluster.unpublish_crd::<DummyCRD>().await?;
 
     anyhow::Ok(())
 }
@@ -331,7 +329,17 @@ mod tests {
         let tenant1_cluster = setup_test_cluster(&config).await.unwrap();
         let tenant2_cluster = setup_test_cluster(&config).await.unwrap();
 
-        let result = check_object_isolation(&tenant1_cluster, &tenant2_cluster, TENANT1_NS).await;
+        let tenant1_config = TenantClusterConfig {
+            cluster: tenant1_cluster,
+            namespace: TENANT1_NS.to_string(),
+        };
+
+        let tenant2_config = TenantClusterConfig {
+            cluster: tenant2_cluster,
+            namespace: "t2".to_string(),
+        };
+
+        let result = check_object_isolation(&tenant1_config, &tenant2_config).await;
         assert!(result.is_err(), "Native cluster should fail isolation test");
 
         kind_cluster.delete().unwrap();
@@ -369,7 +377,17 @@ mod tests {
 
         tenant2_cluster.ensure_cluster_is_ready().await.unwrap();
 
-        let result = check_object_isolation(&tenant1_cluster, &tenant2_cluster, TENANT1_NS).await;
+        let tenant1_config = TenantClusterConfig {
+            cluster: tenant1_cluster,
+            namespace: TENANT1_NS.to_string(),
+        };
+
+        let tenant2_config = TenantClusterConfig {
+            cluster: tenant2_cluster,
+            namespace: "t2".to_string(),
+        };
+
+        let result = check_object_isolation(&tenant1_config, &tenant2_config).await;
         assert!(result.is_ok(), "VCluster should pass isolation test");
 
         kind_cluster.delete().unwrap();

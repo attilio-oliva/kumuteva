@@ -5,6 +5,8 @@ mod control_plane;
 
 pub use control_plane::*;
 
+use crate::cluster::KubernetesCluster;
+
 #[derive(Debug, Clone, Copy)]
 pub enum IsolationKind {
     ControlPlane(ControlPlaneIsolationProperty),
@@ -159,3 +161,10 @@ impl fmt::Display for DataPlaneIsolationProperty {
 //         Ok(())
 //     }
 // }
+
+/// All the configuration needed to test a tenant cluster isolation.
+pub struct TenantClusterConfig {
+    pub cluster: KubernetesCluster,
+    /// The namespace to use for the tenant's resources created during the tests.
+    pub namespace: String,
+}
