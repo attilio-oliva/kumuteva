@@ -35,12 +35,10 @@ pub async fn check_transparent_isolation_level(
 ) -> Result<()> {
     match level {
         TransparentIsolationLevel::Namespace => {
-            check_namespace_level_isolation(&tenant1, &tenant2).await
+            check_namespace_level_isolation(tenant1, tenant2).await
         }
-        TransparentIsolationLevel::Node => check_node_level_isolation(&tenant1, &tenant2).await,
-        TransparentIsolationLevel::Cluster => {
-            check_cluster_level_isolation(&tenant1, &tenant2).await
-        }
+        TransparentIsolationLevel::Node => check_node_level_isolation(tenant1, tenant2).await,
+        TransparentIsolationLevel::Cluster => check_cluster_level_isolation(tenant1, tenant2).await,
     }
 }
 
@@ -196,13 +194,22 @@ async fn check_cluster_level_isolation(
         .cluster
         .publish_crd::<DummyCRD>()
         .await
-        .context("Failed to create CRD in tenant1")?;
+        .context("Failed to publish a CRD in tenant1")?;
 
     tenant2
         .cluster
         .publish_crd::<DummyCRD>()
         .await
-        .context("Failed to create CRD in tenant2")?;
+        .context("Failed to publish a CRD in tenant2")?;
+
+    tenant1
+        .cluster
+        .wait_for_crd_publishing::<DummyCRD>()
+        .await?;
+    tenant2
+        .cluster
+        .wait_for_crd_publishing::<DummyCRD>()
+        .await?;
 
     let spec = DummyCRDSpec {
         info: "test".to_string(),
@@ -218,12 +225,14 @@ async fn check_cluster_level_isolation(
     tenant1
         .cluster
         .create_dummy_crd_resource(&tenant1.namespace, crd_resource.clone())
-        .await?;
+        .await
+        .context("Failed to create a CRD resource in tenant1")?;
 
     tenant2
         .cluster
         .create_dummy_crd_resource(&tenant2.namespace, crd_resource)
-        .await?;
+        .await
+        .context("Failed to create a CRD resource in tenant2")?;
 
     tenant1.cluster.unpublish_crd::<DummyCRD>().await?;
     tenant2.cluster.unpublish_crd::<DummyCRD>().await?;

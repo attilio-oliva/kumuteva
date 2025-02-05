@@ -255,8 +255,14 @@ async fn setup_test_environment(
 ) -> anyhow::Result<()> {
     let (tenant1_ns, tenant1_mapping) = tenant1.get_config()?;
     let (tenant2_ns, tenant2_mapping) = tenant2.get_config()?;
-    println!("Tenant1: ns={}, mapping={:?}", tenant1_ns, tenant1_mapping);
-    println!("Tenant2: ns={}, mapping={:?}", tenant2_ns, tenant2_mapping);
+    println!(
+        "Tenant1: ns={}, port_mapping={{container={}, host={}}}",
+        tenant1_ns, tenant1_mapping.0, tenant1_mapping.1
+    );
+    println!(
+        "Tenant2: ns={}, port_mapping={{container={}, host={}}}",
+        tenant2_ns, tenant2_mapping.0, tenant2_mapping.1
+    );
 
     let port_mappings = TenantsPortMapping::from_tuple(tenant1_mapping, tenant2_mapping);
     let test_kubeconfig = PathBuf::from("/tmp/test-vcluster.kubeconfig");

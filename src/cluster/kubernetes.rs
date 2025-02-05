@@ -1,4 +1,4 @@
-use anyhow::{Error, Result};
+use anyhow::{anyhow, Error, Result};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Secret, Service, ServiceAccount};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
@@ -211,7 +211,7 @@ impl KubernetesCluster {
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
         let pod = pods_api.get(pod_name).await?;
         let status = pod.status.ok_or(Error::msg("Pod status not found"))?;
-        println!("Pod status check: {:?}", status.phase);
+        //println!("Pod status check: {:?}", status.phase);
         Ok(status.phase == Some("Running".to_string()))
     }
 
@@ -327,17 +327,16 @@ impl KubernetesCluster {
 
         while let Some(status) = stream.try_next().await? {
             if let WatchEvent::Added(s) = status {
-                println!("Resource added: {:?}", s.name());
+                //println!("Resource added: {:?}", s.name());
                 return Ok(());
             } else {
-                println!("New event on resource: {:?}", status);
+                //println!("New event on resource: {:?}", status);
                 if api.get(resource_name).await.is_ok() {
                     return Ok(());
                 }
             }
         }
-        println!("Resource created in time");
-        Ok(())
+        Err(anyhow!("Resource was not created in time"))
     }
 
     pub async fn watch_pod_until_condition<F, O>(
@@ -386,7 +385,7 @@ impl KubernetesCluster {
 
         while let Some(status) = stream.try_next().await? {
             if let WatchEvent::Modified(s) = status {
-                println!("Pod modified: {:?}", s.status);
+                // println!("Pod modified: {:?}", s.status);
                 if s.status.unwrap().ready == Some(1) {
                     return Ok(());
                 }
@@ -435,6 +434,57 @@ impl KubernetesCluster {
         crds.delete(crd_name, &Default::default()).await?;
 
         Ok(())
+    }
+
+    pub async fn wait_for_crd_publishing<C>(&self) -> Result<()>
+    where
+        C: CustomResourceExt,
+    {
+        let crd_name = C::crd_name();
+        let crds: Api<CustomResourceDefinition> = Api::all(self.client.clone());
+
+        // Check if the CRD is already established.
+        if let Ok(crd) = crds.get(crd_name).await {
+            if Self::is_crd_established(&crd) {
+                return Ok(());
+            }
+        }
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", crd_name))
+            .timeout(290); // upper bound of how long we watch for
+
+        let mut stream = crds.watch(&lp, "0").await?.boxed();
+
+        while let Some(event) = stream.try_next().await? {
+            match event {
+                WatchEvent::Added(crd) | WatchEvent::Modified(crd) => {
+                    if Self::is_crd_established(&crd) {
+                        return Ok(());
+                    }
+                }
+                _ => {
+                    // Fallback, check CRD status by fetching the latest version.
+                    if let Ok(crd) = crds.get(crd_name).await {
+                        if Self::is_crd_established(&crd) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        Err(Error::msg("CRD was not published in time"))
+    }
+
+    fn is_crd_established(crd: &CustomResourceDefinition) -> bool {
+        if let Some(status) = &crd.status {
+            if let Some(conditions) = &status.conditions {
+                return conditions
+                    .iter()
+                    .any(|cond| cond.type_ == "Established" && cond.status == "True");
+            }
+        }
+        false
     }
 
     pub async fn ensure_cluster_is_ready(&self) -> anyhow::Result<()> {
