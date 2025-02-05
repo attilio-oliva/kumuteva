@@ -215,6 +215,19 @@ impl KubernetesCluster {
         Ok(status.phase == Some("Running".to_string()))
     }
 
+    pub async fn list_cluster_resources<R>(&self) -> Result<ObjectList<R>>
+    where
+        R: Resource<Scope = ClusterResourceScope>
+            + Clone
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::all(self.client.clone());
+        let resources = api.list(&ListParams::default()).await?;
+        Ok(resources)
+    }
+
     pub async fn list_nodes(&self) -> Result<ObjectList<Node>> {
         let api: Api<Node> = Api::all(self.client.clone());
         let nodes = api.list(&ListParams::default()).await?;

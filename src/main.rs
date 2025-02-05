@@ -211,6 +211,21 @@ async fn main() -> anyhow::Result<()> {
                 Ok(_) => println!("Transparent isolation test at node level passed"),
                 Err(e) => println!("Transparent isolation test at node level failed: {}", e),
             }
+
+            let transparent_isolation_result = verifier::check_transparent_isolation_level(
+                &tenant1_config,
+                &tenant2_config,
+                TransparentIsolationLevel::Namespace,
+            )
+            .await;
+
+            match transparent_isolation_result {
+                Ok(_) => println!("Transparent isolation test at namespace level passed"),
+                Err(e) => println!(
+                    "Transparent isolation test at namespace level failed: {}",
+                    e
+                ),
+            }
         }
     }
 

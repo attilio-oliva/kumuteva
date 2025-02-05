@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::cluster::{DummyCRD, DummyCRDSpec, KubernetesCluster, NGINX_POD};
 use anyhow::{Context, Result};
-use k8s_openapi::api::core::v1::{Pod, PodSpec};
+use k8s_openapi::api::core::v1::{Namespace, Pod, PodSpec};
 use kube::runtime::reflector::Lookup;
 
 use super::{TenantClusterConfig, TransparentIsolationLevel};
@@ -42,11 +42,50 @@ pub async fn check_transparent_isolation_level(
     }
 }
 
+/// Verifies that the solution is transparently isolated at namespace level
+/// Also, verify that the tenant can list their namespaces and ensure that they can't list other tenants' namespaces.
 async fn check_namespace_level_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
 ) -> Result<()> {
-    unimplemented!("Namespace isolation test is not implemented")
+    // List tenant1 namespaces and fetch tenant1's namespace UID.
+    let tenant1_namespaces = tenant1
+        .cluster
+        .list_cluster_resources::<Namespace>()
+        .await?;
+
+    // List tenant2 namespaces.
+    let tenant2_namespaces = tenant2
+        .cluster
+        .list_cluster_resources::<Namespace>()
+        .await?;
+
+    // Check if any tenant2 namespace (excluding system namespaces) has the same UID as tenant1's namespace.
+    let t2_can_see_t1_ns = tenant2_namespaces
+        .iter()
+        .filter(|ns| {
+            !["kube-system", "kube-public", "kube-node-lease", "default"]
+                .contains(&ns.name().unwrap_or_default().as_ref())
+        })
+        .any(|t2_ns| {
+            tenant1_namespaces.iter().any(|t1_ns| {
+                if t1_ns.metadata.uid == t2_ns.metadata.uid {
+                    println!(
+                        "Tenant2 can see namespace \"{}\" that has the same UID as tenant1 namespace \"{}\"",
+                        t2_ns.name().unwrap_or_default(),
+                        t1_ns.name().unwrap_or_default()
+                    );
+                    return true;
+                }
+                false
+            })
+        });
+
+    if t2_can_see_t1_ns {
+        anyhow::bail!("Namespaces are not isolated, tenant2 can see tenant1's namespace");
+    }
+
+    Ok(())
 }
 
 /// Verifies that the solution is transparently isolated at node level
