@@ -17,7 +17,8 @@ pub enum IsolationTechnology {
 
 #[derive(Debug, Clone)]
 pub enum ControlPlaneIsolation {
-    Capsule,
+    /// Capsule with a tenant confined in the given namespace
+    Capsule(String),
     /// vCluster virtual control plane in the given namespace
     VCluster(String),
     KubeVirt,
@@ -139,9 +140,7 @@ impl KubernetesClusterBuilder {
         control_plane_isolation_technology: ControlPlaneIsolation,
     ) -> anyhow::Result<()> {
         match control_plane_isolation_technology {
-            ControlPlaneIsolation::Capsule => {
-                Err(anyhow!("Capsule isolation is not implemented yet"))
-            }
+            ControlPlaneIsolation::Capsule(namespace) => self.deploy_capsule(&namespace).await,
             ControlPlaneIsolation::VCluster(namespace) => self.deploy_vcluster(&namespace).await,
 
             ControlPlaneIsolation::KubeVirt => {
@@ -165,6 +164,78 @@ impl KubernetesClusterBuilder {
                 Err(anyhow!("Workload isolation is not implemented yet"))
             }
         }
+    }
+
+    /*
+        Add this repository:
+
+     $ helm repo add projectcapsule https://projectcapsule.github.io/charts
+
+    Install Capsule:
+
+     $ helm install capsule projectcapsule/capsule --version 0.7.0 -n capsule-system --create-namespace
+         */
+    async fn deploy_capsule(&self, namespace: &str) -> anyhow::Result<()> {
+        let repo_name = "projectcapsule";
+        let repo_url = "https://projectcapsule.github.io/charts";
+        let chart = "capsule";
+        let chart_path = format!("{repo_name}/{chart}");
+
+        let capsule_namespace = "capsule-system";
+        let capsule_version = "0.7.0";
+
+        let output = Command::new("helm")
+            .arg("repo")
+            .arg("add")
+            .arg(repo_name)
+            .arg(repo_url)
+            .output()
+            .context("Failed to add capsule helm repo")?;
+
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        }
+
+        let output = Command::new("helm")
+            .arg("install")
+            .arg(chart)
+            .arg(chart_path)
+            .arg("--version")
+            .arg(capsule_version)
+            .arg("-n")
+            .arg(capsule_namespace)
+            .arg("--create-namespace")
+            .output()
+            .context("Failed to install capsule helm chart")?;
+
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        }
+
+        let cluster = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path).await?;
+
+        // create the tenant users
+        let tenant_users = vec!["alice", "bob"];
+
+        let output = Command::new("capsule/create-user.sh")
+            .arg(tenant_users[0])
+            .output()
+            .context("Failed to create capsule user")?;
+
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        }
+
+        let output = Command::new("capsule/create-user.sh")
+            .arg(tenant_users[1])
+            .output()
+            .context("Failed to create capsule user")?;
+
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        }
+
+        Ok(())
     }
 
     async fn deploy_vcluster(&self, namespace: &str) -> anyhow::Result<()> {

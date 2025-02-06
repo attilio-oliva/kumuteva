@@ -4,7 +4,7 @@ mod verifier;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use cluster::TenantsPortMapping;
 use cluster::{ControlPlaneIsolation, KindCluster, KubernetesCluster, KubernetesClusterBuilder};
 use k8s_openapi::api::core::v1::Pod;
@@ -18,6 +18,18 @@ pub struct Cli {
     command: Commands,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ClusterEnvironmentType {
+    #[clap(name = "capsule", alias = "cap", alias = "caps")]
+    Capsule,
+    #[clap(name = "kcp")]
+    Kcp,
+    #[clap(name = "vcluster", alias = "vc")]
+    VCluster,
+    #[clap(name = "kubevirt", alias = "kv")]
+    KubeVirt,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Setup test environment with vclusters
@@ -26,7 +38,8 @@ enum Commands {
         existing_cluster: bool,
         #[clap(long, default_value = "test-vcluster")]
         cluster_name: String,
-
+        #[clap(long = "type", short = 't', default_value = "vcluster")]
+        kind: ClusterEnvironmentType,
         #[clap(flatten)]
         tenant1: Tenant1SetupConfig,
         #[clap(flatten)]
@@ -155,11 +168,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Setup {
             existing_cluster,
             cluster_name,
+            kind,
             tenant1,
             tenant2,
         } => {
             println!("Setting up test environment...");
-            setup_test_environment(existing_cluster, &cluster_name, tenant1, tenant2).await?;
+            setup_test_environment(existing_cluster, &cluster_name, kind, tenant1, tenant2).await?;
             println!("Test environment setup complete");
         }
         Commands::Verify {
@@ -232,10 +246,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn get_or_create_tenant_vcluster(
+async fn get_or_create_tenant_cluster(
     kind_cluster: &KindCluster,
     tenant: &str,
     kubeconfig_path: PathBuf,
+    env_type: ClusterEnvironmentType,
 ) -> anyhow::Result<KubernetesCluster> {
     if let Ok(existing_cluster) = KubernetesCluster::load(&kubeconfig_path).await {
         println!("Tenant {} cluster already exists", tenant);
@@ -253,11 +268,25 @@ async fn get_or_create_tenant_vcluster(
 
     println!("Creating {} cluster", tenant);
 
-    let tenant_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-        .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant.to_string()))
-        .with_kubeconfig_path(kubeconfig_path)
-        .build()
-        .await?;
+    let tenant_cluster = match env_type {
+        ClusterEnvironmentType::Capsule => {
+            KubernetesClusterBuilder::new(kind_cluster.clone())
+                .with_isolation_technology(ControlPlaneIsolation::Capsule(tenant.to_string()))
+                .with_kubeconfig_path(kubeconfig_path)
+                .build()
+                .await?
+        }
+        ClusterEnvironmentType::VCluster => {
+            KubernetesClusterBuilder::new(kind_cluster.clone())
+                .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant.to_string()))
+                .with_kubeconfig_path(kubeconfig_path)
+                .build()
+                .await?
+        }
+        _ => {
+            return Err(anyhow!("Unsupported cluster environment type"));
+        }
+    };
     tenant_cluster.ensure_cluster_is_ready().await?;
     Ok(tenant_cluster)
 }
@@ -265,6 +294,7 @@ async fn get_or_create_tenant_vcluster(
 async fn setup_test_environment(
     existing_cluster: bool,
     cluster_name: &str,
+    kind: ClusterEnvironmentType,
     tenant1: Tenant1SetupConfig,
     tenant2: Tenant2SetupConfig,
 ) -> anyhow::Result<()> {
@@ -294,9 +324,11 @@ async fn setup_test_environment(
     let tenant2_kubeconfig = PathBuf::from("/tmp/tenant2-vcluster.kubeconfig");
 
     let tenant1_cluster =
-        get_or_create_tenant_vcluster(&kind_cluster, "tenant1", tenant1_kubeconfig.clone()).await?;
+        get_or_create_tenant_cluster(&kind_cluster, "tenant1", tenant1_kubeconfig.clone(), kind)
+            .await?;
     let tenant2_cluster =
-        get_or_create_tenant_vcluster(&kind_cluster, "tenant2", tenant2_kubeconfig.clone()).await?;
+        get_or_create_tenant_cluster(&kind_cluster, "tenant2", tenant2_kubeconfig.clone(), kind)
+            .await?;
 
     tenant1_cluster
         .create_namespace_if_not_exists(&tenant1_ns)
