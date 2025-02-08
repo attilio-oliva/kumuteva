@@ -1,4 +1,7 @@
 use anyhow::{anyhow, Error, Result};
+use k8s_openapi::api::authorization::v1::{
+    ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
+};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Secret, Service, ServiceAccount};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
@@ -28,6 +31,10 @@ pub struct KubernetesCluster {
 }
 
 impl KubernetesCluster {
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+
     pub async fn load(kubeconfig_path: &Path) -> Result<Self> {
         let kubeconfig = Kubeconfig::read_from(kubeconfig_path)?;
         let options = KubeConfigOptions::default();
@@ -72,9 +79,8 @@ impl KubernetesCluster {
     }
 
     pub async fn create_namespace_if_not_exists(&self, namespace: &str) -> Result<()> {
-        let namespaces_api: Api<Namespace> = Api::all(self.client.clone());
-        let namespace_list = namespaces_api.list(&Default::default()).await?;
-        if namespace_list
+        let namespaces = self.list_cluster_resources::<Namespace>().await?;
+        if namespaces
             .items
             .iter()
             .any(|ns| ns.metadata.name.as_deref() == Some(namespace))
@@ -82,6 +88,10 @@ impl KubernetesCluster {
             return Ok(());
         }
 
+        self.create_namespace(namespace).await
+    }
+
+    pub async fn create_namespace(&self, namespace: &str) -> Result<()> {
         let namespace = Namespace {
             metadata: ObjectMeta {
                 name: Some(String::from(namespace)),
@@ -89,6 +99,8 @@ impl KubernetesCluster {
             },
             ..Default::default()
         };
+
+        let namespaces_api: Api<Namespace> = Api::all(self.client.clone());
 
         namespaces_api
             .create(&PostParams::default(), &namespace)
@@ -133,20 +145,6 @@ impl KubernetesCluster {
             + Metadata<Ty = ObjectMeta>,
     {
         let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
-        let created = api.create(&PostParams::default(), resource).await?;
-        Ok(created)
-    }
-
-    pub async fn create_cluster_resource<R>(&self, resource: &R) -> Result<R>
-    where
-        R: Resource<Scope = ClusterResourceScope>
-            + Clone
-            + serde::Serialize
-            + serde::de::DeserializeOwned
-            + std::fmt::Debug
-            + Metadata<Ty = ObjectMeta>,
-    {
-        let api: Api<R> = Api::all(self.client.clone());
         let created = api.create(&PostParams::default(), resource).await?;
         Ok(created)
     }
@@ -501,6 +499,32 @@ impl KubernetesCluster {
     }
 
     pub async fn ensure_cluster_is_ready(&self) -> anyhow::Result<()> {
+        let resource_attributes = ResourceAttributes {
+            namespace: Some("default".to_string()),
+            verb: Some("get".to_string()),
+            resource: Some("serviceaccounts".to_string()),
+            ..Default::default()
+        };
+        let sa = SelfSubjectAccessReview {
+            spec: SelfSubjectAccessReviewSpec {
+                resource_attributes: Some(resource_attributes),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // check if it's possible to list service accounts
+        let auth = Api::<SelfSubjectAccessReview>::all(self.client.clone());
+        let res = auth.create(&PostParams::default(), &sa).await?;
+
+        let can_list_sa = self
+            .is_authorized_to("get", "serviceaccounts", Some("default"))
+            .await;
+        if !can_list_sa {
+            println!("Cluster does not allow listing service accounts");
+            return Ok(());
+        }
+
         let service_accounts: Api<ServiceAccount> = Api::namespaced(self.client.clone(), "default");
 
         for _ in 0..10 {
@@ -517,6 +541,40 @@ impl KubernetesCluster {
         }
 
         Err(Error::msg("Cluster did not become ready in time"))
+    }
+
+    /// Check if the current user is authorized to perform an action on a resource in a namespace.
+    ///
+    /// Namespace set to None means the resource is cluster-scoped.
+    ///
+    /// This method uses the SelfSubjectAccessReview API to check if the current user is authorized to perform an action on a resource.
+    pub async fn is_authorized_to(
+        &self,
+        verb: &str,
+        resource: &str,
+        namespace: Option<&str>,
+    ) -> bool {
+        let resource_attributes = ResourceAttributes {
+            namespace: namespace.map(|ns| ns.to_string()),
+            verb: Some(verb.to_string()),
+            resource: Some(resource.to_string()),
+            ..Default::default()
+        };
+        let access_attempt = SelfSubjectAccessReview {
+            spec: SelfSubjectAccessReviewSpec {
+                resource_attributes: Some(resource_attributes),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let auth = Api::<SelfSubjectAccessReview>::all(self.client.clone());
+        let res = auth
+            .create(&PostParams::default(), &access_attempt)
+            .await
+            .unwrap();
+
+        res.status.unwrap().allowed
     }
 }
 

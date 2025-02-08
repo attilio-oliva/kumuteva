@@ -1,9 +1,11 @@
 use std::{collections::BTreeMap, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{anyhow, Context, Ok};
-use k8s_openapi::api::core::v1::Secret;
-use kube::runtime::reflector::Lookup;
+use k8s_openapi::{api::core::v1::Secret, Metadata};
+use kube::{api::ObjectMeta, runtime::reflector::Lookup};
 use tokio::time::sleep;
+
+use crate::external_crds::{capsule, create_tenant};
 
 use super::{KindCluster, KubernetesCluster};
 
@@ -140,7 +142,9 @@ impl KubernetesClusterBuilder {
         control_plane_isolation_technology: ControlPlaneIsolation,
     ) -> anyhow::Result<()> {
         match control_plane_isolation_technology {
-            ControlPlaneIsolation::Capsule(namespace) => self.deploy_capsule(&namespace).await,
+            ControlPlaneIsolation::Capsule(namespace) => {
+                self.deploy_capsule_tenant(&namespace).await
+            }
             ControlPlaneIsolation::VCluster(namespace) => self.deploy_vcluster(&namespace).await,
 
             ControlPlaneIsolation::KubeVirt => {
@@ -166,16 +170,7 @@ impl KubernetesClusterBuilder {
         }
     }
 
-    /*
-        Add this repository:
-
-     $ helm repo add projectcapsule https://projectcapsule.github.io/charts
-
-    Install Capsule:
-
-     $ helm install capsule projectcapsule/capsule --version 0.7.0 -n capsule-system --create-namespace
-         */
-    async fn deploy_capsule(&self, namespace: &str) -> anyhow::Result<()> {
+    fn install_capsule() -> anyhow::Result<()> {
         let repo_name = "projectcapsule";
         let repo_url = "https://projectcapsule.github.io/charts";
         let chart = "capsule";
@@ -196,6 +191,22 @@ impl KubernetesClusterBuilder {
             return Err(terminal_stderr_to_error(output));
         }
 
+        // Check if Capsule is already installed
+        let check_output = Command::new("helm")
+            .arg("list")
+            .arg("-n")
+            .arg(capsule_namespace)
+            .arg("--filter")
+            .arg(chart)
+            .output()
+            .context("Failed to check if capsule is installed")?;
+
+        let helm_list_output = String::from_utf8_lossy(&check_output.stdout);
+        if helm_list_output.contains(chart) {
+            println!("Capsule is already installed, skipping installation");
+            return Ok(());
+        }
+
         let output = Command::new("helm")
             .arg("install")
             .arg(chart)
@@ -211,14 +222,44 @@ impl KubernetesClusterBuilder {
         if !output.status.success() {
             return Err(terminal_stderr_to_error(output));
         }
+        Ok(())
+    }
+
+    async fn deploy_capsule_tenant(&self, tenant_name: &str) -> anyhow::Result<()> {
+        Self::install_capsule()?;
 
         let cluster = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path).await?;
 
-        // create the tenant users
-        let tenant_users = vec!["alice", "bob"];
+        let tenant_admin_user = format!("{}-admin", tenant_name);
+        // Create the tenant crd
+
+        let tenant_metadata = ObjectMeta {
+            name: Some(String::from(tenant_name)),
+            ..Default::default()
+        };
+
+        let tenant_spec = capsule::TenantSpec {
+            owners: vec![capsule::TenantOwners {
+                kind: capsule::TenantOwnersKind::User,
+                name: tenant_admin_user.clone(),
+                cluster_roles: None,
+                proxy_settings: None,
+            }],
+            ..Default::default()
+        };
+
+        let tenant_resource = capsule::Tenant {
+            metadata: tenant_metadata,
+            spec: tenant_spec,
+            ..Default::default()
+        };
+
+        // create this crd resource
+        create_tenant(&cluster, tenant_resource).await?;
 
         let output = Command::new("capsule/create-user.sh")
-            .arg(tenant_users[0])
+            .arg(&tenant_admin_user)
+            .arg(tenant_name)
             .output()
             .context("Failed to create capsule user")?;
 
@@ -226,15 +267,24 @@ impl KubernetesClusterBuilder {
             return Err(terminal_stderr_to_error(output));
         }
 
-        let output = Command::new("capsule/create-user.sh")
-            .arg(tenant_users[1])
-            .output()
-            .context("Failed to create capsule user")?;
+        // move all the generated files to the kubeconfig path
+        let generated_files_prefix = format!("{}-{}", tenant_admin_user, tenant_name);
 
-        if !output.status.success() {
-            return Err(terminal_stderr_to_error(output));
+        let kubeconfig_files = vec![
+            format!("{}.kubeconfig", generated_files_prefix),
+            format!("{}.crt", generated_files_prefix),
+            format!("{}.key", generated_files_prefix),
+        ];
+
+        for file in kubeconfig_files {
+            let dest = if file.ends_with(".kubeconfig") {
+                self.kubeconfig_path.clone()
+            } else {
+                self.kubeconfig_path.with_file_name(&file)
+            };
+            std::fs::copy(&file, dest)?;
+            std::fs::remove_file(&file)?;
         }
-
         Ok(())
     }
 
