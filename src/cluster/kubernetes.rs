@@ -350,6 +350,39 @@ impl KubernetesCluster {
         Err(anyhow!("Resource was not created in time"))
     }
 
+    pub async fn watch_cluster_resource_until_condition<R, F, O>(
+        &self,
+        resource_name: &str,
+        timeout_seconds: u32,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: Fn(WatchEvent<R>) -> O,
+        O: Future<Output = bool>,
+        R: Resource<Scope = ClusterResourceScope>
+            + Clone
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::all(self.client.clone());
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", resource_name))
+            .timeout(timeout_seconds); // upper bound of how long we watch for
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(status) = stream.try_next().await? {
+            let should_stop = on_event(status).await;
+            if should_stop {
+                return Ok(());
+            }
+        }
+
+        Err(Error::msg("Resource watch timed out"))
+    }
+
     pub async fn watch_pod_until_condition<F, O>(
         &self,
         pod_name: &str,

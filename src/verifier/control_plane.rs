@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::cluster::{DummyCRD, DummyCRDSpec, KubernetesCluster, NGINX_POD};
 use anyhow::{Context, Result};
-use k8s_openapi::api::core::v1::{Namespace, Pod, PodSpec};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, PodSpec};
 use kube::runtime::reflector::Lookup;
 
 use super::{TenantClusterConfig, TransparentIsolationLevel};
@@ -107,6 +107,26 @@ async fn check_node_level_isolation(
         .set_label_to_node(&node_name, new_label, new_label_value)
         .await
         .context("Failed to set label to node")?;
+
+    // wait for the node to be updated
+    tenant1
+        .cluster
+        .watch_cluster_resource_until_condition::<Node, _, _>(&node_name, 20, |event| async {
+            let node = tenant1.cluster.get_node(&node_name).await;
+            if node.is_err() {
+                return false;
+            }
+            let node = node.unwrap();
+            if node.clone().metadata.labels.is_none() {
+                return false;
+            }
+
+            let labels = node.metadata.labels.unwrap();
+            let label_value = labels.get(new_label);
+            label_value.is_some() && label_value.unwrap() == new_label_value
+        })
+        .await
+        .context("Failed to watch node")?;
 
     let updated_node = tenant1.cluster.get_node(&node_name).await;
 
