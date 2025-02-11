@@ -108,6 +108,19 @@ impl KubernetesCluster {
         Ok(())
     }
 
+    pub async fn delete_cluster_resource<R>(&self, resource_name: &str) -> Result<()>
+    where
+        R: Resource<Scope = ClusterResourceScope>
+            + Clone
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::all(self.client.clone());
+        api.delete(resource_name, &Default::default()).await?;
+        Ok(())
+    }
+
     pub async fn get_pod_in_namespace(&self, pod_name: &str, namespace: &str) -> Result<Pod> {
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
         let pod = pods_api.get(pod_name).await?;

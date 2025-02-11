@@ -85,6 +85,50 @@ async fn check_namespace_level_isolation(
         anyhow::bail!("Namespaces are not isolated, tenant2 can see tenant1's namespace");
     }
 
+    // attempt to create a new namespace in tenant1
+    let new_namespace_name = tenant1.namespace.clone() + "-new";
+
+    tenant1
+        .cluster
+        .create_namespace(&new_namespace_name)
+        .await
+        .context("Failed to create a new namespace in tenant1")?;
+
+    // attempt to get the new namespace in tenant2
+    let tenant2_namespaces = tenant2
+        .cluster
+        .list_cluster_resources::<Namespace>()
+        .await?;
+
+    let is_namespace_available_in_tenant2 = tenant2_namespaces
+        .iter()
+        .any(|ns| ns.name().unwrap_or_default() == new_namespace_name);
+
+    if is_namespace_available_in_tenant2 {
+        anyhow::bail!("Namespaces are not isolated, tenant2 can see tenant1's new namespace");
+    }
+
+    // attempt to delete the new namespace in tenant1
+    tenant1
+        .cluster
+        .delete_cluster_resource::<Namespace>(&new_namespace_name)
+        .await
+        .context("Failed to delete the new namespace in tenant1")?;
+
+    // attempt to create a new namespace in tenant1 with the same name of an existing tenant2 namespace
+    tenant1
+        .cluster
+        .create_namespace(&tenant2.namespace)
+        .await
+        .context("Failed to create a new namespace in tenant1 with the same name of an existing tenant2 namespace")?;
+
+    // cleanup the new namespace in tenant1
+    tenant1
+        .cluster
+        .delete_cluster_resource::<Namespace>(&tenant2.namespace)
+        .await
+        .context("Failed to delete the new namespace in tenant1 with the same name of an existing tenant2 namespace")?;
+
     Ok(())
 }
 
