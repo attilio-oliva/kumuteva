@@ -1,32 +1,15 @@
 use std::collections::BTreeMap;
 
-use crate::cluster::{DummyCRD, DummyCRDSpec, KubernetesCluster, NGINX_POD};
+use crate::{
+    cluster::{DummyCRD, DummyCRDSpec, NGINX_POD},
+    verifier::TransparentIsolationLevel,
+};
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod, PodSpec};
 use kube::runtime::reflector::Lookup;
 
-use super::{TenantClusterConfig, TransparentIsolationLevel};
-
-const POD_DEFAULT_NAME: &str = "nginx";
-
-/// Verifies that object isolation works between two tenant clusters
-pub async fn check_object_isolation(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> Result<bool> {
-    let pod_name = get_pod_name();
-
-    // Deploy and verify pod for tenant1
-    deploy_tenant_pod(&tenant1.cluster, &pod_name, &tenant1.namespace).await?;
-
-    // Verify tenant2 cannot access tenant1's pod
-    let is_isolated = assert_pod_isolation(&tenant2.cluster, &pod_name, &tenant1.namespace).await;
-
-    // Cleanup
-    cleanup_tenant_pod(&tenant1.cluster, &pod_name, &tenant1.namespace).await?;
-
-    Ok(is_isolated)
-}
+use super::get_example_pod_name;
+use crate::TenantClusterConfig;
 
 pub async fn check_transparent_isolation_level(
     tenant1: &TenantClusterConfig,
@@ -155,7 +138,7 @@ async fn check_node_level_isolation(
     // wait for the node to be updated
     tenant1
         .cluster
-        .watch_cluster_resource_until_condition::<Node, _, _>(&node_name, 10, |event| async {
+        .watch_cluster_resource_until_condition::<Node, _, _>(&node_name, 10, |_event| async {
             let node = tenant1.cluster.get_node(&node_name).await;
             if node.is_err() {
                 return false;
@@ -191,7 +174,7 @@ async fn check_node_level_isolation(
         }
     }
 
-    let pod_name = get_pod_name();
+    let pod_name = get_example_pod_name();
     let pod = NGINX_POD.clone();
 
     let pod_with_node_selector = Pod {
@@ -341,167 +324,4 @@ async fn check_cluster_level_isolation(
     tenant2.cluster.unpublish_crd::<DummyCRD>().await?;
 
     anyhow::Ok(())
-}
-
-fn get_pod_name() -> String {
-    NGINX_POD
-        .metadata
-        .name
-        .clone()
-        .unwrap_or_else(|| POD_DEFAULT_NAME.to_string())
-}
-
-async fn deploy_tenant_pod(
-    cluster: &KubernetesCluster,
-    pod_name: &str,
-    namespace: &str,
-) -> Result<()> {
-    cluster
-        .create_pod_in_namespace(&NGINX_POD, namespace)
-        .await
-        .context("Failed to create tenant pod")?;
-
-    cluster
-        .get_pod_in_namespace(pod_name, namespace)
-        .await
-        .context("Failed to verify tenant pod creation")?;
-
-    Ok(())
-}
-
-async fn assert_pod_isolation(
-    other_cluster: &KubernetesCluster,
-    pod_name: &str,
-    namespace: &str,
-) -> bool {
-    other_cluster
-        .get_pod_in_namespace(pod_name, namespace)
-        .await
-        .is_err() // Expect an error if the pod is not found, meaning isolation is working
-}
-
-async fn cleanup_tenant_pod(
-    cluster: &KubernetesCluster,
-    pod_name: &str,
-    namespace: &str,
-) -> Result<()> {
-    cluster
-        .delete_pod_in_namespace(pod_name, namespace)
-        .await
-        .context("Failed to cleanup tenant pod")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cluster::{ControlPlaneIsolation, KindCluster, KubernetesClusterBuilder};
-    use std::path::PathBuf;
-
-    const TENANT1_NS: &str = "t1";
-    const CLUSTER_NAME_PREFIX: &str = "cp";
-
-    struct TestClusterConfig {
-        name: String,
-        kubeconfig_path: PathBuf,
-    }
-
-    impl TestClusterConfig {
-        fn new(name: &str) -> Self {
-            let name = name.to_string();
-            let kubeconfig_path = temp_kubeconfig_path(&name);
-            Self {
-                name,
-                kubeconfig_path,
-            }
-        }
-    }
-
-    fn temp_kubeconfig_path(cluster_name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("{}.kubeconfig", cluster_name))
-    }
-
-    async fn setup_test_cluster(config: &TestClusterConfig) -> Result<KubernetesCluster> {
-        let cluster = KubernetesCluster::load(&config.kubeconfig_path).await?;
-        cluster.ensure_cluster_is_ready().await?;
-        Ok(cluster)
-    }
-
-    #[tokio::test]
-    async fn test_native_object_isolation() {
-        let config =
-            TestClusterConfig::new(&format!("{}-obj-isolation-native", CLUSTER_NAME_PREFIX));
-
-        let kind_cluster = KindCluster::create(
-            &config.name,
-            config.kubeconfig_path.clone(),
-            Default::default(),
-        )
-        .unwrap();
-
-        let tenant1_cluster = setup_test_cluster(&config).await.unwrap();
-        let tenant2_cluster = setup_test_cluster(&config).await.unwrap();
-
-        let tenant1_config = TenantClusterConfig {
-            cluster: tenant1_cluster,
-            namespace: TENANT1_NS.to_string(),
-        };
-
-        let tenant2_config = TenantClusterConfig {
-            cluster: tenant2_cluster,
-            namespace: "t2".to_string(),
-        };
-
-        let result = check_object_isolation(&tenant1_config, &tenant2_config).await;
-        assert!(result.is_err(), "Native cluster should fail isolation test");
-
-        kind_cluster.delete().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_vcluster_object_isolation() {
-        let base_config =
-            TestClusterConfig::new(&format!("{}-obj-isolation-vcluster", CLUSTER_NAME_PREFIX));
-        let kind_cluster = KindCluster::create(
-            &base_config.name,
-            base_config.kubeconfig_path.clone(),
-            Default::default(),
-        )
-        .unwrap();
-
-        let tenant1_config = TestClusterConfig::new(&format!("tenant1-{}", base_config.name));
-        let tenant2_config = TestClusterConfig::new(&format!("tenant2-{}", base_config.name));
-
-        let tenant1_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-            .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant1_config.name.clone()))
-            .with_kubeconfig_path(tenant1_config.kubeconfig_path)
-            .build()
-            .await
-            .unwrap();
-
-        tenant1_cluster.ensure_cluster_is_ready().await.unwrap();
-
-        let tenant2_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-            .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant2_config.name.clone()))
-            .with_kubeconfig_path(tenant2_config.kubeconfig_path)
-            .build()
-            .await
-            .unwrap();
-
-        tenant2_cluster.ensure_cluster_is_ready().await.unwrap();
-
-        let tenant1_config = TenantClusterConfig {
-            cluster: tenant1_cluster,
-            namespace: TENANT1_NS.to_string(),
-        };
-
-        let tenant2_config = TenantClusterConfig {
-            cluster: tenant2_cluster,
-            namespace: "t2".to_string(),
-        };
-
-        let result = check_object_isolation(&tenant1_config, &tenant2_config).await;
-        assert!(result.is_ok(), "VCluster should pass isolation test");
-
-        kind_cluster.delete().unwrap();
-    }
 }
