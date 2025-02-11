@@ -255,6 +255,14 @@ async fn main() -> anyhow::Result<()> {
                     e
                 ),
             }
+
+            /* This will do the same as above, but formatted in a nice way
+            let report = verifier::check_control_plane_isolation(&tenant1_config, &tenant2_config)
+                .await
+                .context("Failed to verify control plane isolation")?;
+
+            println!("Control plane isolation test results:\n{}", report);
+             */
         }
     }
 

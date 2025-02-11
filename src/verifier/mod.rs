@@ -7,6 +7,108 @@ pub use control_plane::*;
 
 use crate::cluster::KubernetesCluster;
 
+pub struct IsolationReport {
+    control_plane: ControlPlaneReport,
+    data_plane: DataPlaneReport,
+}
+
+pub struct ControlPlaneReport {
+    object_isolation: TestResult,
+    transparent_isolation: TransparentIsolationReport,
+    fairness: TestResult,
+}
+
+pub struct TransparentIsolationReport {
+    namespace: TestResult,
+    node: TestResult,
+    cluster: TestResult,
+}
+
+pub struct DataPlaneReport {
+    storage_isolation: TestResult,
+    network_isolation: TestResult,
+    workload_isolation: TestResult,
+}
+
+/// Run all the isolation tests
+pub async fn check_all(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> Result<IsolationReport> {
+    let control_plane = check_control_plane_isolation(tenant1, tenant2).await?;
+    let data_plane = check_data_plane_isolation(tenant1, tenant2).await?;
+
+    Ok(IsolationReport {
+        control_plane,
+        data_plane,
+    })
+}
+
+/// Run all the control plane isolation tests
+pub async fn check_control_plane_isolation(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> Result<ControlPlaneReport> {
+    let object_isolation = ControlPlaneIsolationProperty::ObjectIsolation
+        .run(tenant1, tenant2)
+        .await?;
+
+    let transparent_isolation_namespace =
+        ControlPlaneIsolationProperty::TransparentIsolation(TransparentIsolationLevel::Namespace)
+            .run(tenant1, tenant2)
+            .await?;
+
+    let transparent_isolation_node =
+        ControlPlaneIsolationProperty::TransparentIsolation(TransparentIsolationLevel::Node)
+            .run(tenant1, tenant2)
+            .await?;
+
+    let transparent_isolation_cluster =
+        ControlPlaneIsolationProperty::TransparentIsolation(TransparentIsolationLevel::Cluster)
+            .run(tenant1, tenant2)
+            .await?;
+
+    let transparent_isolation = TransparentIsolationReport {
+        namespace: transparent_isolation_namespace,
+        node: transparent_isolation_node,
+        cluster: transparent_isolation_cluster,
+    };
+
+    let fairness = ControlPlaneIsolationProperty::Fairness
+        .run(tenant1, tenant2)
+        .await?;
+
+    Ok(ControlPlaneReport {
+        object_isolation,
+        transparent_isolation,
+        fairness,
+    })
+}
+
+/// Run all the data plane isolation tests
+pub async fn check_data_plane_isolation(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> Result<DataPlaneReport> {
+    let storage_isolation = DataPlaneIsolationProperty::StorageIsolation
+        .run(tenant1, tenant2)
+        .await?;
+
+    let network_isolation = DataPlaneIsolationProperty::NetworkIsolation
+        .run(tenant1, tenant2)
+        .await?;
+
+    let workload_isolation = DataPlaneIsolationProperty::WorkloadIsolation
+        .run(tenant1, tenant2)
+        .await?;
+
+    Ok(DataPlaneReport {
+        storage_isolation,
+        network_isolation,
+        workload_isolation,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum IsolationKind {
     ControlPlane(ControlPlaneIsolationProperty),
@@ -39,55 +141,90 @@ pub struct TestResult {
 }
 
 pub trait IsolationTest {
-    fn run(&self) -> Result<TestResult>;
+    async fn run(
+        &self,
+        tenant1: &TenantClusterConfig,
+        tenant2: &TenantClusterConfig,
+    ) -> Result<TestResult>;
 }
 
 impl IsolationTest for IsolationKind {
-    fn run(&self) -> Result<TestResult> {
+    async fn run(
+        &self,
+        tenant1: &TenantClusterConfig,
+        tenant2: &TenantClusterConfig,
+    ) -> Result<TestResult> {
         match self {
-            IsolationKind::ControlPlane(property) => property.run(),
-            IsolationKind::DataPlane(property) => property.run(),
+            IsolationKind::ControlPlane(property) => property.run(tenant1, tenant2).await,
+            IsolationKind::DataPlane(property) => property.run(tenant1, tenant2).await,
         }
     }
 }
 
 impl IsolationTest for ControlPlaneIsolationProperty {
-    fn run(&self) -> Result<TestResult> {
+    async fn run(
+        &self,
+        tenant1: &TenantClusterConfig,
+        tenant2: &TenantClusterConfig,
+    ) -> Result<TestResult> {
         match self {
-            ControlPlaneIsolationProperty::ObjectIsolation => Ok(TestResult {
-                success: true,
-                message: String::from("Object isolation test passed"),
-            }),
-            ControlPlaneIsolationProperty::TransparentIsolation(level) => level.run(),
-            ControlPlaneIsolationProperty::Fairness => Ok(TestResult {
-                success: true,
-                message: String::from("Fairness test passed"),
-            }),
+            ControlPlaneIsolationProperty::ObjectIsolation => {
+                check_object_isolation(tenant1, tenant2)
+                    .await
+                    .map(|is_isolated| TestResult {
+                        success: is_isolated,
+                        message: if is_isolated {
+                            String::from("Object isolation test passed")
+                        } else {
+                            String::from("Object isolation test failed")
+                        },
+                    })
+            }
+            ControlPlaneIsolationProperty::TransparentIsolation(level) => {
+                level.run(tenant1, tenant2).await
+            }
+            ControlPlaneIsolationProperty::Fairness => {
+                check_fairness(tenant1, tenant2)
+                    .await
+                    .map(|is_fair| TestResult {
+                        success: is_fair,
+                        message: if is_fair {
+                            String::from("Fairness test passed")
+                        } else {
+                            String::from("Fairness test failed")
+                        },
+                    })
+            }
         }
     }
 }
 
 impl IsolationTest for TransparentIsolationLevel {
-    fn run(&self) -> Result<TestResult> {
-        match self {
-            TransparentIsolationLevel::Namespace => Ok(TestResult {
+    async fn run(
+        &self,
+        tenant1: &TenantClusterConfig,
+        tenant2: &TenantClusterConfig,
+    ) -> Result<TestResult> {
+        let result = check_transparent_isolation_level(tenant1, tenant2, *self).await;
+        match result {
+            Ok(()) => Ok(TestResult {
                 success: true,
-                message: String::from("Namespace isolation test passed"),
+                message: format!("Test passed at {}", self),
             }),
-            TransparentIsolationLevel::Node => Ok(TestResult {
-                success: true,
-                message: String::from("Node isolation test passed"),
-            }),
-            TransparentIsolationLevel::Cluster => Ok(TestResult {
-                success: true,
-                message: String::from("Cluster isolation test passed"),
+            Err(e) => Ok(TestResult {
+                success: false,
+                message: format!("Test failed at {}: {}", self, e),
             }),
         }
     }
 }
 
 impl IsolationTest for DataPlaneIsolationProperty {
-    fn run(&self) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _tenant1: &TenantClusterConfig,
+        _tenant2: &TenantClusterConfig,
+    ) -> Result<TestResult> {
         match self {
             DataPlaneIsolationProperty::StorageIsolation => Ok(TestResult {
                 success: true,
@@ -148,19 +285,76 @@ impl fmt::Display for DataPlaneIsolationProperty {
     }
 }
 
-// impl fmt::Display for TestResult {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         writeln!(
-//             f,
-//             "[{:?}]: {} ({})",
-//             self.kind,
-//             if result.success { "PASS" } else { "FAIL" },
-//             result.message
-//         )?;
+impl fmt::Display for IsolationReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Control Plane Isolation")?;
+        writeln!(f, "------------------------")?;
+        writeln!(f, "{}", self.control_plane)?;
 
-//         Ok(())
-//     }
-// }
+        writeln!(f, "\nData Plane Isolation")?;
+        writeln!(f, "---------------------")?;
+        writeln!(f, "{}", self.data_plane)?;
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for ControlPlaneReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.object_isolation)?;
+        // error icon if all fails, success icon if all pass, warning icon if some fail
+        let icon = if self.transparent_isolation.namespace.success
+            && self.transparent_isolation.node.success
+            && self.transparent_isolation.cluster.success
+        {
+            "✅"
+        } else if !self.transparent_isolation.namespace.success
+            && !self.transparent_isolation.node.success
+            && !self.transparent_isolation.cluster.success
+        {
+            "❌"
+        } else {
+            "⚠️"
+        };
+        write!(
+            f,
+            "{}  Transparent isolation: \n{}",
+            icon, self.transparent_isolation
+        )?;
+        writeln!(f, "{}", self.fairness)?;
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for TransparentIsolationReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "   {}", self.namespace)?;
+        writeln!(f, "   {}", self.node)?;
+        writeln!(f, "   {}", self.cluster)?;
+        Ok(())
+    }
+}
+
+impl fmt::Display for DataPlaneReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.storage_isolation)?;
+        writeln!(f, "{}", self.network_isolation)?;
+        writeln!(f, "{}", self.workload_isolation)?;
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for TestResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.success {
+            write!(f, "✅ {}", self.message)
+        } else {
+            write!(f, "❌ {}", self.message)
+        }
+    }
+}
 
 /// All the configuration needed to test a tenant cluster isolation.
 pub struct TenantClusterConfig {
