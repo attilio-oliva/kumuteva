@@ -111,7 +111,7 @@ async fn check_node_level_isolation(
     // wait for the node to be updated
     tenant1
         .cluster
-        .watch_cluster_resource_until_condition::<Node, _, _>(&node_name, 20, |event| async {
+        .watch_cluster_resource_until_condition::<Node, _, _>(&node_name, 10, |event| async {
             let node = tenant1.cluster.get_node(&node_name).await;
             if node.is_err() {
                 return false;

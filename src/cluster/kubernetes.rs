@@ -254,7 +254,15 @@ impl KubernetesCluster {
                 }
             }
         }));
-        nodes_api.patch(node_name, &patch_params, &patch).await?;
+        let result = nodes_api.patch(node_name, &patch_params, &patch).await;
+
+        // if the requests times out, ignore as it is common to happen in vcluster
+        if let Err(e) = result {
+            if !e.to_string().contains("context deadline exceeded") {
+                return Err(e.into());
+            }
+        }
+
         Ok(())
     }
 
