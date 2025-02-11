@@ -108,6 +108,19 @@ impl KubernetesCluster {
         Ok(())
     }
 
+    pub async fn list_resource_in_namespace<R>(&self, namespace: &str) -> Result<ObjectList<R>>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Clone
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+        let list = api.list(&ListParams::default()).await?;
+        Ok(list)
+    }
+
     pub async fn delete_cluster_resource<R>(&self, resource_name: &str) -> Result<()>
     where
         R: Resource<Scope = ClusterResourceScope>
