@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{anyhow, Context, Ok};
-use k8s_openapi::{api::core::v1::Secret, Metadata};
+use k8s_openapi::api::core::v1::Secret;
 use kube::{api::ObjectMeta, runtime::reflector::Lookup};
 use tokio::time::sleep;
 
@@ -376,7 +376,7 @@ impl KubernetesClusterBuilder {
             .await?;
 
         //get the nodeport
-        let nodeport = service
+        let _nodeport = service
             .spec
             .and_then(|spec| spec.ports)
             .and_then(|ports| ports.first().and_then(|port| port.node_port))

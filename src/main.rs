@@ -348,7 +348,7 @@ async fn setup_test_environment(
 
     if tenant1_cluster
         .is_authorized_to("get", "namespaces", None)
-        .await
+        .await?
     {
         tenant1_cluster
             .create_namespace_if_not_exists(&tenant1_ns)
@@ -359,7 +359,7 @@ async fn setup_test_environment(
 
     if tenant2_cluster
         .is_authorized_to("get", "namespaces", None)
-        .await
+        .await?
     {
         tenant2_cluster
             .create_namespace_if_not_exists(&tenant2_ns)

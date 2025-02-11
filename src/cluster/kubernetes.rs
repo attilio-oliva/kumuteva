@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Error, Result};
+use anyhow::{anyhow, Context, Error, Result};
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
@@ -553,27 +553,10 @@ impl KubernetesCluster {
     }
 
     pub async fn ensure_cluster_is_ready(&self) -> anyhow::Result<()> {
-        let resource_attributes = ResourceAttributes {
-            namespace: Some("default".to_string()),
-            verb: Some("get".to_string()),
-            resource: Some("serviceaccounts".to_string()),
-            ..Default::default()
-        };
-        let sa = SelfSubjectAccessReview {
-            spec: SelfSubjectAccessReviewSpec {
-                resource_attributes: Some(resource_attributes),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
         // check if it's possible to list service accounts
-        let auth = Api::<SelfSubjectAccessReview>::all(self.client.clone());
-        let res = auth.create(&PostParams::default(), &sa).await?;
-
         let can_list_sa = self
             .is_authorized_to("get", "serviceaccounts", Some("default"))
-            .await;
+            .await?;
         if !can_list_sa {
             println!("Cluster does not allow listing service accounts");
             return Ok(());
@@ -607,7 +590,7 @@ impl KubernetesCluster {
         verb: &str,
         resource: &str,
         namespace: Option<&str>,
-    ) -> bool {
+    ) -> Result<bool> {
         let resource_attributes = ResourceAttributes {
             namespace: namespace.map(|ns| ns.to_string()),
             verb: Some(verb.to_string()),
@@ -626,9 +609,13 @@ impl KubernetesCluster {
         let res = auth
             .create(&PostParams::default(), &access_attempt)
             .await
-            .unwrap();
+            .context("Failed to check authorization")?;
 
-        res.status.unwrap().allowed
+        let status = res
+            .status
+            .ok_or_else(|| anyhow!("No status in SelfSubjectAccessReview"))?;
+
+        Ok(status.allowed)
     }
 }
 
