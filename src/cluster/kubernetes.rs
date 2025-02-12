@@ -3,26 +3,36 @@ use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Secret, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{
+    Namespace, Node, Pod, Secret, Service, ServiceAccount, ServicePort, ServiceSpec,
+};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::{ClusterResourceScope, Metadata, NamespaceResourceScope, Resource};
-use kube::api::{ListParams, ObjectList, ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams};
+use kube::api::{
+    AttachParams, AttachedProcess, ListParams, ObjectList, ObjectMeta, Patch, PatchParams,
+    WatchEvent, WatchParams,
+};
 use kube::config::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::core::ErrorResponse;
 use kube::runtime::reflector::Lookup;
+use kube::runtime::{watcher, WatchStreamExt};
 use kube::CustomResourceExt;
 use kube::{api::PostParams, Api, Client};
 
 use futures::{StreamExt, TryStreamExt};
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::time::sleep;
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
+use std::pin::pin;
 use std::time::Duration;
 
-use super::{DummyCRD, KindCluster};
+use super::DummyCRD;
 
 /// An abstraction over a Kubernetes client.
 /// This struct is used to interact with a Kubernetes cluster using `kube` crate.
@@ -56,14 +66,12 @@ impl KubernetesCluster {
                 namespace: Some(namespace.to_string()),
                 ..Default::default()
             },
-            spec: Some(k8s_openapi::api::core::v1::ServiceSpec {
+            spec: Some(ServiceSpec {
                 selector,
-                ports: Some(vec![k8s_openapi::api::core::v1::ServicePort {
+                ports: Some(vec![ServicePort {
                     name: Some("https".to_string()),
                     port: 443,
-                    target_port: Some(
-                        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8443),
-                    ),
+                    target_port: Some(IntOrString::Int(8443)),
                     protocol: Some("TCP".to_string()),
                     node_port: chosen_port,
                     ..Default::default()
@@ -121,10 +129,46 @@ impl KubernetesCluster {
         Ok(())
     }
 
+    pub async fn get_resource_in_namespace<R>(
+        &self,
+        resource_name: &str,
+        namespace: &str,
+    ) -> Result<R>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+        let resource = api.get(resource_name).await?;
+        Ok(resource)
+    }
+
     pub async fn get_pod_in_namespace(&self, pod_name: &str, namespace: &str) -> Result<Pod> {
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
         let pod = pods_api.get(pod_name).await?;
         Ok(pod)
+    }
+
+    pub async fn delete_resouce_in_namespace<R>(
+        &self,
+        resource_name: &str,
+        namespace: &str,
+    ) -> Result<()>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+        api.delete(resource_name, &Default::default()).await?;
+        Ok(())
     }
 
     pub async fn delete_pod_in_namespace(&self, pod_name: &str, namespace: &str) -> Result<()> {
@@ -148,7 +192,21 @@ impl KubernetesCluster {
         self.create_pod(pod, Some(namespace)).await
     }
 
-    pub async fn create_namespaced_resource<R>(&self, namespace: &str, resource: &R) -> Result<R>
+    pub async fn create_cluster_resource<R>(&self, resource: &R) -> Result<R>
+    where
+        R: Resource<Scope = ClusterResourceScope>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::all(self.client.clone());
+        let created = api.create(&PostParams::default(), resource).await?;
+        Ok(created)
+    }
+
+    pub async fn create_namespaced_resource<R>(&self, resource: &R, namespace: &str) -> Result<R>
     where
         R: Resource<Scope = NamespaceResourceScope>
             + Clone
@@ -434,11 +492,7 @@ impl KubernetesCluster {
 
     pub async fn wait_for_pod_to_be_ready(&self, pod_name: &str, namespace: &str) -> Result<()> {
         // use the Job API to wait for the pod to be ready
-        let jobs: Api<Job> = Api::namespaced(self.client.clone(), namespace);
-
-        let lp = WatchParams::default()
-            .fields(&format!("metadata.name={}", pod_name))
-            .timeout(290); // upper bound of how long we watch for
+        let api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
         let pod_ready = self.is_pod_ready(pod_name, namespace).await?;
 
@@ -446,23 +500,25 @@ impl KubernetesCluster {
             return Ok(());
         }
 
-        let mut stream = jobs.watch(&lp, "0").await?.boxed();
+        let wc = watcher::Config {
+            field_selector: Some(format!("metadata.name={}", pod_name)),
+            timeout: Some(290),
+            ..Default::default()
+        };
 
-        while let Some(status) = stream.try_next().await? {
-            if let WatchEvent::Modified(s) = status {
-                // println!("Pod modified: {:?}", s.status);
-                if s.status.unwrap().ready == Some(1) {
-                    return Ok(());
-                }
-            } else {
-                // println!("New event on pod: {:?}", status);
-                if (self.is_pod_ready(pod_name, namespace)).await? {
-                    return Ok(());
-                }
+        let watch_stream = watcher(api, wc).applied_objects().default_backoff();
+
+        let mut stream = pin!(watch_stream);
+
+        while let Some(pod) = stream.try_next().await? {
+            let status = pod.status.ok_or(Error::msg("Pod status not found"))?;
+            if status.phase == Some("Running".to_string()) {
+                return Ok(());
             }
         }
-        println!("Pod become ready in time");
-        Ok(())
+
+        println!("Pod did not become ready in time");
+        Err(Error::msg("Pod did not become ready in time"))
     }
 
     pub async fn publish_crd<C>(&self) -> Result<()>
@@ -556,8 +612,8 @@ impl KubernetesCluster {
         // check if it's possible to list service accounts
         let can_list_sa = self
             .is_authorized_to("get", "serviceaccounts", Some("default"))
-            .await?;
-        if !can_list_sa {
+            .await;
+        if let Ok(false) = can_list_sa {
             println!("Cluster does not allow listing service accounts");
             return Ok(());
         }
@@ -617,6 +673,43 @@ impl KubernetesCluster {
 
         Ok(status.allowed)
     }
+
+    pub async fn exec_command_in_container(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        command: &str,
+    ) -> Result<String> {
+        let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
+        let attached_process = pods_api
+            .exec(
+                pod_name,
+                vec!["sh", "-c", command],
+                &AttachParams::default().stderr(false),
+            )
+            .await?;
+        let output = get_output(attached_process).await;
+
+        Ok(output)
+    }
+
+    pub async fn get_pod_ip(&self, pod_name: &str, namespace: &str) -> Result<String> {
+        let pod = self.get_pod_in_namespace(pod_name, namespace).await?;
+        let status = pod.status.ok_or(Error::msg("Pod status not found"))?;
+        let pod_ip = status.pod_ip.ok_or(Error::msg("Pod IP not found"))?;
+        Ok(pod_ip)
+    }
+}
+
+async fn get_output(mut attached: AttachedProcess) -> String {
+    let stdout = tokio_util::io::ReaderStream::new(attached.stdout().unwrap());
+    let out = stdout
+        .filter_map(|r| async { r.ok().and_then(|v| String::from_utf8(v.to_vec()).ok()) })
+        .collect::<Vec<_>>()
+        .await
+        .join("");
+    attached.join().await.unwrap();
+    out
 }
 
 impl From<Client> for KubernetesCluster {

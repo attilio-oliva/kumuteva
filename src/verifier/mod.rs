@@ -2,8 +2,10 @@ use anyhow::Result;
 use std::fmt;
 
 mod control_plane;
+mod data_plane;
 
 pub use control_plane::*;
+pub use data_plane::*;
 
 use crate::cluster::KubernetesCluster;
 

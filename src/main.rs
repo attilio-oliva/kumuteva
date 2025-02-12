@@ -206,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
                 cluster: KubernetesCluster::load(&tenant2_kubeconfig_path).await?,
                 namespace: tenant2_namespace,
             };
+            /*
             let obj_isolation_result =
                 verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
 
@@ -255,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
                     e
                 ),
             }
+            */
 
             /* This will do the same as above, but formatted in a nice way
             let report = verifier::check_control_plane_isolation(&tenant1_config, &tenant2_config)
@@ -262,7 +264,18 @@ async fn main() -> anyhow::Result<()> {
                 .context("Failed to verify control plane isolation")?;
 
             println!("Control plane isolation test results:\n{}", report);
-             */
+            */
+
+            let is_network_isolated =
+                verifier::check_network_isolation(&tenant1_config, &tenant2_config)
+                    .await
+                    .context("Failed to verify network isolation")?;
+
+            if is_network_isolated {
+                println!("Network isolation test passed");
+            } else {
+                println!("Network isolation test failed");
+            }
         }
     }
 
@@ -353,6 +366,9 @@ async fn setup_test_environment(
     let tenant2_cluster =
         get_or_create_tenant_cluster(&kind_cluster, "tenant2", tenant2_kubeconfig.clone(), env)
             .await?;
+
+    tenant1_cluster.ensure_cluster_is_ready().await?;
+    tenant2_cluster.ensure_cluster_is_ready().await?;
 
     if tenant1_cluster
         .is_authorized_to("get", "namespaces", None)
