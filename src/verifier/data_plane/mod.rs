@@ -81,13 +81,13 @@ pub async fn check_network_isolation(
         .create_pod_in_namespace(&NETWORK_MULTITOOL_POD, &tenant2.namespace)
         .await?;
 
-    println!("Waiting for pods1 to be ready...");
+    println!("Waiting for pod in tenant1 to be ready...");
     tenant1
         .cluster
         .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
         .await?;
 
-    println!("Waiting for pods2 to be ready...");
+    println!("Waiting for pod in tenant2 to be ready...");
     tenant2
         .cluster
         .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
@@ -129,7 +129,7 @@ pub async fn check_network_isolation(
         .cluster
         .wait_for_resource_to_be_created::<Service>(
             &WEBSERVER_SERVICE.name().unwrap(),
-            &tenant1.namespace,
+            &tenant2.namespace,
         )
         .await?;
 
@@ -157,7 +157,10 @@ pub async fn check_network_isolation(
         .await?
         .is_empty();
 
-    println!("Tenant1 can connect to service: {}", can_reach_service);
+    println!(
+        "Tenant1 pods can connect to services in tenant2: {}",
+        can_reach_service
+    );
 
     // cleanup
     tenant2
