@@ -7,10 +7,13 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand, ValueEnum};
 use cluster::TenantsPortMapping;
-use cluster::{ControlPlaneIsolation, KindCluster, KubernetesCluster, KubernetesClusterBuilder};
+use cluster::{
+    ControlPlaneIsolation, KindCluster, KubernetesCluster, KubernetesClusterBuilder,
+    NetworkIsolationStrategy,
+};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
-use verifier::{TenantClusterConfig, TransparentIsolationLevel};
+use verifier::TenantClusterConfig;
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
@@ -308,6 +311,9 @@ async fn get_or_create_tenant_cluster(
         ClusterEnvironmentType::Capsule => {
             KubernetesClusterBuilder::new(kind_cluster.clone())
                 .with_isolation_technology(ControlPlaneIsolation::Capsule(tenant.to_string()))
+                .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
+                    tenant.to_string(),
+                ))
                 .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
@@ -315,6 +321,9 @@ async fn get_or_create_tenant_cluster(
         ClusterEnvironmentType::VCluster => {
             KubernetesClusterBuilder::new(kind_cluster.clone())
                 .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant.to_string()))
+                // .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
+                //     tenant.to_string(),
+                // ))
                 .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
@@ -323,6 +332,7 @@ async fn get_or_create_tenant_cluster(
             return Err(anyhow!("Unsupported cluster environment type"));
         }
     };
+
     Ok(tenant_cluster)
 }
 
@@ -369,28 +379,6 @@ async fn setup_test_environment(
 
     tenant1_cluster.ensure_cluster_is_ready().await?;
     tenant2_cluster.ensure_cluster_is_ready().await?;
-
-    if tenant1_cluster
-        .is_authorized_to("get", "namespaces", None)
-        .await?
-    {
-        tenant1_cluster
-            .create_namespace_if_not_exists(&tenant1_ns)
-            .await?;
-    } else {
-        tenant1_cluster.create_namespace(&tenant1_ns).await?;
-    }
-
-    if tenant2_cluster
-        .is_authorized_to("get", "namespaces", None)
-        .await?
-    {
-        tenant2_cluster
-            .create_namespace_if_not_exists(&tenant2_ns)
-            .await?;
-    } else {
-        tenant2_cluster.create_namespace(&tenant2_ns).await?;
-    }
 
     println!("Created test clusters:");
     println!("Tenant 1 kubeconfig: {}", tenant1_kubeconfig.display());

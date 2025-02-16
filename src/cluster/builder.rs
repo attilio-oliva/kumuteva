@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{anyhow, Context, Ok};
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::{core::v1::Secret, networking::v1::NetworkPolicy};
 use kube::{api::ObjectMeta, runtime::reflector::Lookup};
 use tokio::time::sleep;
 
@@ -35,7 +35,7 @@ pub enum DataPlaneIsolation {
 
 #[derive(Debug, Clone)]
 pub enum NetworkIsolationStrategy {
-    NetworkPolicy,
+    NetworkPolicy(String),
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +69,18 @@ impl From<ControlPlaneIsolation> for IsolationTechnology {
 impl From<DataPlaneIsolation> for IsolationTechnology {
     fn from(tech: DataPlaneIsolation) -> Self {
         IsolationTechnology::DataPlane(tech)
+    }
+}
+
+impl From<NetworkIsolationStrategy> for DataPlaneIsolation {
+    fn from(tech: NetworkIsolationStrategy) -> Self {
+        DataPlaneIsolation::Network(tech)
+    }
+}
+
+impl From<NetworkIsolationStrategy> for IsolationTechnology {
+    fn from(tech: NetworkIsolationStrategy) -> Self {
+        DataPlaneIsolation::Network(tech).into()
     }
 }
 
@@ -129,8 +141,15 @@ impl KubernetesClusterBuilder {
                 .await?;
         }
 
+        // Ensure that the cluster is ready before applying data plane isolation technologies
+        let _ = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path)
+            .await?
+            .ensure_cluster_is_ready()
+            .await;
+
         for data_plane_isolation_technology in data_plane_isolation_technologies {
-            self.apply_data_plane_isolation_technology(data_plane_isolation_technology)?;
+            self.apply_data_plane_isolation_technology(data_plane_isolation_technology)
+                .await?;
         }
 
         let kubernetes_cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
@@ -145,6 +164,7 @@ impl KubernetesClusterBuilder {
             ControlPlaneIsolation::Capsule(namespace) => {
                 self.deploy_capsule_tenant(&namespace).await
             }
+
             ControlPlaneIsolation::VCluster(namespace) => self.deploy_vcluster(&namespace).await,
 
             ControlPlaneIsolation::KubeVirt => {
@@ -153,21 +173,94 @@ impl KubernetesClusterBuilder {
         }
     }
 
-    fn apply_data_plane_isolation_technology(
+    async fn apply_data_plane_isolation_technology(
         &self,
         data_plane_isolation_technology: DataPlaneIsolation,
     ) -> anyhow::Result<()> {
         match data_plane_isolation_technology {
             DataPlaneIsolation::Network(network_isolation_strategy) => {
-                Err(anyhow!("Network isolation is not implemented yet"))
+                match network_isolation_strategy {
+                    NetworkIsolationStrategy::NetworkPolicy(tenant_namespace) => {
+                        self.isolate_network_between_namespaces(&tenant_namespace)
+                            .await
+                    }
+                }
             }
-            DataPlaneIsolation::Storage(storage_isolation_technology) => {
+            DataPlaneIsolation::Storage(_storage_isolation_technology) => {
                 Err(anyhow!("Storage isolation is not implemented yet"))
             }
-            DataPlaneIsolation::Workload(workload_isolation_technology) => {
+            DataPlaneIsolation::Workload(_workload_isolation_technology) => {
                 Err(anyhow!("Workload isolation is not implemented yet"))
             }
         }
+    }
+
+    async fn isolate_network_between_namespaces(
+        &self,
+        tenant_namespace: &str,
+    ) -> anyhow::Result<()> {
+        let admin_cluster = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path).await?;
+        let deny_all_network_policy = json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": "deny-other-namespaces",
+            },
+            "spec": {
+                "podSelector": {
+                    "matchLabels": {}
+                },
+                "ingress": [{
+                    "from": [{
+                        "podSelector": {}
+                    }]
+                }],
+            }
+        });
+
+        let allow_dns_network_policy = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+              "name": "allow-traffic-to-kube-system",
+            },
+            "spec": {
+              "podSelector": {},
+              "egress": [
+                {
+                  "to": [
+                    {
+                      "podSelector": {
+                        "matchLabels": {}
+                      },
+                      "namespaceSelector": {
+                        "matchLabels": {
+                          "kubernetes.io/metadata.name": "kube-system"
+                        }
+                      }
+                    }
+                  ],
+                }
+              ]
+            }
+        });
+
+        let deny_all_network_policy: NetworkPolicy =
+            serde_json::from_value(deny_all_network_policy)?;
+        let allow_dns_network_policy: NetworkPolicy =
+            serde_json::from_value(allow_dns_network_policy)?;
+
+        admin_cluster
+            .create_namespaced_resource::<NetworkPolicy>(&deny_all_network_policy, tenant_namespace)
+            .await?;
+        admin_cluster
+            .create_namespaced_resource::<NetworkPolicy>(
+                &allow_dns_network_policy,
+                tenant_namespace,
+            )
+            .await?;
+
+        Ok(())
     }
 
     fn install_capsule() -> anyhow::Result<()> {
@@ -285,6 +378,11 @@ impl KubernetesClusterBuilder {
             std::fs::copy(&file, dest)?;
             std::fs::remove_file(&file)?;
         }
+
+        // create a namespace for the tenant
+        let tenant_cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
+        tenant_cluster.create_namespace(tenant_name).await?;
+
         Ok(())
     }
 

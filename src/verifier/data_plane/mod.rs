@@ -112,7 +112,11 @@ pub async fn check_network_isolation(
         .exec_command_in_container(
             &tenant1.namespace,
             NETWORK_MULTITOOL_POD_NAME,
-            format!("curl -sSf {}:80 > /dev/null", tenant2_pod_ip).as_str(),
+            format!(
+                "curl -sSf {}:80 --connect-timeout 10 2>&1 >/dev/null",
+                tenant2_pod_ip
+            )
+            .as_str(),
         )
         .await?
         .is_empty();
@@ -152,7 +156,11 @@ pub async fn check_network_isolation(
         .exec_command_in_container(
             &tenant1.namespace,
             NETWORK_MULTITOOL_POD_NAME,
-            format!("curl -sSf {}:80 > /dev/null", service_ip).as_str(),
+            format!(
+                "curl -sSf {}:80 --connect-timeout 10 2>&1 >/dev/null",
+                service_ip
+            )
+            .as_str(),
         )
         .await?
         .is_empty();
