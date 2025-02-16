@@ -1,5 +1,6 @@
 mod cluster;
 mod external_crds;
+mod helm;
 mod verifier;
 
 use std::path::PathBuf;
