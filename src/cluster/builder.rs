@@ -484,6 +484,12 @@ impl KubernetesClusterBuilder {
         let kubeconfig = std::fs::read_to_string(&self.kubeconfig_path)?;
         let kubeconfig = kubeconfig.replace("8443", &host_port.to_string());
         std::fs::write(&self.kubeconfig_path, kubeconfig)?;
+
+        // create a namespace to deploy workloads
+        let tenant_cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
+        tenant_cluster.ensure_cluster_is_ready().await?;
+        tenant_cluster.create_namespace(namespace).await?;
+
         Ok(())
     }
 
@@ -553,7 +559,10 @@ fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
                     "nodes": {
                         "enabled": true,
                         "syncBackChanges": true
-                    }
+                    },
+                    "storageClasses": {
+                        "enabled": true
+                    },
                 }
             }
 

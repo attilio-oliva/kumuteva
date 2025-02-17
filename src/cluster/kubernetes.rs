@@ -129,6 +129,20 @@ impl KubernetesCluster {
         Ok(())
     }
 
+    pub async fn get_cluster_resource<R>(&self, resource_name: &str) -> Result<R>
+    where
+        R: Resource<Scope = ClusterResourceScope>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::all(self.client.clone());
+        let resource = api.get(resource_name).await?;
+        Ok(resource)
+    }
+
     pub async fn get_resource_in_namespace<R>(
         &self,
         resource_name: &str,
@@ -676,8 +690,8 @@ impl KubernetesCluster {
 
     pub async fn exec_command_in_container(
         &self,
-        namespace: &str,
         pod_name: &str,
+        namespace: &str,
         command: &str,
     ) -> Result<String> {
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);

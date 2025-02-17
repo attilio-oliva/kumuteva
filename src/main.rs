@@ -269,6 +269,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Control plane isolation test results:\n{}", report);
             */
 
+            /*
+
             let is_network_isolated =
                 verifier::check_network_isolation(&tenant1_config, &tenant2_config)
                     .await
@@ -279,6 +281,11 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("Network isolation test failed");
             }
+            */
+
+            let is_storage_isolated =
+                verifier::check_storage_isolation(&tenant1_config, &tenant2_config).await;
+            is_storage_isolated.unwrap();
         }
     }
 

@@ -1,10 +1,11 @@
-use crate::cluster::KubernetesCluster;
+mod storage_isolation;
+pub use storage_isolation::*;
 
 use super::TenantClusterConfig;
 use anyhow::{Ok, Result};
-use k8s_openapi::api::core::v1::{Container, ContainerPort, Pod, PodSpec, Service};
-use kube::{api::ObjectMeta, runtime::reflector::Lookup};
-use std::{sync::LazyLock, vec};
+use k8s_openapi::api::core::v1::{Pod, Service};
+use kube::runtime::reflector::Lookup;
+use std::sync::LazyLock;
 
 const NETWORK_MULTITOOL_IMAGE: &str = "wbitt/network-multitool";
 const NETWORK_MULTITOOL_POD_NAME: &str = "network-multitool";
@@ -110,8 +111,8 @@ pub async fn check_network_isolation(
     let can_reach_other_pod = tenant1
         .cluster
         .exec_command_in_container(
-            &tenant1.namespace,
             NETWORK_MULTITOOL_POD_NAME,
+            &tenant1.namespace,
             format!(
                 "curl -sSf {}:80 --connect-timeout 10 2>&1 >/dev/null",
                 tenant2_pod_ip
@@ -154,8 +155,8 @@ pub async fn check_network_isolation(
     let can_reach_service = tenant1
         .cluster
         .exec_command_in_container(
-            &tenant1.namespace,
             NETWORK_MULTITOOL_POD_NAME,
+            &tenant1.namespace,
             format!(
                 "curl -sSf {}:80 --connect-timeout 10 2>&1 >/dev/null",
                 service_ip
