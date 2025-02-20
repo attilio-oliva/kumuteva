@@ -53,6 +53,27 @@ impl KubernetesCluster {
         Ok(Self { client })
     }
 
+    pub async fn patch_cluster_resource<R, P>(
+        &self,
+        resource_name: &str,
+        patch: &Patch<P>,
+    ) -> Result<R>
+    where
+        R: Resource<Scope = ClusterResourceScope>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+        P: serde::Serialize + std::fmt::Debug,
+    {
+        let api: Api<R> = Api::all(self.client.clone());
+        let resource = api
+            .patch(resource_name, &PatchParams::default(), patch)
+            .await?;
+        Ok(resource)
+    }
+
     pub async fn create_nodeport_service(
         &self,
         namespace: &str,

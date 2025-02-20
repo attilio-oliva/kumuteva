@@ -16,61 +16,59 @@ pub async fn check_storage_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
 ) -> anyhow::Result<()> {
-    let can_t1_get_storage_class = is_authorized_to_get_storage_class(tenant1).await;
-    let can_t2_get_storage_class = is_authorized_to_get_storage_class(tenant2).await;
-
-    if can_t1_get_storage_class? && can_t2_get_storage_class? {
-        let tenant1_storage_classes = tenant1
-            .cluster
-            .list_cluster_resources::<StorageClass>()
-            .await?;
-        let tenant2_storage_classes = tenant2
-            .cluster
-            .list_cluster_resources::<StorageClass>()
-            .await?;
-
-        if !tenant1_storage_classes.items.is_empty() && !tenant2_storage_classes.items.is_empty() {
-            return check_storage_class_isolation(
-                &tenant1_storage_classes.items,
-                &tenant2_storage_classes.items,
-            );
-        }
-    }
+    // let can_t1_get_storage_class = is_authorized_to_get_storage_class(tenant1).await;
+    // let can_t2_get_storage_class = is_authorized_to_get_storage_class(tenant2).await;
+    //
+    // if can_t1_get_storage_class? && can_t2_get_storage_class? {
+    //     let tenant1_storage_classes = tenant1
+    //         .cluster
+    //         .list_cluster_resources::<StorageClass>()
+    //         .await?;
+    //     let tenant2_storage_classes = tenant2
+    //         .cluster
+    //         .list_cluster_resources::<StorageClass>()
+    //         .await?;
+    //
+    //     if !tenant1_storage_classes.items.is_empty() && !tenant2_storage_classes.items.is_empty() {
+    //         return check_storage_class_isolation(
+    //             &tenant1_storage_classes.items,
+    //             &tenant2_storage_classes.items,
+    //         );
+    //     }
+    // }
 
     // If we can't check storage classes, we can try by creating  a PVC and checking if it's isolated
     // first attempt to check PV persistentVolumeReclaimPolicy field as it's set by the StorageClass
     // if the tenant doesn't have permission to list PVs, we can't check this
 
-    let result = attempt_other_tenant_file_access(tenant1, tenant2).await;
+    attempt_other_tenant_file_access(tenant1, tenant2).await?;
 
-    let _ = cleanup(tenant1).await;
-    let _ = cleanup(tenant2).await;
-
-    result
+    Ok(())
 }
 
-async fn cleanup(tenant: &TenantClusterConfig) -> anyhow::Result<()> {
+async fn cleanup(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    pv_name: &str,
+    pvc_name: &str,
+) -> anyhow::Result<()> {
     let pod_name = "persistent-pod";
 
-    let pvc = tenant
+    tenant2
         .cluster
-        .get_resource_in_namespace::<PersistentVolumeClaim>(pod_name, &tenant.namespace)
+        .delete_resouce_in_namespace::<StatefulSet>(pod_name, &tenant2.namespace)
         .await?;
 
-    let pvc_name = pvc.metadata.name.unwrap();
-    let pv_name = pvc.spec.unwrap().volume_name.unwrap();
+    println!("Cleaning up PVC {}", pvc_name);
+    tenant1
+        .cluster
+        .delete_resouce_in_namespace::<PersistentVolumeClaim>(pvc_name, &tenant1.namespace)
+        .await?;
 
-    tenant
+    println!("Cleaning up PV {}", pv_name);
+    tenant1
         .cluster
-        .delete_resouce_in_namespace::<StatefulSet>(pod_name, &tenant.namespace)
-        .await?;
-    tenant
-        .cluster
-        .delete_resouce_in_namespace::<PersistentVolumeClaim>(pvc_name.as_str(), &tenant.namespace)
-        .await?;
-    tenant
-        .cluster
-        .delete_cluster_resource::<PersistentVolume>(pv_name.as_str())
+        .delete_cluster_resource::<PersistentVolume>(pv_name)
         .await?;
 
     Ok(())
@@ -143,7 +141,8 @@ async fn attempt_other_tenant_file_access(
                     },
                 },
             ],
-            "restartPolicy": "Never"
+            "restartPolicy": "Never",
+            "replicas": 1
         }
     }))?;
 
@@ -180,7 +179,7 @@ async fn attempt_other_tenant_file_access(
         )
         .await?;
 
-    let dynamic_pv_name = tenant1
+    let created_pvc = tenant1
         .cluster
         .list_namespaced_resources::<PersistentVolumeClaim>(&tenant1.namespace)
         .await?
@@ -193,13 +192,14 @@ async fn attempt_other_tenant_file_access(
                 .map(|labels| labels["app"] == pod_name)
                 .unwrap_or(false)
         })
-        .ok_or_else(|| anyhow::anyhow!("PersistentVolumeClaim not found"))?
-        .spec
-        .unwrap()
-        .volume_name
-        .unwrap();
+        .ok_or_else(|| anyhow::anyhow!("PersistentVolumeClaim not found"))?;
 
-    println!("PV created: {}", dynamic_pv_name);
+    // The name of the PVC requested is used as a base for each replica of a StatefulSet
+    // so we need to get the actual name of the PVC created by the StatefulSet by our single replica
+    let created_pvc_name = created_pvc.metadata.name.as_deref().unwrap_or_default();
+    let dynamic_pv_name = created_pvc.spec.unwrap().volume_name.unwrap();
+
+    println!("A dynamic PV was created: {}", dynamic_pv_name);
 
     // check if authorized to list PVs
     if tenant1
@@ -223,25 +223,25 @@ async fn attempt_other_tenant_file_access(
                             .map(|claim_ref| claim_ref.name.as_deref())
                     })
                     .flatten()
-                    .map(|claim_name| claim_name == persistent_volume_claim_name)
+                    .map(|claim_name| claim_name == created_pvc_name)
                     .unwrap_or(false)
             })
             .ok_or_else(|| anyhow::anyhow!("PersistentVolume not found"))?;
 
-        if let Some(reclaim_policy) = new_persistent_volume
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.persistent_volume_reclaim_policy.as_deref())
-        {
-            if reclaim_policy != "Delete" {
-                return Err(anyhow::anyhow!(
-                    "PersistentVolume is not isolated between tenants, it must have reclaimPolicy set to Delete"
-                ));
-            } else {
-                println!("PersistentVolume is isolated between tenants");
-                return Ok(());
-            }
-        }
+        // if let Some(reclaim_policy) = new_persistent_volume
+        //     .spec
+        //     .as_ref()
+        //     .and_then(|spec| spec.persistent_volume_reclaim_policy.as_deref())
+        // {
+        //     if reclaim_policy != "Delete" {
+        //         return Err(anyhow::anyhow!(
+        //             "PersistentVolume is not isolated between tenants, it must have reclaimPolicy set to Delete"
+        //         ));
+        //     } else {
+        //         println!("PersistentVolume is isolated between tenants");
+        //         return Ok(());
+        //     }
+        // }
     }
 
     // Now create a pod in tenant2 that attempts to read the file.
@@ -274,8 +274,11 @@ async fn attempt_other_tenant_file_access(
                                 "sh",
                                 "-c",
                                 format!(
-                                    "if [ \"$(cat {} 2>/dev/null)\" = \"{}\" ]; then exit 1; else exit 0; fi",
-                                    file_path, file_content
+                                    "echo 'Reading file content:' && cat {} 2>/dev/null || echo 'File not found/accessible' && \
+                                     if [ \"$(cat {} 2>/dev/null)\" = \"{}\" ]; then exit 1; else exit 0; fi",
+                                    file_path,
+                                    file_path,
+                                    file_content
                                 )
                             ],
                             "volumeMounts": [
@@ -304,7 +307,8 @@ async fn attempt_other_tenant_file_access(
                     },
                 },
             ],
-            "restartPolicy": "Never"
+            "restartPolicy": "Never",
+            "replicas": 1
         }
     }))?;
 
@@ -322,6 +326,23 @@ async fn attempt_other_tenant_file_access(
     tenant1
         .cluster
         .delete_resouce_in_namespace::<StatefulSet>(pod_name, &tenant1.namespace)
+        .await?;
+
+    tenant1
+        .cluster
+        .delete_resouce_in_namespace::<PersistentVolumeClaim>(created_pvc_name, &tenant1.namespace)
+        .await?;
+
+    tenant1
+        .cluster
+        .patch_cluster_resource::<PersistentVolume, _>(
+            &dynamic_pv_name,
+            &kube::api::Patch::Strategic(serde_json::json!({
+                "spec": {
+                    "claimRef": null
+                }
+            })),
+        )
         .await?;
 
     tenant2
@@ -390,6 +411,8 @@ async fn attempt_other_tenant_file_access(
             .to_string()
             .contains("timed out")
     {
+        println!("Pod creation timed out, we assume a policy is blocking the cross-tenant mount");
+        //let _ = cleanup(tenant1, tenant2, &dynamic_pv_name, created_pvc_name).await;
         return Ok(());
     }
 
@@ -431,6 +454,7 @@ async fn attempt_other_tenant_file_access(
         ));
     }
 
+    let _ = cleanup(tenant1, tenant2, &dynamic_pv_name, created_pvc_name).await;
     Ok(())
 }
 
