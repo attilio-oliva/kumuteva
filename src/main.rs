@@ -285,7 +285,11 @@ async fn main() -> anyhow::Result<()> {
 
             let is_storage_isolated =
                 verifier::check_storage_isolation(&tenant1_config, &tenant2_config).await;
-            is_storage_isolated.unwrap();
+
+            match is_storage_isolated {
+                Ok(_) => println!("Storage isolation test passed"),
+                Err(e) => panic!("Storage isolation test failed: {}", e),
+            }
         }
     }
 

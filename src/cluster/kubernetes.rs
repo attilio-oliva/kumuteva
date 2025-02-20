@@ -143,6 +143,24 @@ impl KubernetesCluster {
         Ok(resource)
     }
 
+    pub async fn find_cluster_resources_with_label<R>(&self, label: &str) -> Result<ObjectList<R>>
+    where
+        R: Resource<Scope = ClusterResourceScope>
+            + Clone
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::all(self.client.clone());
+        let resources = api
+            .list(&ListParams {
+                label_selector: Some(String::from(label)),
+                ..Default::default()
+            })
+            .await?;
+        Ok(resources)
+    }
+
     pub async fn get_resource_in_namespace<R>(
         &self,
         resource_name: &str,
@@ -298,6 +316,19 @@ impl KubernetesCluster {
         Ok(status.phase == Some("Running".to_string()))
     }
 
+    pub async fn list_namespaced_resources<R>(&self, namespace: &str) -> Result<ObjectList<R>>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Clone
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+        let resources = api.list(&ListParams::default()).await?;
+        Ok(resources)
+    }
+
     pub async fn list_cluster_resources<R>(&self) -> Result<ObjectList<R>>
     where
         R: Resource<Scope = ClusterResourceScope>
@@ -441,6 +472,40 @@ impl KubernetesCluster {
             }
         }
         Err(anyhow!("Resource was not created in time"))
+    }
+
+    pub async fn watch_namespaced_resource_until_condition<R, F, O>(
+        &self,
+        resource_name: &str,
+        namespace: &str,
+        timeout_seconds: u32,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: Fn(WatchEvent<R>) -> O,
+        O: Future<Output = bool>,
+        R: Resource<Scope = NamespaceResourceScope>
+            + Clone
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", resource_name))
+            .timeout(timeout_seconds); // upper bound of how long we watch for
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(status) = stream.try_next().await? {
+            let should_stop = on_event(status).await;
+            if should_stop {
+                return Ok(());
+            }
+        }
+
+        Err(Error::msg("Resource watch timed out"))
     }
 
     pub async fn watch_cluster_resource_until_condition<R, F, O>(
