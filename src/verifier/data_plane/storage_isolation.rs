@@ -183,7 +183,7 @@ async fn attempt_other_tenant_file_access(
         return Ok(());
     }
 
-    // Step 3: Release the PV from tenant1
+    // Step 3: Release the PV from tenant1 by deleting the stateful set
     release_pv_from_tenant(tenant1, &dynamic_pv_name, &created_pvc_name).await?;
 
     // Step 4: Create StatefulSet in tenant2 with PVC
@@ -191,296 +191,26 @@ async fn attempt_other_tenant_file_access(
     let (created_pvc_name, dynamic_pv_name) =
         create_tenant_stateful_set(tenant2, &tenant2_commands, Some(&dynamic_pv_name)).await?;
 
-    // Step 5: Try to mount the PV in tenant2
-    let mount_result = try_mount_in_tenant(tenant2, &dynamic_pv_name, &file_path).await;
+    // Step 5: Check if the mount of the old tenant1 PV is successfull in tenant2
+    let mount_result = check_mount_attempt(tenant2, &dynamic_pv_name, &file_path).await;
 
-    // Step 6: Check results and clean up
-    let result = check_cross_tenant_mount_results(tenant2, mount_result).await?;
+    // Step 6: Check if the mounted PV was really the same one of tenant1 and if there are its files
+    if mount_result.is_err() {
+        println!("Tenant2 cannot mount the pv created by Tenant1, storage is isolated");
+        return Ok(());
+    }
+
+    // Step 7: Check if tenant2 can access the file created by tenant1
+    let can_access_tenant1_files = check_cross_tenant_mount(tenant2).await?;
 
     let _ = cleanup(tenant1, tenant2, &dynamic_pv_name, &created_pvc_name).await;
-    //result
 
-    let created_pvc = tenant1
-        .cluster
-        .list_namespaced_resources::<PersistentVolumeClaim>(&tenant1.namespace)
-        .await?
-        .items
-        .into_iter()
-        .find(|pvc| {
-            pvc.metadata
-                .labels
-                .as_ref()
-                .map(|labels| labels["app"] == POD_NAME)
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| anyhow::anyhow!("PersistentVolumeClaim not found"))?;
-
-    // The name of the PVC requested is used as a base for each replica of a StatefulSet
-    // so we need to get the actual name of the PVC created by the StatefulSet by our single replica
-    let created_pvc_name = created_pvc.metadata.name.as_deref().unwrap_or_default();
-    let dynamic_pv_name = created_pvc.spec.unwrap().volume_name.unwrap();
-
-    println!("A dynamic PV was created: {}", dynamic_pv_name);
-
-    // check if authorized to list PVs
-    if tenant1
-        .cluster
-        .is_authorized_to("get", "PersistentVolume", None)
-        .await?
-    {
-        println!("Checking if PersistentVolume is isolated between tenants");
-        let new_persistent_volume = tenant1
-            .cluster
-            .list_cluster_resources::<PersistentVolume>()
-            .await?
-            .items
-            .into_iter()
-            .find(|pv| {
-                pv.spec
-                    .as_ref()
-                    .and_then(|spec| {
-                        spec.claim_ref
-                            .as_ref()
-                            .map(|claim_ref| claim_ref.name.as_deref())
-                    })
-                    .flatten()
-                    .map(|claim_name| claim_name == created_pvc_name)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| anyhow::anyhow!("PersistentVolume not found"))?;
-
-        if strategy == StorageIsolationCheckStrategy::CheckPVReclaimPolicy {
-            if let Some(reclaim_policy) = new_persistent_volume
-                .spec
-                .as_ref()
-                .and_then(|spec| spec.persistent_volume_reclaim_policy.as_deref())
-            {
-                if reclaim_policy != "Delete" {
-                    return Err(anyhow::anyhow!(
-                    "PersistentVolume is not isolated between tenants, it must have reclaimPolicy set to Delete"
-                ));
-                } else {
-                    println!("PersistentVolume is isolated between tenants");
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    if strategy != StorageIsolationCheckStrategy::MountOtherTenantStorage {
-        return Ok(());
-    }
-    // Now create a pod in tenant2 that attempts to read the file.
-    // The container command checks if the file content is the expected one.
-    // If yes then it exits with exit code 1, otherwise 0.
-    let tenant2_pod = serde_json::from_value(serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "StatefulSet",
-        "metadata": {
-            "name": POD_NAME,
-        },
-        "spec": {
-            "selector": {
-                "matchLabels": {
-                    "app": POD_NAME
-                },
-            },
-            "template": {
-                "metadata": {
-                    "labels": {
-                        "app": POD_NAME
-                    },
-                },
-                "spec": {
-                    "containers": [
-                        {
-                            "name": POD_NAME,
-                            "image": "nginx",
-                            "command": [
-                                "sh",
-                                "-c",
-                                format!(
-                                    "echo 'Reading file content:' && cat {} 2>/dev/null || echo 'File not found/accessible' && \
-                                     if [ \"$(cat {} 2>/dev/null)\" = \"{}\" ]; then exit 1; else exit 0; fi",
-                                    file_path,
-                                    file_path,
-                                    FILE_CONTENT
-                                )
-                            ],
-                            "volumeMounts": [
-                                {
-                                    "mountPath": MOUNT_PATH,
-                                    "name": PVC_NAME
-                                },
-                            ],
-                        },
-                    ],
-                },
-            },
-            "volumeClaimTemplates": [
-                {
-                    "metadata": {
-                        "name": PVC_NAME,
-                    },
-                    "spec": {
-                        "volumeName": dynamic_pv_name, // Attempt to use the same PV as tenant1
-                        "accessModes": ["ReadWriteOnce"],
-                        "resources": {
-                            "requests": {
-                                "storage": "1Gi",
-                            },
-                        },
-                    },
-                },
-            ],
-            "restartPolicy": "Never",
-            "replicas": 1
-        }
-    }))?;
-
-    // println!("Attempting to create a file in tenant1 and access it from tenant2");
-    // tenant1
-    //     .cluster
-    //     .exec_command_in_container(
-    //         POD_NAME,
-    //         &tenant1.namespace,
-    //         &format!("sh -c 'echo {} > {}'", file_content, file_path),
-    //     )
-    //     .await?;
-
-    // Now delete the pod and create the same pod in the other tenant
-    tenant1
-        .cluster
-        .delete_resouce_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
-        .await?;
-
-    tenant1
-        .cluster
-        .delete_resouce_in_namespace::<PersistentVolumeClaim>(created_pvc_name, &tenant1.namespace)
-        .await?;
-
-    tenant1
-        .cluster
-        .patch_cluster_resource::<PersistentVolume, _>(
-            &dynamic_pv_name,
-            &kube::api::Patch::Strategic(serde_json::json!({
-                "spec": {
-                    "claimRef": null
-                }
-            })),
-        )
-        .await?;
-
-    tenant2
-        .cluster
-        .create_namespaced_resource::<StatefulSet>(&tenant2_pod, &tenant2.namespace)
-        .await?;
-
-    let wait_operation = tenant2
-        .cluster
-        .watch_namespaced_resource_until_condition::<StatefulSet, _, _>(
-            POD_NAME,
-            &tenant2.namespace,
-            15,
-            |_event| async {
-                let stateful_set = tenant2
-                    .cluster
-                    .get_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant2.namespace)
-                    .await;
-
-                if stateful_set.is_err() {
-                    return false;
-                }
-
-                // some solution will block the pod creation as a webhoook preventing a cross-tenant mount
-                // so we need to check if the pod is not created, then we assume the storage is isolated
-                let pod = tenant2
-                    .cluster
-                    .list_pods_with_label_in_namespace(
-                        &format!("app={}", POD_NAME),
-                        &tenant2.namespace,
-                    )
-                    .await
-                    .map(|pods| pods.items.first().cloned());
-
-                if pod.is_err() || pod.as_ref().unwrap().is_none() {
-                    return false;
-                }
-
-                let pod = pod.unwrap().unwrap();
-
-                let is_container_terminated = pod
-                    .status
-                    .and_then(|status| status.container_statuses)
-                    .map(|container_statuses| {
-                        container_statuses.iter().any(|container_status| {
-                            container_status
-                                .state
-                                .as_ref()
-                                .and_then(|state| {
-                                    state.terminated.as_ref().map(|terminated| {
-                                        terminated.exit_code == 0 || terminated.exit_code == 1
-                                    })
-                                })
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false);
-
-                is_container_terminated
-            },
-        )
-        .await;
-    if wait_operation.is_err()
-        && wait_operation
-            .unwrap_err()
-            .to_string()
-            .contains("timed out")
-    {
-        println!("Pod creation timed out, we assume a policy is blocking the cross-tenant mount");
-        //let _ = cleanup(tenant1, tenant2, &dynamic_pv_name, created_pvc_name).await;
-        return Ok(());
-    }
-
-    // check if the file is accessible
-    // let file_content2 = tenant2
-    //     .cluster
-    //     .exec_command_in_container(POD_NAME, &tenant2.namespace, &format!("cat {}", file_path))
-    //     .await?;
-
-    //if file_content2.trim() == file_content {
-    //    return Err(anyhow::anyhow!(
-    //        "Tenant2 can access the file created by Tenant1, storage is not isolated"
-    //    ));
-    //}
-
-    let label = format!("app={}", POD_NAME);
-    // get stateful set pod
-    let pod = tenant2
-        .cluster
-        .list_pods_with_label_in_namespace(&label, &tenant2.namespace)
-        .await?
-        .items
-        .first()
-        .ok_or(anyhow::anyhow!("Pod in tenant2 not found"))
-        .unwrap()
-        .to_owned();
-
-    // check exit status
-    let exit_code = pod.status.unwrap().container_statuses.unwrap()[0]
-        .state
-        .as_ref()
-        .and_then(|state| state.terminated.as_ref())
-        .map(|terminated| terminated.exit_code)
-        .unwrap_or(0);
-
-    if exit_code == 1 {
+    if can_access_tenant1_files {
         return Err(anyhow::anyhow!(
             "Tenant2 can access the file created by Tenant1, storage is not isolated"
         ));
     }
 
-    let _ = cleanup(tenant1, tenant2, &dynamic_pv_name, created_pvc_name).await;
     Ok(())
 }
 
@@ -491,7 +221,7 @@ async fn create_tenant_stateful_set<T: AsRef<str> + Serialize>(
     pv_name: Option<&str>,
 ) -> anyhow::Result<(String, String)> {
     // Create StatefulSet with PVC in tenant1
-    let tenant_pod = create_tenant_statefulset_manifest(commands, None)?;
+    let tenant_pod = create_tenant_statefulset_manifest(commands, pv_name)?;
 
     tenant
         .cluster
@@ -567,19 +297,72 @@ fn create_tenant_statefulset_manifest<T: AsRef<str> + Serialize>(
         }
     }))?;
 
-    // if pv_name is provided, set it in the volume claim template
+    // If pv_name is provided, set it in the volume claim template
     if let Some(pv_name) = pv_name {
-        pod_manifest
-            .spec
-            .as_mut()
-            .unwrap()
-            .volume_claim_templates
-            .unwrap()[0]
-            .spec
-            .unwrap()
-            .volume_name = Some(pv_name.to_string());
+        // Safely access and modify nested fields
+        if let Some(spec) = pod_manifest.spec.as_mut() {
+            if let Some(volume_claim_templates) = spec.volume_claim_templates.as_mut() {
+                if !volume_claim_templates.is_empty() {
+                    if let Some(claim_spec) = volume_claim_templates[0].spec.as_mut() {
+                        claim_spec.volume_name = Some(pv_name.to_string());
+                    }
+                }
+            }
+        }
     }
     Ok(pod_manifest)
+}
+
+async fn check_pv_reclaim_policy(
+    tenant: &TenantClusterConfig,
+    pvc_name: &str,
+) -> anyhow::Result<Option<bool>> {
+    let pv_name = tenant
+        .cluster
+        .get_resource_in_namespace::<PersistentVolumeClaim>(pvc_name, &tenant.namespace)
+        .await?
+        .spec
+        .and_then(|spec| spec.volume_name)
+        .ok_or_else(|| anyhow::anyhow!("PersistentVolumeClaim not found"))?;
+
+    let pv = tenant
+        .cluster
+        .get_cluster_resource::<PersistentVolume>(&pv_name)
+        .await?;
+
+    Ok(pv
+        .spec
+        .map(|spec| spec.persistent_volume_reclaim_policy == Some("Delete".to_string())))
+}
+
+async fn release_pv_from_tenant(
+    tenant: &TenantClusterConfig,
+    pv_name: &str,
+    pvc_name: &str,
+) -> anyhow::Result<()> {
+    tenant
+        .cluster
+        .delete_resouce_in_namespace::<StatefulSet>(POD_NAME, &tenant.namespace)
+        .await?;
+
+    tenant
+        .cluster
+        .delete_resouce_in_namespace::<PersistentVolumeClaim>(pvc_name, &tenant.namespace)
+        .await?;
+
+    tenant
+        .cluster
+        .patch_cluster_resource::<PersistentVolume, _>(
+            pv_name,
+            &kube::api::Patch::Strategic(serde_json::json!({
+                "spec": {
+                    "claimRef": null
+                }
+            })),
+        )
+        .await?;
+
+    Ok(())
 }
 
 async fn wait_for_statefulset_ready(tenant: &TenantClusterConfig) -> anyhow::Result<()> {
@@ -604,7 +387,7 @@ async fn wait_for_statefulset_ready(tenant: &TenantClusterConfig) -> anyhow::Res
                 let replicas = stateful_set
                     .status
                     .as_ref()
-                    .and_then(|status| Some(status.replicas))
+                    .map(|status| status.replicas)
                     .unwrap_or(0);
                 let ready_replicas = stateful_set
                     .status
@@ -642,6 +425,108 @@ async fn get_pvc_and_pv_info(tenant: &TenantClusterConfig) -> anyhow::Result<(St
     let dynamic_pv_name = created_pvc.spec.unwrap().volume_name.unwrap();
 
     Ok((created_pvc_name.to_string(), dynamic_pv_name.to_string()))
+}
+
+async fn check_mount_attempt(
+    tenant: &TenantClusterConfig,
+    pv_name: &str,
+    file_path: &str,
+) -> anyhow::Result<()> {
+    let wait_operation = tenant
+        .cluster
+        .watch_namespaced_resource_until_condition::<StatefulSet, _, _>(
+            POD_NAME,
+            &tenant.namespace,
+            15,
+            |_event| async {
+                let stateful_set = tenant
+                    .cluster
+                    .get_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant.namespace)
+                    .await;
+
+                if stateful_set.is_err() {
+                    return false;
+                }
+
+                // some solution will block the pod creation as a webhoook preventing a cross-tenant mount
+                // so we need to check if the pod is not created, then we assume the storage is isolated
+                let pod = tenant
+                    .cluster
+                    .list_pods_with_label_in_namespace(
+                        &format!("app={}", POD_NAME),
+                        &tenant.namespace,
+                    )
+                    .await
+                    .map(|pods| pods.items.first().cloned());
+
+                if pod.is_err() || pod.as_ref().unwrap().is_none() {
+                    return false;
+                }
+
+                let pod = pod.unwrap().unwrap();
+
+                let is_container_terminated = pod
+                    .status
+                    .and_then(|status| status.container_statuses)
+                    .map(|container_statuses| {
+                        container_statuses.iter().any(|container_status| {
+                            container_status
+                                .state
+                                .as_ref()
+                                .and_then(|state| {
+                                    state.terminated.as_ref().map(|terminated| {
+                                        terminated.exit_code == 0 || terminated.exit_code == 1
+                                    })
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+
+                is_container_terminated
+            },
+        )
+        .await;
+    if let Err(err) = &wait_operation {
+        if err.to_string().contains("timed out") {
+            println!(
+                "Pod creation timed out, we assume a policy is blocking the cross-tenant mount"
+            );
+            //let _ = cleanup(tenant1, tenant2, &dynamic_pv_name, created_pvc_name).await;
+            return Ok(());
+        }
+    }
+
+    wait_operation
+}
+
+async fn check_cross_tenant_mount(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+    let label = format!("app={}", POD_NAME);
+    // get stateful set pod
+    let pod = tenant
+        .cluster
+        .list_pods_with_label_in_namespace(&label, &tenant.namespace)
+        .await?
+        .items
+        .first()
+        .ok_or(anyhow::anyhow!("Pod in tenant2 not found"))
+        .unwrap()
+        .to_owned();
+
+    // check exit status
+    let exit_code = pod.status.unwrap().container_statuses.unwrap()[0]
+        .state
+        .as_ref()
+        .and_then(|state| state.terminated.as_ref())
+        .map(|terminated| terminated.exit_code)
+        .unwrap_or(0);
+
+    if exit_code == 1 {
+        // This tenant can access the file created by the other tenant
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 async fn cleanup(
