@@ -162,7 +162,7 @@ async fn attempt_other_tenant_file_access(
     // Step 1: Create StatefulSet in tenant1 with PVC
     println!("Creating a StatefulSet in tenant1");
     let (created_pvc_name, dynamic_pv_name) =
-        create_tenant_stateful_set(tenant1, &tenant1_commands, None).await?;
+        create_and_wait_stateful_set(tenant1, &tenant1_commands, None).await?;
 
     // Step 2: Check PV reclaim policy if applicable
     if strategy == StorageIsolationCheckStrategy::CheckPVReclaimPolicy {
@@ -188,11 +188,13 @@ async fn attempt_other_tenant_file_access(
 
     // Step 4: Create StatefulSet in tenant2 with PVC
     println!("Creating a StatefulSet in tenant2");
-    let (created_pvc_name, dynamic_pv_name) =
-        create_tenant_stateful_set(tenant2, &tenant2_commands, Some(&dynamic_pv_name)).await?;
-
+    //let (created_pvc_name, dynamic_pv_name) =
+    //    create_and_wait_stateful_set(tenant2, &tenant2_commands, Some(&dynamic_pv_name)).await?;
+    create_stateful_set(tenant2, &tenant2_commands, Some(&dynamic_pv_name)).await?;
     // Step 5: Check if the mount of the old tenant1 PV is successfull in tenant2
     let mount_result = check_mount_attempt(tenant2, &dynamic_pv_name, &file_path).await;
+    // get the pvc name created by tenant2
+    let created_pvc_name = get_pvc_from_pv(tenant2, &dynamic_pv_name).await?;
 
     // Step 6: Check if the mounted PV was really the same one of tenant1 and if there are its files
     if mount_result.is_err() {
@@ -214,20 +216,27 @@ async fn attempt_other_tenant_file_access(
     Ok(())
 }
 
-/// Create StatefulSet with PVC in tenant1 and write test file
-async fn create_tenant_stateful_set<T: AsRef<str> + Serialize>(
+/// Create a StatefulSet without waiting for it to be ready
+async fn create_stateful_set<T: AsRef<str> + Serialize>(
     tenant: &TenantClusterConfig,
     commands: &[T],
     pv_name: Option<&str>,
-) -> anyhow::Result<(String, String)> {
-    // Create StatefulSet with PVC in tenant1
-    let tenant_pod = create_tenant_statefulset_manifest(commands, pv_name)?;
+) -> anyhow::Result<()> {
+    // Create StatefulSet with PVC
+    let tenant_set = create_tenant_statefulset_manifest(commands, pv_name)?;
 
     tenant
         .cluster
-        .create_namespaced_resource::<StatefulSet>(&tenant_pod, &tenant.namespace)
+        .create_namespaced_resource::<StatefulSet>(&tenant_set, &tenant.namespace)
         .await?;
 
+    Ok(())
+}
+
+/// Wait for a StatefulSet to become ready and return PVC/PV information
+async fn wait_and_get_volume_info(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<(String, String)> {
     // Wait for StatefulSet to be ready
     wait_for_statefulset_ready(tenant).await?;
 
@@ -237,6 +246,20 @@ async fn create_tenant_stateful_set<T: AsRef<str> + Serialize>(
     println!("A dynamic PV was created: {}", dynamic_pv_name);
 
     Ok((created_pvc_name, dynamic_pv_name))
+}
+
+/// Create StatefulSet with PVC and wait for it to be ready
+/// This function combines the two functions above for backward compatibility
+async fn create_and_wait_stateful_set<T: AsRef<str> + Serialize>(
+    tenant: &TenantClusterConfig,
+    commands: &[T],
+    pv_name: Option<&str>,
+) -> anyhow::Result<(String, String)> {
+    // Create the StatefulSet
+    create_stateful_set(tenant, commands, pv_name).await?;
+
+    // Wait for it to be ready and get volume info
+    wait_and_get_volume_info(tenant).await
 }
 
 fn create_tenant_statefulset_manifest<T: AsRef<str> + Serialize>(
@@ -437,7 +460,7 @@ async fn check_mount_attempt(
         .watch_namespaced_resource_until_condition::<StatefulSet, _, _>(
             POD_NAME,
             &tenant.namespace,
-            15,
+            POD_CREATION_TIMEOUT,
             |_event| async {
                 let stateful_set = tenant
                     .cluster
@@ -527,6 +550,21 @@ async fn check_cross_tenant_mount(tenant: &TenantClusterConfig) -> anyhow::Resul
     }
 
     Ok(false)
+}
+
+async fn get_pvc_from_pv(tenant: &TenantClusterConfig, pv_name: &str) -> anyhow::Result<String> {
+    let pv = tenant
+        .cluster
+        .get_cluster_resource::<PersistentVolume>(pv_name)
+        .await?;
+
+    let pvc_name = pv
+        .spec
+        .and_then(|spec| spec.claim_ref)
+        .and_then(|claim_ref| claim_ref.name)
+        .ok_or_else(|| anyhow::anyhow!("PersistentVolumeClaim not found"))?;
+
+    Ok(pvc_name)
 }
 
 async fn cleanup(

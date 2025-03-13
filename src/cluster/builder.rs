@@ -19,6 +19,8 @@ pub enum IsolationTechnology {
 
 #[derive(Debug, Clone)]
 pub enum ControlPlaneIsolation {
+    /// Do not isolate the control plane, just create a new namespace
+    None(String),
     /// Capsule with a tenant confined in the given namespace
     Capsule(String),
     /// vCluster virtual control plane in the given namespace
@@ -166,6 +168,10 @@ impl KubernetesClusterBuilder {
             }
 
             ControlPlaneIsolation::VCluster(namespace) => self.deploy_vcluster(&namespace).await,
+
+            ControlPlaneIsolation::None(namespace) => {
+                self.dummy_control_plane_isolation(&namespace).await
+            }
 
             ControlPlaneIsolation::KubeVirt => {
                 Err(anyhow!("KubeVirt isolation is not implemented yet"))
@@ -518,6 +524,15 @@ impl KubernetesClusterBuilder {
         let config: String = String::from_utf8(config_b64.0)
             .context("Failed to parse config data from secret as UTF-8 string")?;
         Ok(config)
+    }
+    async fn dummy_control_plane_isolation(&self, namespace: &str) -> anyhow::Result<()> {
+        let cluster = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path).await?;
+        cluster.create_namespace(namespace).await?;
+        // use the kind kubeconfig as the tenant kubeconfig
+        // Basically, we are not isolating the control plane and reusing the same kubeconfig
+        let kubeconfig = std::fs::read_to_string(&self.kind_cluster.kubeconfig_path)?;
+        std::fs::write(&self.kubeconfig_path, kubeconfig)?;
+        Ok(())
     }
 }
 

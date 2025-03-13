@@ -24,6 +24,8 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ClusterEnvironmentType {
+    #[clap(name = "native", alias = "na")]
+    Native,
     #[clap(name = "capsule", alias = "cap", alias = "caps")]
     Capsule,
     #[clap(name = "kcp")]
@@ -37,6 +39,7 @@ enum ClusterEnvironmentType {
 impl ClusterEnvironmentType {
     fn as_str(&self) -> &str {
         match self {
+            ClusterEnvironmentType::Native => "native",
             ClusterEnvironmentType::Capsule => "capsule",
             ClusterEnvironmentType::Kcp => "kcp",
             ClusterEnvironmentType::VCluster => "vcluster",
@@ -335,6 +338,13 @@ async fn get_or_create_tenant_cluster(
                 // .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
                 //     tenant.to_string(),
                 // ))
+                .with_kubeconfig_path(kubeconfig_path)
+                .build()
+                .await?
+        }
+        ClusterEnvironmentType::Native => {
+            KubernetesClusterBuilder::new(kind_cluster.clone())
+                .with_isolation_technology(ControlPlaneIsolation::None(tenant.to_string()))
                 .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
