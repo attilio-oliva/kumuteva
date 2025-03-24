@@ -192,7 +192,7 @@ async fn attempt_other_tenant_file_access(
     //    create_and_wait_stateful_set(tenant2, &tenant2_commands, Some(&dynamic_pv_name)).await?;
     create_stateful_set(tenant2, &tenant2_commands, Some(&dynamic_pv_name)).await?;
     // Step 5: Check if the mount of the old tenant1 PV is successfull in tenant2
-    let mount_result = check_mount_attempt(tenant2, &dynamic_pv_name, &file_path).await;
+    let mount_result = check_mount_attempt(tenant2).await;
     // get the pvc name created by tenant2
     let created_pvc_name = get_pvc_from_pv(tenant2, &dynamic_pv_name).await?;
 
@@ -450,11 +450,7 @@ async fn get_pvc_and_pv_info(tenant: &TenantClusterConfig) -> anyhow::Result<(St
     Ok((created_pvc_name.to_string(), dynamic_pv_name.to_string()))
 }
 
-async fn check_mount_attempt(
-    tenant: &TenantClusterConfig,
-    pv_name: &str,
-    file_path: &str,
-) -> anyhow::Result<()> {
+async fn check_mount_attempt(tenant: &TenantClusterConfig) -> anyhow::Result<()> {
     let wait_operation = tenant
         .cluster
         .watch_namespaced_resource_until_condition::<StatefulSet, _, _>(
