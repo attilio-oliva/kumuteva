@@ -1,8 +1,9 @@
-use super::TenantClusterConfig;
 use anyhow::{Ok, Result};
 use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::runtime::reflector::Lookup;
 use std::sync::LazyLock;
+
+use crate::verifier::TenantClusterConfig;
 
 const NETWORK_MULTITOOL_IMAGE: &str = "wbitt/network-multitool";
 const NETWORK_MULTITOOL_POD_NAME: &str = "network-multitool";
