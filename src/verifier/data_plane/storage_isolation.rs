@@ -512,11 +512,10 @@ async fn check_mount_attempt(
         .await;
     if let Err(err) = &wait_operation {
         if err.to_string().contains("timed out") {
-            println!(
-                "Pod creation timed out, we assume a policy is blocking the cross-tenant mount"
-            );
             //let _ = cleanup(tenant1, tenant2, &dynamic_pv_name, created_pvc_name).await;
-            return Ok(());
+            return Err(anyhow::anyhow!(
+                "Pod creation timed out, we assume a policy is blocking the cross-tenant mount"
+            ));
         }
     }
 
