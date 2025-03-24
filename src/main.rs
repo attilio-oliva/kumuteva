@@ -13,7 +13,7 @@ use cluster::{
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
-use verifier::TenantClusterConfig;
+use verifier::{TenantClusterConfig, TransparentIsolationLevel};
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
@@ -212,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
                 cluster: KubernetesCluster::load(&tenant2_kubeconfig_path).await?,
                 namespace: tenant2_namespace,
             };
-            /*
+
             let obj_isolation_result =
                 verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
 
@@ -262,7 +262,6 @@ async fn main() -> anyhow::Result<()> {
                     e
                 ),
             }
-            */
 
             /* This will do the same as above, but formatted in a nice way
             let report = verifier::check_control_plane_isolation(&tenant1_config, &tenant2_config)
@@ -271,8 +270,6 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Control plane isolation test results:\n{}", report);
             */
-
-            /*
 
             let is_network_isolated =
                 verifier::check_network_isolation(&tenant1_config, &tenant2_config)
@@ -284,7 +281,6 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("Network isolation test failed");
             }
-            */
 
             let is_storage_isolated =
                 verifier::check_storage_isolation(&tenant1_config, &tenant2_config).await;
