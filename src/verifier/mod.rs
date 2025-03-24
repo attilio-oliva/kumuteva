@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 mod control_plane;
 mod data_plane;
@@ -34,11 +34,11 @@ pub struct DataPlaneReport {
 
 /// Run all the isolation tests
 pub async fn check_all(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
+    tenant1: Arc<TenantClusterConfig>,
+    tenant2: Arc<TenantClusterConfig>,
 ) -> Result<IsolationReport> {
-    let control_plane = check_control_plane_isolation(tenant1, tenant2).await?;
-    let data_plane = check_data_plane_isolation(tenant1, tenant2).await?;
+    let control_plane = check_control_plane_isolation(tenant1.clone(), tenant2.clone()).await?;
+    let data_plane = check_data_plane_isolation(tenant1.clone(), tenant2.clone()).await?;
 
     Ok(IsolationReport {
         control_plane,
@@ -48,26 +48,26 @@ pub async fn check_all(
 
 /// Run all the control plane isolation tests
 pub async fn check_control_plane_isolation(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
+    tenant1: Arc<TenantClusterConfig>,
+    tenant2: Arc<TenantClusterConfig>,
 ) -> Result<ControlPlaneReport> {
     let object_isolation = ControlPlaneIsolationProperty::ObjectIsolation
-        .run(tenant1, tenant2)
+        .run(tenant1.clone(), tenant2.clone())
         .await?;
 
     let transparent_isolation_namespace =
         ControlPlaneIsolationProperty::TransparentIsolation(TransparentIsolationLevel::Namespace)
-            .run(tenant1, tenant2)
+            .run(tenant1.clone(), tenant2.clone())
             .await?;
 
     let transparent_isolation_node =
         ControlPlaneIsolationProperty::TransparentIsolation(TransparentIsolationLevel::Node)
-            .run(tenant1, tenant2)
+            .run(tenant1.clone(), tenant2.clone())
             .await?;
 
     let transparent_isolation_cluster =
         ControlPlaneIsolationProperty::TransparentIsolation(TransparentIsolationLevel::Cluster)
-            .run(tenant1, tenant2)
+            .run(tenant1.clone(), tenant2.clone())
             .await?;
 
     let transparent_isolation = TransparentIsolationReport {
@@ -89,19 +89,19 @@ pub async fn check_control_plane_isolation(
 
 /// Run all the data plane isolation tests
 pub async fn check_data_plane_isolation(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
+    tenant1: Arc<TenantClusterConfig>,
+    tenant2: Arc<TenantClusterConfig>,
 ) -> Result<DataPlaneReport> {
     let storage_isolation = DataPlaneIsolationProperty::StorageIsolation
-        .run(tenant1, tenant2)
+        .run(tenant1.clone(), tenant2.clone())
         .await?;
 
     let network_isolation = DataPlaneIsolationProperty::NetworkIsolation
-        .run(tenant1, tenant2)
+        .run(tenant1.clone(), tenant2.clone())
         .await?;
 
     let workload_isolation = DataPlaneIsolationProperty::WorkloadIsolation
-        .run(tenant1, tenant2)
+        .run(tenant1.clone(), tenant2.clone())
         .await?;
 
     Ok(DataPlaneReport {
@@ -145,16 +145,16 @@ pub struct TestResult {
 pub trait IsolationTest {
     async fn run(
         &self,
-        tenant1: &TenantClusterConfig,
-        tenant2: &TenantClusterConfig,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
     ) -> Result<TestResult>;
 }
 
 impl IsolationTest for IsolationKind {
     async fn run(
         &self,
-        tenant1: &TenantClusterConfig,
-        tenant2: &TenantClusterConfig,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
     ) -> Result<TestResult> {
         match self {
             IsolationKind::ControlPlane(property) => property.run(tenant1, tenant2).await,
@@ -166,12 +166,12 @@ impl IsolationTest for IsolationKind {
 impl IsolationTest for ControlPlaneIsolationProperty {
     async fn run(
         &self,
-        tenant1: &TenantClusterConfig,
-        tenant2: &TenantClusterConfig,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
     ) -> Result<TestResult> {
         match self {
             ControlPlaneIsolationProperty::ObjectIsolation => {
-                check_object_isolation(tenant1, tenant2)
+                check_object_isolation(&tenant1, &tenant2)
                     .await
                     .map(|is_isolated| TestResult {
                         success: is_isolated,
@@ -204,10 +204,10 @@ impl IsolationTest for ControlPlaneIsolationProperty {
 impl IsolationTest for TransparentIsolationLevel {
     async fn run(
         &self,
-        tenant1: &TenantClusterConfig,
-        tenant2: &TenantClusterConfig,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
     ) -> Result<TestResult> {
-        let result = check_transparent_isolation_level(tenant1, tenant2, *self).await;
+        let result = check_transparent_isolation_level(&tenant1, &tenant2, *self).await;
         match result {
             Ok(()) => Ok(TestResult {
                 success: true,
@@ -224,8 +224,8 @@ impl IsolationTest for TransparentIsolationLevel {
 impl IsolationTest for DataPlaneIsolationProperty {
     async fn run(
         &self,
-        _tenant1: &TenantClusterConfig,
-        _tenant2: &TenantClusterConfig,
+        _tenant1: Arc<TenantClusterConfig>,
+        _tenant2: Arc<TenantClusterConfig>,
     ) -> Result<TestResult> {
         match self {
             DataPlaneIsolationProperty::StorageIsolation => Ok(TestResult {
