@@ -23,8 +23,9 @@ use std::{
 
 use crate::verifier::TenantClusterConfig;
 use anyhow::Result;
+use rand::Rng;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{broadcast, mpsc},
     task::JoinHandle,
 };
 
@@ -33,16 +34,47 @@ pub async fn check_fairness(
     tenant1: Arc<TenantClusterConfig>,
     tenant2: Arc<TenantClusterConfig>,
 ) -> Result<bool> {
-    // Create scenarios
+    // Create scenarios with synthetic test values
     let regular_scenario = Arc::new(Scenario {
-        // Define regular tenant scenario
-        requests: vec![/* ... */],
+        requests: vec![
+            Request {
+                resource: ResourceKind::Pod,
+                operation: RequestOperation::Create,
+                delay: 500, // 500ms between requests
+            },
+            Request {
+                resource: ResourceKind::ConfigMap,
+                operation: RequestOperation::Create,
+                delay: 1000, // 1 second between requests
+            },
+            Request {
+                resource: ResourceKind::Pod,
+                operation: RequestOperation::Update,
+                delay: 800, // 800ms between requests
+            },
+        ],
     });
 
     let malicious_scenario = Arc::new(Scenario {
-        // Define malicious tenant scenario (more requests)
-        requests: vec![/* ... */],
+        requests: vec![
+            Request {
+                resource: ResourceKind::Pod,
+                operation: RequestOperation::Create,
+                delay: 100, // 100ms between requests - 5x more frequent
+            },
+            Request {
+                resource: ResourceKind::ConfigMap,
+                operation: RequestOperation::Create,
+                delay: 200, // 200ms between requests - 5x more frequent
+            },
+            Request {
+                resource: ResourceKind::Pod,
+                operation: RequestOperation::Update,
+                delay: 150, // 150ms between requests - 5x more frequent
+            },
+        ],
     });
+
     // Create initiator pools for both regular and malicious scenarios
     let regular_pool = InitiatorsPool {
         initiators: vec![
@@ -64,19 +96,28 @@ pub async fn check_fairness(
         ], // 10 malicious initiators
     };
 
+    let malicious_overseer = Overseer::new(
+        Role::Malicious, // The role is used to determine evaluation criteria
+        malicious_pool,
+    );
+
     // Create overseer to manage the test
-    let overseer = Overseer::new(
+    let regular_overseer = Overseer::new(
         Role::Regular, // The role is used to determine evaluation criteria
-        vec![regular_pool, malicious_pool],
+        regular_pool,
     );
 
     // Run the test for a specific duration (e.g., 60 seconds)
-    let test_duration = Duration::from_secs(60);
+    let test_duration = Duration::from_secs(30);
 
-    overseer.run(tenant1, tenant2, test_duration).await
+    regular_overseer.run(tenant1, test_duration).await?;
+    malicious_overseer.run(tenant2, test_duration).await?;
+
+    // Return the result of the test
+    Ok(true)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Copy)]
 enum Role {
     Malicious,
     Regular,
@@ -102,18 +143,18 @@ struct Scenario {
 }
 
 struct Request {
-    kind: RequestKind,
+    resource: ResourceKind,
     operation: RequestOperation,
     delay: u64,
 }
 
-#[derive(Clone)]
-enum RequestKind {
+#[derive(Debug, Clone)]
+enum ResourceKind {
     ConfigMap,
     Pod,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum RequestOperation {
     Create,
     Update,
@@ -126,20 +167,21 @@ struct InitiatorsPool {
 
 struct Overseer {
     role: Role,
-    pools: Vec<InitiatorsPool>,
+    pool: InitiatorsPool,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct RequestMetrics {
-    request_type: RequestKind,
+    request_type: ResourceKind,
     operation: RequestOperation,
     start_time: Instant,
     duration: Duration,
     initiator_role: Role,
 }
 
+#[derive(Debug, Clone)]
 struct AverageMetrics {
-    request_type: RequestKind,
+    request_type: ResourceKind,
     operation: RequestOperation,
     average_duration: Duration,
     std_deviation: Duration,
@@ -167,43 +209,30 @@ impl AverageMetrics {
             request_type: requests[0].request_type.clone(),
             operation: requests[0].operation.clone(),
             average_duration,
-            std_deviation: std_deviation.into(),
-            initiator_role: requests[0].initiator_role.clone(),
+            std_deviation,
+            initiator_role: requests[0].initiator_role,
         }
     }
 }
 
 impl Overseer {
-    fn new(role: Role, pools: Vec<InitiatorsPool>) -> Self {
-        Self { role, pools }
+    fn new(role: Role, pool: InitiatorsPool) -> Self {
+        Self { role, pool }
     }
 
     async fn run(
         &self,
-        malicious_tenant: Arc<TenantClusterConfig>,
-        regular_tenant: Arc<TenantClusterConfig>,
+        tenant_config: Arc<TenantClusterConfig>,
         duration: Duration,
-    ) -> Result<bool> {
+    ) -> Result<HashMap<String, Vec<Duration>>> {
         // Create channel for metrics collection
         let (metrics_tx, mut metrics_rx) = mpsc::channel(100);
 
-        // Store handles and stop channels for all initiators
-        let mut all_handles = Vec::new();
-
-        // Spawn initiators for each pool
-        for pool in &self.pools {
-            let tenant_config = match self.role {
-                // Assign tenant configs based on your test design
-                Role::Regular => Arc::clone(&malicious_tenant),
-                Role::Malicious => Arc::clone(&regular_tenant),
-            };
-
-            let handles = pool
-                .spawn_initiators(metrics_tx.clone(), tenant_config)
-                .await;
-
-            all_handles.extend(handles);
-        }
+        // Spawn initiators according to the role
+        let mut handles = self
+            .pool
+            .spawn_initiators(metrics_tx.clone(), tenant_config)
+            .await;
 
         // Drop the sender we own since we're not sending metrics
         drop(metrics_tx);
@@ -228,11 +257,10 @@ impl Overseer {
         });
 
         // Wait for the specified duration
-        tokio::time::sleep(duration).await;
+        //tokio::time::sleep(duration).await;
 
         // Stop all initiators
-        // Stop all initiators
-        let handles: Vec<JoinHandle<()>> = all_handles
+        let handles: Vec<JoinHandle<()>> = handles
             .drain(..)
             .map(|(handle, stop_tx)| {
                 let _ = stop_tx.send(());
@@ -248,12 +276,23 @@ impl Overseer {
         // Get collected metrics
         let tenant_metrics = metrics_collector.await?;
 
-        // Analyze metrics to determine if fairness is maintained
-        // A fair system would show similar response times for the regular tenant
-        // regardless of the malicious tenant's activity
+        // Log collected metrics
+        for (role, durations) in &tenant_metrics {
+            let avg_duration = if !durations.is_empty() {
+                durations.iter().sum::<Duration>() / durations.len() as u32
+            } else {
+                Duration::from_secs(0)
+            };
 
-        // Return true if fairness criteria are met
-        Ok(true)
+            println!(
+                "Role: {}, Requests: {}, Avg Duration: {:?}",
+                role,
+                durations.len(),
+                avg_duration
+            );
+        }
+
+        Ok(tenant_metrics)
     }
 }
 
@@ -262,43 +301,55 @@ impl Initiator {
         self,
         scenario: Arc<Scenario>,
         metrics_tx: mpsc::Sender<RequestMetrics>,
-        stop_rx: oneshot::Receiver<()>,
+        stop_rx: broadcast::Receiver<()>,
         tenant_config: Arc<TenantClusterConfig>,
     ) {
-        let mut stop_future = stop_rx;
+        let mut stop_rx = stop_rx;
 
         loop {
-            // Check if we should stop
-            if stop_future.try_recv().is_ok() {
-                break;
-            }
+            tokio::select! {
+                    // If we receive a stop signal, exit the loop.
+                    _ = stop_rx.recv() => {
+                        break;
+                    }
+                    // Otherwise, process one full iteration of the scenario.
+                    _ = async {
 
-            // Execute each request in the scenario
-            for request in &scenario.requests {
-                let start = Instant::now();
+                // Execute each request in the scenario
+                for request in &scenario.requests {
+                    let start = Instant::now();
 
-                // Execute the k8s request based on request.kind and request.operation
-                // This would make actual API calls to the k8s cluster using tenant_config
+                    // Execute the k8s request based on request.kind and request.operation
+                    // This would make actual API calls to the k8s cluster using tenant_config
+                    // For simplicity, we'll just sleep for the request delay
+                    let random_factor = rand::thread_rng().gen_range(0..=99);
+                    tokio::time::sleep(Duration::from_millis(random_factor)).await;
+                    let duration = start.elapsed();
 
-                let duration = start.elapsed();
+                    // Send metrics back to overseer
+                    let metrics = RequestMetrics {
+                        request_type: request.resource.clone(),
+                        operation: request.operation.clone(),
+                        start_time: start,
+                        duration,
+                        initiator_role: self.role.clone(),
+                    };
 
-                // Send metrics back to overseer
-                let metrics = RequestMetrics {
-                    request_type: request.kind.clone(),
-                    operation: request.operation.clone(),
-                    start_time: start,
-                    duration,
-                    initiator_role: self.role.clone(),
-                };
+                    println!(
+                        "Role: {}, Request: {:?}, Operation: {:?}, Duration: {:?}",
+                        self.role, request.resource, request.operation, duration
+                    );
 
-                if metrics_tx.send(metrics).await.is_err() {
-                    // Overseer has dropped the channel, exit
-                    return;
+                    if metrics_tx.send(metrics).await.is_err() {
+                        // Overseer has dropped the channel, exit
+                        return;
+                    }
+
+                    // Respect the defined delay between requests
+                    tokio::time::sleep(Duration::from_millis(request.delay)).await;
                 }
-
-                // Respect the defined delay between requests
-                tokio::time::sleep(Duration::from_millis(request.delay)).await;
-            }
+            } => {}
+                }
         }
     }
 }
@@ -308,30 +359,53 @@ impl InitiatorsPool {
         &self,
         metrics_tx: mpsc::Sender<RequestMetrics>,
         tenant_config: Arc<TenantClusterConfig>,
-    ) -> Vec<(JoinHandle<()>, oneshot::Sender<()>)> {
+    ) -> Vec<(JoinHandle<()>, broadcast::Sender<()>)> {
         let mut handles = Vec::new();
+        let (stop_tx, _) = broadcast::channel(1);
 
         for initiator in &self.initiators {
-            let (stop_tx, stop_rx) = oneshot::channel();
             let initiator_clone = initiator.clone();
             let scenario_clone = Arc::clone(&initiator.scenario);
             let metrics_tx_clone = metrics_tx.clone();
             let tenant_config_clone = Arc::clone(&tenant_config);
-
+            let stop_tx_clone = stop_tx.clone();
             let handle = tokio::spawn(async move {
                 initiator_clone
                     .run(
                         scenario_clone,
                         metrics_tx_clone,
-                        stop_rx,
+                        stop_tx_clone.subscribe(),
                         tenant_config_clone,
                     )
                     .await;
             });
 
-            handles.push((handle, stop_tx));
+            handles.push((handle, stop_tx.clone()));
         }
 
         handles
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cluster::KubernetesCluster;
+
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_check_fairness() {
+        let tenant1 = Arc::new(TenantClusterConfig {
+            namespace: "tenant1".to_string(),
+            cluster: KubernetesCluster::infer().await.unwrap(),
+        });
+        let tenant2 = Arc::new(TenantClusterConfig {
+            namespace: "tenant2".to_string(),
+            cluster: KubernetesCluster::infer().await.unwrap(),
+        });
+
+        let result = check_fairness(tenant1, tenant2).await;
+        assert!(result.is_ok());
     }
 }

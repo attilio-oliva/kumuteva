@@ -41,6 +41,12 @@ pub struct KubernetesCluster {
 }
 
 impl KubernetesCluster {
+    pub async fn infer() -> Result<Self> {
+        let config = Config::infer().await?;
+        let client = Client::try_from(config).context("Failed to create client")?;
+        Ok(Self { client })
+    }
+
     pub fn client(&self) -> Client {
         self.client.clone()
     }
