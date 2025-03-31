@@ -3,6 +3,7 @@ mod external_crds;
 mod verifier;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -213,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
                 namespace: tenant2_namespace,
             };
 
+            /*
             let obj_isolation_result =
                 verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
 
@@ -288,6 +290,13 @@ async fn main() -> anyhow::Result<()> {
             match is_storage_isolated {
                 Ok(_) => println!("Storage isolation test passed"),
                 Err(e) => println!("Storage isolation test failed: {}", e),
+            }*/
+
+            let fairness =
+                verifier::check_fairness(Arc::new(tenant1_config), Arc::new(tenant2_config)).await;
+            match fairness {
+                Ok(_) => println!("Fairness test passed"),
+                Err(e) => println!("Fairness test failed: {}", e),
             }
         }
     }
