@@ -22,8 +22,14 @@ use std::{
 };
 
 use crate::verifier::TenantClusterConfig;
-use anyhow::Result;
+use anyhow::{Ok, Result};
+use k8s_openapi::api::{
+    apps::v1::Deployment,
+    core::v1::{ConfigMap, Pod},
+};
+use kube::{api::Patch, runtime::reflector::Lookup};
 use rand::Rng;
+use serde_json::json;
 use tokio::{
     sync::{broadcast, mpsc},
     task::JoinHandle,
@@ -38,19 +44,24 @@ pub async fn check_fairness(
     let regular_scenario = Arc::new(Scenario {
         requests: vec![
             Request {
-                resource: ResourceKind::Pod,
+                resource: ResourceKind::Deployment,
                 operation: RequestOperation::Create,
-                delay: 500, // 500ms between requests
             },
             Request {
                 resource: ResourceKind::ConfigMap,
                 operation: RequestOperation::Create,
-                delay: 1000, // 1 second between requests
             },
             Request {
-                resource: ResourceKind::Pod,
+                resource: ResourceKind::Deployment,
                 operation: RequestOperation::Update,
-                delay: 800, // 800ms between requests
+            },
+            Request {
+                resource: ResourceKind::ConfigMap,
+                operation: RequestOperation::Delete,
+            },
+            Request {
+                resource: ResourceKind::Deployment,
+                operation: RequestOperation::Delete,
             },
         ],
     });
@@ -58,43 +69,65 @@ pub async fn check_fairness(
     let malicious_scenario = Arc::new(Scenario {
         requests: vec![
             Request {
-                resource: ResourceKind::Pod,
+                resource: ResourceKind::Deployment,
                 operation: RequestOperation::Create,
-                delay: 100, // 100ms between requests - 5x more frequent
             },
             Request {
                 resource: ResourceKind::ConfigMap,
                 operation: RequestOperation::Create,
-                delay: 200, // 200ms between requests - 5x more frequent
             },
             Request {
-                resource: ResourceKind::Pod,
+                resource: ResourceKind::Deployment,
                 operation: RequestOperation::Update,
-                delay: 150, // 150ms between requests - 5x more frequent
+            },
+            Request {
+                resource: ResourceKind::ConfigMap,
+                operation: RequestOperation::Update,
+            },
+            Request {
+                resource: ResourceKind::Deployment,
+                operation: RequestOperation::Update,
+            },
+            Request {
+                resource: ResourceKind::ConfigMap,
+                operation: RequestOperation::Delete,
+            },
+            Request {
+                resource: ResourceKind::Deployment,
+                operation: RequestOperation::Delete,
             },
         ],
     });
 
     // Create initiator pools for both regular and malicious scenarios
     let regular_pool = InitiatorsPool {
-        initiators: vec![
-            Initiator {
+        initiators: (0..3) // 3 regular initiators
+            .map(|idx| Initiator {
                 role: Role::Regular,
-                scenario: Arc::clone(&regular_scenario)
-            };
-            3
-        ], // 3 regular initiators
+                scenario: Arc::clone(&regular_scenario),
+                uid: format!("regular-initiator-{}", idx),
+            })
+            .collect(),
     };
 
     let malicious_pool = InitiatorsPool {
-        initiators: vec![
+        initiators: (0..10)
+            .map(|idx| // 10 malicious initiators
             Initiator {
+                scenario: Arc::clone(&malicious_scenario),
                 role: Role::Malicious,
-                scenario: Arc::clone(&malicious_scenario)
-            };
-            10
-        ], // 10 malicious initiators
+                uid: format!("malicious-initiator-{}", idx),
+            })
+            .collect(),
     };
+
+    // print all the ids
+    for initiator in &malicious_pool.initiators {
+        println!("Malicious initiator id: {}", initiator.uid);
+    }
+    for initiator in &regular_pool.initiators {
+        println!("Regular initiator id: {}", initiator.uid);
+    }
 
     let malicious_overseer = Overseer::new(
         Role::Malicious, // The role is used to determine evaluation criteria
@@ -107,14 +140,18 @@ pub async fn check_fairness(
         regular_pool,
     );
 
-    // Run the test for a specific duration (e.g., 60 seconds)
+    // Run the test for a specific duration
     let test_duration = Duration::from_secs(10);
 
-    let regular_result = regular_overseer.run(tenant1, test_duration);
-    let malicious_result = malicious_overseer.run(tenant2, test_duration);
+    let regular_result = regular_overseer.run(Arc::clone(&tenant1), test_duration);
+    let malicious_result = malicious_overseer.run(Arc::clone(&tenant2), test_duration);
 
     // Wait for the test to finish
     let (regular_metrics, malicious_metrics) = tokio::try_join!(regular_result, malicious_result)?;
+
+    cleanup(&tenant1).await?;
+    cleanup(&tenant2).await?;
+
     // Return the result of the test
     Ok(true)
 }
@@ -138,6 +175,7 @@ impl std::fmt::Display for Role {
 struct Initiator {
     scenario: Arc<Scenario>,
     role: Role,
+    uid: String,
 }
 
 struct Scenario {
@@ -147,13 +185,12 @@ struct Scenario {
 struct Request {
     resource: ResourceKind,
     operation: RequestOperation,
-    delay: u64,
 }
 
 #[derive(Debug, Clone)]
 enum ResourceKind {
     ConfigMap,
-    Pod,
+    Deployment,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +344,7 @@ impl Initiator {
         tenant_config: Arc<TenantClusterConfig>,
     ) {
         let mut stop_rx = stop_rx;
+        let uid = self.uid.clone();
 
         loop {
             tokio::select! {
@@ -324,8 +362,12 @@ impl Initiator {
                     // Execute the k8s request based on request.kind and request.operation
                     // This would make actual API calls to the k8s cluster using tenant_config
                     // For simplicity, we'll just sleep for the request delay
-                    let random_factor = rand::rng().random_range(0..=99);
-                    tokio::time::sleep(Duration::from_millis(random_factor)).await;
+                    // let random_factor = rand::rng().random_range(0..=99);
+                    let result = request.send(&tenant_config, uid.clone()).await;
+                    if let Err(e) = result {
+                        eprintln!("Error sending request: {:?}", e);
+                    }
+
                     let duration = start.elapsed();
 
                     // Send metrics back to overseer
@@ -347,8 +389,9 @@ impl Initiator {
                         return;
                     }
 
-                    // Respect the defined delay between requests
-                    tokio::time::sleep(Duration::from_millis(request.delay)).await;
+                    // Here a logic to obtain a desired requests-per-second rate will be implemented
+                    // For now, we just sleep for a bit to simulate the delay
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             } => {}
                 }
@@ -386,6 +429,213 @@ impl InitiatorsPool {
         }
 
         handles
+    }
+}
+
+async fn cleanup(tenant: &TenantClusterConfig) -> Result<()> {
+    // list all config maps in the namespace
+    let config_maps = tenant
+        .cluster
+        .list_namespaced_resources::<ConfigMap>(&tenant.namespace)
+        .await?;
+
+    // if the config map starts with "fairness-test-config-", delete it
+    for config_map in config_maps {
+        if config_map
+            .name()
+            .unwrap()
+            .starts_with("fairness-test-config-")
+        {
+            tenant
+                .cluster
+                .delete_resource_in_namespace::<ConfigMap>(
+                    &config_map.name().unwrap(),
+                    &tenant.namespace,
+                )
+                .await?;
+        }
+    }
+
+    // list all deployments in the namespace
+    let deployments = tenant
+        .cluster
+        .list_namespaced_resources::<Deployment>(&tenant.namespace)
+        .await?;
+
+    // if the deployment starts with "fairness-test-", delete it
+    for deployment in deployments {
+        // Check if the deployment name starts with "fairness-test-"
+        if deployment.name().unwrap().starts_with("fairness-test-") {
+            tenant
+                .cluster
+                .delete_resource_in_namespace::<Deployment>(
+                    &deployment.name().unwrap(),
+                    &tenant.namespace,
+                )
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+impl Request {
+    pub async fn send(
+        &self,
+        tenant_config: &TenantClusterConfig,
+        sender_uid: String,
+    ) -> anyhow::Result<()> {
+        let config_map: ConfigMap = serde_json::from_value(serde_json::json!(
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": format!("fairness-test-config-{}", sender_uid),
+                    "namespace": tenant_config.namespace,
+                },
+                "data": {
+                    "key": "example-value",
+                }
+            }
+        ))?;
+
+        let deployment: Deployment = serde_json::from_value(serde_json::json!(
+            {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "name": format!("fairness-test-{}", sender_uid),
+                    "namespace": tenant_config.namespace,
+                },
+                "spec": {
+                    "replicas": 1,
+                    "selector": {
+                        "matchLabels": {
+                            "app": "fairness-test"
+                        }
+                    },
+                    "template": {
+                        "metadata": {
+                            "labels": {
+                                "app": "fairness-test"
+                            }
+                        },
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": "fairness-test",
+                                    "image": "nginx:latest",
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        ))?;
+
+        match self.operation {
+            RequestOperation::Create => match self.resource {
+                ResourceKind::ConfigMap => {
+                    tenant_config
+                        .cluster
+                        .create_namespaced_resource(&config_map, &tenant_config.namespace)
+                        .await?;
+
+                    // Wait for the config map to be created
+                    tenant_config
+                        .cluster
+                        .wait_for_resource_to_be_created::<ConfigMap>(
+                            &config_map.name().unwrap(),
+                            &tenant_config.namespace,
+                        )
+                        .await?;
+                }
+                ResourceKind::Deployment => {
+                    tenant_config
+                        .cluster
+                        .create_namespaced_resource(&deployment, &tenant_config.namespace)
+                        .await?;
+
+                    // Wait for the deployment to be created
+                    tenant_config
+                        .cluster
+                        .wait_for_resource_to_be_created::<Deployment>(
+                            &deployment.name().unwrap(),
+                            &tenant_config.namespace,
+                        )
+                        .await?;
+                }
+            },
+            RequestOperation::Delete => match self.resource {
+                ResourceKind::ConfigMap => {
+                    tenant_config
+                        .cluster
+                        .delete_resource_in_namespace::<ConfigMap>(
+                            &config_map.name().unwrap(),
+                            &tenant_config.namespace,
+                        )
+                        .await?;
+                }
+                ResourceKind::Deployment => {
+                    tenant_config
+                        .cluster
+                        .delete_resource_in_namespace::<Deployment>(
+                            &deployment.name().unwrap(),
+                            &tenant_config.namespace,
+                        )
+                        .await?;
+                }
+            },
+            RequestOperation::Update => match self.resource {
+                ResourceKind::ConfigMap => {
+                    let random_value = rand::random::<u32>();
+                    let patch_data = Patch::Merge(json!({
+                        "data": {
+                            "key": format!("example-value-{}", random_value),
+                        }
+                    }));
+
+                    tenant_config
+                        .cluster
+                        .patch_namespaced_resource::<ConfigMap, _>(
+                            &config_map.name().unwrap(),
+                            &tenant_config.namespace,
+                            &patch_data,
+                        )
+                        .await?;
+                }
+                ResourceKind::Deployment => {
+                    let replicas = tenant_config
+                        .cluster
+                        .get_resource_in_namespace::<Deployment>(
+                            &deployment.name().unwrap(),
+                            &tenant_config.namespace,
+                        )
+                        .await?
+                        .spec
+                        .as_ref()
+                        .unwrap()
+                        .replicas
+                        .unwrap_or(1);
+
+                    let patch_data = Patch::Merge(json!({
+                        "spec": {
+                            "replicas": replicas + 1,
+                        }
+                    }));
+                    tenant_config
+                        .cluster
+                        .patch_namespaced_resource::<Deployment, _>(
+                            &deployment.name().unwrap(),
+                            &tenant_config.namespace,
+                            &patch_data,
+                        )
+                        .await?;
+                }
+            },
+        }
+
+        Ok(())
     }
 }
 

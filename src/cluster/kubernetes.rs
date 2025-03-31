@@ -2,7 +2,6 @@ use anyhow::{anyhow, Context, Error, Result};
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
-use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{
     Namespace, Node, Pod, Secret, Service, ServiceAccount, ServicePort, ServiceSpec,
 };
@@ -15,7 +14,6 @@ use kube::api::{
 };
 use kube::config::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::core::ErrorResponse;
 use kube::runtime::reflector::Lookup;
 use kube::runtime::{watcher, WatchStreamExt};
 use kube::CustomResourceExt;
@@ -23,7 +21,6 @@ use kube::{api::PostParams, Api, Client};
 
 use futures::{StreamExt, TryStreamExt};
 use serde_json::json;
-use tokio::io::AsyncReadExt;
 use tokio::time::sleep;
 
 use std::collections::BTreeMap;
@@ -74,6 +71,28 @@ impl KubernetesCluster {
         P: serde::Serialize + std::fmt::Debug,
     {
         let api: Api<R> = Api::all(self.client.clone());
+        let resource = api
+            .patch(resource_name, &PatchParams::default(), patch)
+            .await?;
+        Ok(resource)
+    }
+
+    pub async fn patch_namespaced_resource<R, P>(
+        &self,
+        resource_name: &str,
+        namespace: &str,
+        patch: &Patch<P>,
+    ) -> Result<R>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>,
+        P: serde::Serialize + std::fmt::Debug,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
         let resource = api
             .patch(resource_name, &PatchParams::default(), patch)
             .await?;
@@ -212,7 +231,7 @@ impl KubernetesCluster {
         Ok(pod)
     }
 
-    pub async fn delete_resouce_in_namespace<R>(
+    pub async fn delete_resource_in_namespace<R>(
         &self,
         resource_name: &str,
         namespace: &str,

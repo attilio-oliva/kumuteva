@@ -172,7 +172,7 @@ pub async fn check_network_isolation(
     // cleanup
     tenant2
         .cluster
-        .delete_resouce_in_namespace::<Service>(&service_name, &tenant2.namespace)
+        .delete_resource_in_namespace::<Service>(&service_name, &tenant2.namespace)
         .await?;
 
     tenant1

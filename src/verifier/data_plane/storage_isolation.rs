@@ -365,12 +365,12 @@ async fn release_pv_from_tenant(
 ) -> anyhow::Result<()> {
     tenant
         .cluster
-        .delete_resouce_in_namespace::<StatefulSet>(POD_NAME, &tenant.namespace)
+        .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant.namespace)
         .await?;
 
     tenant
         .cluster
-        .delete_resouce_in_namespace::<PersistentVolumeClaim>(pvc_name, &tenant.namespace)
+        .delete_resource_in_namespace::<PersistentVolumeClaim>(pvc_name, &tenant.namespace)
         .await?;
 
     tenant
@@ -570,13 +570,13 @@ async fn cleanup(
 ) -> anyhow::Result<()> {
     tenant2
         .cluster
-        .delete_resouce_in_namespace::<StatefulSet>(POD_NAME, &tenant2.namespace)
+        .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant2.namespace)
         .await?;
 
     println!("Cleaning up PVC {}", pvc_name);
     tenant1
         .cluster
-        .delete_resouce_in_namespace::<PersistentVolumeClaim>(pvc_name, &tenant1.namespace)
+        .delete_resource_in_namespace::<PersistentVolumeClaim>(pvc_name, &tenant1.namespace)
         .await?;
 
     println!("Cleaning up PV {}", pv_name);
