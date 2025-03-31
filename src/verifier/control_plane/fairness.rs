@@ -108,11 +108,13 @@ pub async fn check_fairness(
     );
 
     // Run the test for a specific duration (e.g., 60 seconds)
-    let test_duration = Duration::from_secs(30);
+    let test_duration = Duration::from_secs(10);
 
-    regular_overseer.run(tenant1, test_duration).await?;
-    malicious_overseer.run(tenant2, test_duration).await?;
+    let regular_result = regular_overseer.run(tenant1, test_duration);
+    let malicious_result = malicious_overseer.run(tenant2, test_duration);
 
+    // Wait for the test to finish
+    let (regular_metrics, malicious_metrics) = tokio::try_join!(regular_result, malicious_result)?;
     // Return the result of the test
     Ok(true)
 }
@@ -257,7 +259,7 @@ impl Overseer {
         });
 
         // Wait for the specified duration
-        //tokio::time::sleep(duration).await;
+        tokio::time::sleep(duration).await;
 
         // Stop all initiators
         let handles: Vec<JoinHandle<()>> = handles
@@ -322,7 +324,7 @@ impl Initiator {
                     // Execute the k8s request based on request.kind and request.operation
                     // This would make actual API calls to the k8s cluster using tenant_config
                     // For simplicity, we'll just sleep for the request delay
-                    let random_factor = rand::thread_rng().gen_range(0..=99);
+                    let random_factor = rand::rng().random_range(0..=99);
                     tokio::time::sleep(Duration::from_millis(random_factor)).await;
                     let duration = start.elapsed();
 
@@ -332,7 +334,7 @@ impl Initiator {
                         operation: request.operation.clone(),
                         start_time: start,
                         duration,
-                        initiator_role: self.role.clone(),
+                        initiator_role: self.role,
                     };
 
                     println!(
@@ -392,7 +394,6 @@ mod tests {
     use crate::cluster::KubernetesCluster;
 
     use super::*;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn test_check_fairness() {
