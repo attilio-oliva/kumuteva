@@ -722,6 +722,40 @@ impl KubernetesCluster {
         Err(Error::msg("CRD was not published in time"))
     }
 
+    pub async fn wait_namespaced_resource_deletion<R>(
+        &self,
+        resource_name: &str,
+        namespace: &str,
+    ) -> Result<()>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Clone
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Metadata<Ty = ObjectMeta>
+            + 'static,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", resource_name))
+            .timeout(290); // upper bound of how long we watch for
+
+        let mut watch_stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(_status) = watch_stream.try_next().await? {
+            // query the resource to check if it still exists
+            let resource = api.get(resource_name).await;
+
+            if resource.is_err() {
+                // resource was deleted
+                return Ok(());
+            }
+        }
+
+        Err(Error::msg("Resource was not deleted in time"))
+    }
+
     fn is_crd_established(crd: &CustomResourceDefinition) -> bool {
         if let Some(status) = &crd.status {
             if let Some(conditions) = &status.conditions {
