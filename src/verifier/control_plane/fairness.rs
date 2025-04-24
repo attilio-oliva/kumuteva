@@ -324,36 +324,21 @@ impl Overseer {
             .await;
 
         // Collect metrics for the specified duration
-        let mut tenant_metrics: HashMap<String, Vec<AverageMetrics>> = HashMap::new();
-
-        // Spawn a task to collect the last metrics before stopping
         let metrics_collector = tokio::spawn(async move {
-            let mut completed_initiators = 0;
-
-            loop {
-                tokio::select! {
-                    Some(metric) = metrics_rx.recv() => {
-                        tenant_metrics
-                            .entry(metric.initiator_role.to_string())
-                            .or_default()
-                            .push(metric);
-                    }
-
-                    Some(_) = completion_rx.recv() => {
-                        completed_initiators += 1;
-                        // All initiators have sent their final metrics and signaled completion
-                        if completed_initiators >= initiator_count {
-                            break;
-                        }
-                    }
-
-                    else => {
-                        // All channels closed, exit
-                        break;
-                    }
+            let mut tenant_metrics: HashMap<String, Vec<AverageMetrics>> = HashMap::new();
+            let mut completed = 0;
+            while let Some(metric) = metrics_rx.recv().await {
+                tenant_metrics
+                    .entry(metric.initiator_role.to_string())
+                    .or_default()
+                    .push(metric);
+            }
+            while let Some(_) = completion_rx.recv().await {
+                completed += 1;
+                if completed >= initiator_count {
+                    break;
                 }
             }
-
             tenant_metrics
         });
 
@@ -401,93 +386,73 @@ impl Initiator {
         mut self,
         scenario: Arc<Scenario>,
         metrics_tx: mpsc::Sender<AverageMetrics>,
-        stop_rx: broadcast::Receiver<()>,
+        mut stop_rx: broadcast::Receiver<()>,
         completion_tx: mpsc::Sender<()>,
         tenant_config: Arc<TenantClusterConfig>,
     ) {
-        let mut stop_rx = stop_rx;
-        let uid = self.uid.clone();
-
-        // Create an interval timer that fires at the specified interval
-        let mut metrics_interval = tokio::time::interval(self.metrics_send_interval);
-
+        let mut update_overseer_interval = tokio::time::interval(self.metrics_send_interval);
         loop {
             tokio::select! {
-                // If we receive a stop signal, exit the loop.
                 _ = stop_rx.recv() => {
-                    self.stop(metrics_tx, completion_tx).await;
+                    // Send any pending metrics and signal completion.
+                    self.send_final(&metrics_tx, &completion_tx).await;
                     break;
                 }
-                // When the metrics interval timer fires, send metrics
-                _ = metrics_interval.tick() => {
+                _ = update_overseer_interval.tick() => {
                     if !self.request_metrics.is_empty() {
-                        let average_metrics = AverageMetrics::calculate(&self.request_metrics);
-                        if metrics_tx.send(average_metrics).await.is_err() {
-                            // Overseer has dropped the channel, exit
-                            return;
-                        }
-                        // Clear the metrics after sending
+                        let avg = AverageMetrics::calculate(&self.request_metrics);
+                        if metrics_tx.send(avg).await.is_err() { break; }
                         self.request_metrics.clear();
                     }
                 }
-                // Otherwise, process one full iteration of the scenario.
-                _ = async {
-                    // Execute each request in the scenario
-                    for request in &scenario.requests {
-                        let start = Instant::now();
-
-                        // Execute the k8s request based on request.kind and request.operation
-                        // This would make actual API calls to the k8s cluster using tenant_config
-                        // For simplicity, we'll just sleep for the request delay
-                        // let random_factor = rand::rng().random_range(0..=99);
-                        let result = request.send(&tenant_config, uid.clone()).await;
-                        if let Err(e) = result {
-                            eprintln!("Error sending request: {:?}", e);
-                        }
-
-                        let duration = start.elapsed();
-
-                        // Send metrics back to overseer
-                        let metrics = RequestMetrics {
-                            request_type: request.resource.clone(),
-                            operation: request.operation.clone(),
-                            start_time: start,
-                            duration,
-                            initiator_role: self.role,
-                        };
-
-                        println!(
-                            "Role: {}, Request: {:?}, Operation: {:?}, Duration: {:.2?}",
-                            self.role, request.resource, request.operation, duration
-                        );
-
-                        self.request_metrics.push(metrics);
-
-                        // Here a logic to obtain a desired requests-per-second rate will be implemented
-                        // For now, we just sleep for a bit to simulate the delay
-                        //tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                } => {}
+                _ = Self::process_scenario(&mut self, Arc::clone(&scenario), &tenant_config) => {}
             }
         }
     }
 
-    pub async fn stop(
+    async fn send_final(
         &self,
-        metrics_tx: mpsc::Sender<AverageMetrics>,
-        completion_tx: mpsc::Sender<()>,
+        metrics_tx: &mpsc::Sender<AverageMetrics>,
+        completion_tx: &mpsc::Sender<()>,
     ) {
         if !self.request_metrics.is_empty() {
-            let average_metrics = AverageMetrics::calculate(&self.request_metrics);
-
-            // Send the final metrics
-            if let Err(e) = metrics_tx.send(average_metrics).await {
-                eprintln!("Failed to send final metrics: {}", e);
-            }
+            let avg = AverageMetrics::calculate(&self.request_metrics);
+            let _ = metrics_tx.send(avg).await;
         }
-
-        // Signal that this initiator is complete
         let _ = completion_tx.send(()).await;
+    }
+
+    async fn process_scenario(
+        &mut self,
+        scenario: Arc<Scenario>,
+        tenant_config: &Arc<TenantClusterConfig>,
+    ) {
+        for request in &scenario.requests {
+            let start = Instant::now();
+            let result = request.send(tenant_config, self.uid.clone()).await;
+            let duration = start.elapsed();
+
+            if let Err(e) = result {
+                eprintln!("Error sending request: {:?}", e);
+            }
+
+            // Here the logic for limiting the rate of requests can be added
+            // This is a placeholder for the actual logic
+            let delay_ms: u64 = 100;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+            println!(
+                "Role: {}, Request: {:?} / {:?}, Duration: {:.2?}",
+                self.role, request.resource, request.operation, duration
+            );
+            self.request_metrics.push(RequestMetrics {
+                request_type: request.resource.clone(),
+                operation: request.operation.clone(),
+                start_time: start,
+                duration,
+                initiator_role: self.role,
+            });
+        }
     }
 }
 
