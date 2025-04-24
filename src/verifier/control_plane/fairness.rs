@@ -40,8 +40,8 @@ pub async fn check_fairness(
     tenant1: Arc<TenantClusterConfig>,
     tenant2: Arc<TenantClusterConfig>,
 ) -> Result<bool> {
-    let regular_requesters = 3;
-    let malicious_requesters = 10;
+    let regular_requesters = 2;
+    let malicious_requesters = 20;
     // Create scenarios with synthetic test values
     let regular_scenario = Arc::new(Scenario {
         requests: vec![
@@ -148,16 +148,39 @@ pub async fn check_fairness(
 
     // Run the test for a specific duration
     let test_duration = Duration::from_secs(10);
-
-    let regular_result = regular_overseer.run(Arc::clone(&tenant1), test_duration);
-    let malicious_result = malicious_overseer.run(Arc::clone(&tenant2), test_duration);
+    let regular_t2_overseer = regular_overseer.clone();
+    let baseline_result_t1 = regular_overseer.run(Arc::clone(&tenant1), test_duration);
+    let baseline_result_t2 = regular_t2_overseer.run(Arc::clone(&tenant2), test_duration);
 
     // Wait for the test to finish
-    let (regular_metrics, malicious_metrics) = tokio::try_join!(regular_result, malicious_result)?;
+    let (baseline_metrics_t1, baseline_metrics_t2) =
+        tokio::try_join!(baseline_result_t1, baseline_result_t2)?;
 
     cleanup(&tenant1).await?;
     cleanup(&tenant2).await?;
 
+    let baseline_avg_response_time_t1 = baseline_metrics_t1.average_duration;
+
+    let regular_result_t1 = regular_overseer.run(Arc::clone(&tenant1), test_duration);
+    let malicious_result_t2 = malicious_overseer.run(Arc::clone(&tenant2), test_duration);
+
+    let (regular_result_t1, malicious_result_t2) =
+        tokio::try_join!(regular_result_t1, malicious_result_t2)?;
+
+    let regular_avg_response_time_t1 = regular_result_t1.average_duration;
+    // how much did t1 response time increase from baseline
+    let relative_increase_avg_response_time_t1 = (regular_avg_response_time_t1.as_secs_f64()
+        - baseline_avg_response_time_t1.as_secs_f64())
+        / baseline_avg_response_time_t1.as_secs_f64();
+
+    println!(
+        "Tenant1 (Regular user) - Avg Response Time: Baseline {:.2?}, Unbalanced scenario {:.2?}, Relative Increase: {:.2}%",
+        baseline_avg_response_time_t1,
+        regular_avg_response_time_t1,
+        relative_increase_avg_response_time_t1 * 100.0
+    );
+    cleanup(&tenant1).await?;
+    cleanup(&tenant2).await?;
     // Return the result of the test
     Ok(true)
 }
@@ -208,10 +231,12 @@ enum RequestOperation {
     Delete,
 }
 
+#[derive(Clone)]
 struct InitiatorsPool {
     initiators: Vec<Initiator>,
 }
 
+#[derive(Clone)]
 struct Overseer {
     role: Role,
     pool: InitiatorsPool,
@@ -309,7 +334,7 @@ impl Overseer {
         &self,
         tenant_config: Arc<TenantClusterConfig>,
         duration: Duration,
-    ) -> Result<HashMap<String, Vec<AverageMetrics>>> {
+    ) -> Result<AverageMetrics> {
         // Create channel for metrics collection
         let (metrics_tx, mut metrics_rx) = mpsc::channel(5);
 
@@ -360,24 +385,31 @@ impl Overseer {
         // Get collected metrics once all the initiators finish to send their last metrics
         let tenant_metrics = metrics_collector.await?;
 
+        if !tenant_metrics.contains_key(&self.role.to_string()) {
+            return Err(anyhow::anyhow!(
+                "No metrics collected for role: {}",
+                self.role
+            ));
+        }
         // Log collected metrics
-        for (role, metrics) in &tenant_metrics {
-            if metrics.is_empty() {
-                println!("Role: {}, No metrics collected", role);
-                continue;
-            }
-
-            let average_metrics = AverageMetrics::aggregate_averages(metrics);
-            println!(
-                "Role: {}, Requests: {}, Avg Duration: {:.2?}, Std Dev: {:.2?}",
-                role,
-                average_metrics.total_requests,
-                average_metrics.average_duration,
-                average_metrics.std_deviation
-            );
+        let aggregated_periodic_metrics = tenant_metrics.get(&self.role.to_string()).unwrap();
+        if aggregated_periodic_metrics.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No metrics collected for role: {}",
+                self.role
+            ));
         }
 
-        Ok(tenant_metrics)
+        let average_metrics = AverageMetrics::aggregate_averages(&aggregated_periodic_metrics);
+        println!(
+            "Role: {}, Requests: {}, Avg Duration: {:.2?}, Std Dev: {:.2?}",
+            self.role,
+            average_metrics.total_requests,
+            average_metrics.average_duration,
+            average_metrics.std_deviation
+        );
+
+        Ok(average_metrics)
     }
 }
 
@@ -432,19 +464,19 @@ impl Initiator {
             let result = request.send(tenant_config, self.uid.clone()).await;
             let duration = start.elapsed();
 
-            if let Err(e) = result {
-                eprintln!("Error sending request: {:?}", e);
-            }
+            // if let Err(e) = result {
+            //     eprintln!("Error sending request: {:?}", e);
+            // }
 
             // Here the logic for limiting the rate of requests can be added
             // This is a placeholder for the actual logic
-            let delay_ms: u64 = 100;
+            let delay_ms: u64 = 10;
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
-            println!(
-                "Role: {}, Request: {:?} / {:?}, Duration: {:.2?}",
-                self.role, request.resource, request.operation, duration
-            );
+            // println!(
+            //     "Role: {}, Request: {:?} / {:?}, Duration: {:.2?}",
+            //     self.role, request.resource, request.operation, duration
+            // );
             self.request_metrics.push(RequestMetrics {
                 request_type: request.resource.clone(),
                 operation: request.operation.clone(),
