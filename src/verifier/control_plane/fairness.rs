@@ -23,12 +23,8 @@ use std::{
 
 use crate::verifier::TenantClusterConfig;
 use anyhow::{Ok, Result};
-use k8s_openapi::api::{
-    apps::v1::Deployment,
-    core::v1::{ConfigMap, Pod},
-};
+use k8s_openapi::api::{apps::v1::Deployment, core::v1::ConfigMap};
 use kube::{api::Patch, runtime::reflector::Lookup};
-use rand::Rng;
 use serde_json::json;
 use tokio::{
     sync::{broadcast, mpsc},
@@ -40,8 +36,8 @@ pub async fn check_fairness(
     tenant1: Arc<TenantClusterConfig>,
     tenant2: Arc<TenantClusterConfig>,
 ) -> Result<bool> {
-    let regular_requesters = 2;
-    let malicious_requesters = 20;
+    let regular_requesters = 10;
+    let malicious_requesters = 500;
     // Create scenarios with synthetic test values
     let regular_scenario = Arc::new(Scenario {
         requests: vec![
@@ -110,6 +106,7 @@ pub async fn check_fairness(
                 uid: format!("regular-initiator-{}", idx),
                 request_metrics: vec![],
                 metrics_send_interval: Duration::from_secs(3),
+                request_rate: 50.0,
             })
             .collect(),
     };
@@ -123,6 +120,7 @@ pub async fn check_fairness(
                 uid: format!("malicious-initiator-{}", idx),
                 request_metrics: vec![],
                 metrics_send_interval: Duration::from_secs(3),
+                request_rate: 5000.0, // Malicious initiators make more requests
             })
             .collect(),
     };
@@ -156,8 +154,8 @@ pub async fn check_fairness(
     let (baseline_metrics_t1, baseline_metrics_t2) =
         tokio::try_join!(baseline_result_t1, baseline_result_t2)?;
 
-    cleanup(&tenant1).await?;
-    cleanup(&tenant2).await?;
+    // cleanup(&tenant1).await?;
+    // cleanup(&tenant2).await?;
 
     let baseline_avg_response_time_t1 = baseline_metrics_t1.average_duration;
 
@@ -174,15 +172,45 @@ pub async fn check_fairness(
         / baseline_avg_response_time_t1.as_secs_f64();
 
     println!(
-        "Tenant1 (Regular user) - Avg Response Time: Baseline {:.2?}, Unbalanced scenario {:.2?}, Relative Increase: {:.2}%",
+        "Avg Response Time: Baseline {:.2?}, Unbalanced scenario {:.2?}, Relative Increase: {:.2}%",
         baseline_avg_response_time_t1,
         regular_avg_response_time_t1,
         relative_increase_avg_response_time_t1 * 100.0
     );
+
+    // Evaluate test success based on error rates
+    let regular_error_rate = regular_result_t1.error_rate;
+    println!(
+        "Regular tenant error rate: {:.2}% ({} errors out of {} requests)",
+        regular_error_rate * 100.0,
+        regular_result_t1.error_count,
+        regular_result_t1.total_requests
+    );
+    // Malicious tenant error rate is not used in the fairness test, but can be logged
+    let malicious_error_rate = malicious_result_t2.error_rate;
+    println!(
+        "Malicious tenant error rate: {:.2}% ({} errors out of {} requests)",
+        malicious_error_rate * 100.0,
+        malicious_result_t2.error_count,
+        malicious_result_t2.total_requests
+    );
+
+    // Test fails if regular tenant experiences significant errors
+    let test_passed = regular_error_rate < 0.05; // Less than 5% errors allowed
+
+    println!(
+        "Fairness test result: {}",
+        if test_passed {
+            "PASSED"
+        } else {
+            "FAILED - Regular tenants experienced too many errors"
+        }
+    );
+
     cleanup(&tenant1).await?;
     cleanup(&tenant2).await?;
-    // Return the result of the test
-    Ok(true)
+
+    Ok(test_passed)
 }
 
 #[derive(Clone, Debug, Copy)]
@@ -207,6 +235,7 @@ struct Initiator {
     uid: String,
     request_metrics: Vec<RequestMetrics>,
     metrics_send_interval: Duration,
+    request_rate: f64,
 }
 
 struct Scenario {
@@ -249,6 +278,7 @@ struct RequestMetrics {
     start_time: Instant,
     duration: Duration,
     initiator_role: Role,
+    is_error: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +289,8 @@ struct AverageMetrics {
     std_deviation: Duration,
     total_duration: Duration,
     total_requests: usize,
+    error_count: usize,
+    error_rate: f64,
     initiator_role: Role,
 }
 
@@ -268,6 +300,7 @@ impl AverageMetrics {
         let total_duration: Duration = requests.iter().map(|m| m.duration).sum();
         let average_duration = total_duration / requests.len() as u32;
 
+        // Calculate variance and std deviation (existing code)
         let variance = requests
             .iter()
             .map(|m| {
@@ -276,8 +309,11 @@ impl AverageMetrics {
             })
             .sum::<f64>()
             / requests.len() as f64;
-
         let std_deviation = Duration::from_secs_f64(variance.sqrt());
+
+        // Count errors
+        let error_count = requests.iter().filter(|m| m.is_error).count();
+        let error_rate = error_count as f64 / requests.len() as f64;
 
         Self {
             request_type: requests[0].request_type.clone(),
@@ -286,6 +322,8 @@ impl AverageMetrics {
             std_deviation,
             total_duration,
             total_requests: requests.len(),
+            error_count,
+            error_rate,
             initiator_role: requests[0].initiator_role,
         }
     }
@@ -312,6 +350,11 @@ impl AverageMetrics {
 
         // Convert variance back to std_deviation
         let std_deviation = Duration::from_secs_f64(weighted_variance.sqrt());
+
+        // Count errors
+        let error_count = requests.iter().map(|m| m.error_count).sum();
+        let error_rate = error_count as f64 / total_requests as f64;
+
         // Use the first item's metadata for the aggregated metrics
         Self {
             request_type: requests[0].request_type.clone(),
@@ -321,6 +364,8 @@ impl AverageMetrics {
             total_duration,
             total_requests,
             initiator_role: requests[0].initiator_role,
+            error_count,
+            error_rate,
         }
     }
 }
@@ -352,23 +397,60 @@ impl Overseer {
         let metrics_collector = tokio::spawn(async move {
             let mut tenant_metrics: HashMap<String, Vec<AverageMetrics>> = HashMap::new();
             let mut completed = 0;
-            while let Some(metric) = metrics_rx.recv().await {
-                tenant_metrics
-                    .entry(metric.initiator_role.to_string())
-                    .or_default()
-                    .push(metric);
-            }
-            while let Some(_) = completion_rx.recv().await {
-                completed += 1;
-                if completed >= initiator_count {
-                    break;
+
+            // Use a timeout to ensure we don't wait forever
+            let collection_timeout = tokio::time::sleep(duration + Duration::from_secs(5));
+            tokio::pin!(collection_timeout);
+
+            loop {
+                tokio::select! {
+                    // Timeout case
+                    _ = &mut collection_timeout => {
+                        println!("Metrics collection timed out");
+                        break;
+                    }
+                    // Receive metrics
+                    maybe_metric = metrics_rx.recv() => {
+                        match maybe_metric {
+                            Some(metric) => {
+                                // println!("Collected metric from role: {}", metric.initiator_role);
+                                tenant_metrics
+                                    .entry(metric.initiator_role.to_string())
+                                    .or_default()
+                                    .push(metric);
+                            }
+                            None => {
+                                println!("Metrics channel closed, ending collection");
+                                break;
+                            }
+                        }
+                    }
+                    // Track completions
+                    maybe_completion = completion_rx.recv() => {
+                        match maybe_completion {
+                            Some(_) => {
+                                completed += 1;
+                                // println!("Initiator completed: {}/{}", completed, initiator_count);
+                                if completed >= initiator_count {
+                                    println!("All initiators completed");
+                                    break;
+                                }
+                            }
+                            None => {
+                                println!("Completion channel closed");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
+
             tenant_metrics
         });
 
         // Wait for the specified duration
         tokio::time::sleep(duration).await;
+        println!("Test duration completed, stopping initiators...");
 
         // Stop all initiators
         for (_, stop_tx) in handles.drain(..) {
@@ -400,7 +482,7 @@ impl Overseer {
             ));
         }
 
-        let average_metrics = AverageMetrics::aggregate_averages(&aggregated_periodic_metrics);
+        let average_metrics = AverageMetrics::aggregate_averages(aggregated_periodic_metrics);
         println!(
             "Role: {}, Requests: {}, Avg Duration: {:.2?}, Std Dev: {:.2?}",
             self.role,
@@ -423,6 +505,10 @@ impl Initiator {
         tenant_config: Arc<TenantClusterConfig>,
     ) {
         let mut update_overseer_interval = tokio::time::interval(self.metrics_send_interval);
+        // Use a rate limiter to control request frequency
+        let mut request_rate_interval =
+            tokio::time::interval(Duration::from_secs_f64(1.0 / self.request_rate));
+        let mut scenario_step = 0;
         loop {
             tokio::select! {
                 _ = stop_rx.recv() => {
@@ -437,7 +523,11 @@ impl Initiator {
                         self.request_metrics.clear();
                     }
                 }
-                _ = Self::process_scenario(&mut self, Arc::clone(&scenario), &tenant_config) => {}
+                _ = request_rate_interval.tick() => {
+                    // Process the scenario requests at the defined rate
+                    self.process_scenario_step(Arc::clone(&scenario), scenario_step, &tenant_config).await;
+                    scenario_step = (scenario_step + 1) % scenario.requests.len();
+                }
             }
         }
     }
@@ -454,37 +544,47 @@ impl Initiator {
         let _ = completion_tx.send(()).await;
     }
 
-    async fn process_scenario(
+    async fn process_scenario_step(
         &mut self,
         scenario: Arc<Scenario>,
+        step_index: usize,
         tenant_config: &Arc<TenantClusterConfig>,
     ) {
-        for request in &scenario.requests {
-            let start = Instant::now();
-            let result = request.send(tenant_config, self.uid.clone()).await;
-            let duration = start.elapsed();
-
-            // if let Err(e) = result {
-            //     eprintln!("Error sending request: {:?}", e);
-            // }
-
-            // Here the logic for limiting the rate of requests can be added
-            // This is a placeholder for the actual logic
-            let delay_ms: u64 = 10;
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-            // println!(
-            //     "Role: {}, Request: {:?} / {:?}, Duration: {:.2?}",
-            //     self.role, request.resource, request.operation, duration
-            // );
-            self.request_metrics.push(RequestMetrics {
-                request_type: request.resource.clone(),
-                operation: request.operation.clone(),
-                start_time: start,
-                duration,
-                initiator_role: self.role,
-            });
+        if step_index >= scenario.requests.len() {
+            eprintln!(
+                "Step index {} out of bounds for scenario with {} requests",
+                step_index,
+                scenario.requests.len()
+            );
+            return;
         }
+
+        let request = &scenario.requests[step_index];
+        let start = Instant::now();
+        let result = request.send(tenant_config, self.uid.clone()).await;
+        let duration = start.elapsed();
+
+        let is_error = result.is_err();
+        if is_error {
+            eprintln!(
+                "Error in request from {:?} initiator {}: {:?}",
+                self.role, self.uid, result
+            );
+        }
+
+        // println!(
+        //     "Role: {}, Request: {:?} / {:?}, Duration: {:.2?}, Error: {}",
+        //     self.role, request.resource, request.operation, duration, is_error
+        // );
+
+        self.request_metrics.push(RequestMetrics {
+            request_type: request.resource.clone(),
+            operation: request.operation.clone(),
+            start_time: start,
+            duration,
+            initiator_role: self.role,
+            is_error,
+        });
     }
 }
 
@@ -525,6 +625,7 @@ impl InitiatorsPool {
 }
 
 async fn cleanup(tenant: &TenantClusterConfig) -> Result<()> {
+    println!("Cleaning up resources in namespace: {}", tenant.namespace);
     // list all config maps in the namespace
     let config_maps = tenant
         .cluster
