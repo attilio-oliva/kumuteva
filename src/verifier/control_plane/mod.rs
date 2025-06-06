@@ -1,10 +1,17 @@
 mod fairness;
+mod isolation;
 mod obj_isolation;
+mod objects;
 mod transparent_isolation;
 
 pub use fairness::*;
+pub use isolation::*;
 pub use obj_isolation::*;
+pub use objects::*;
 pub use transparent_isolation::*;
+
+use anyhow::Result;
+use std::collections::HashMap;
 
 use crate::cluster::NGINX_POD;
 
@@ -18,9 +25,107 @@ fn get_example_pod_name() -> String {
         .unwrap_or_else(|| POD_DEFAULT_NAME.to_string())
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectKind {
+    pub api_version: String,
+    pub kind: String,
+    pub namespaced: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum KubernetesVerb {
+    Create,
+    Get,
+    List,
+    Update,
+    Patch,
+    Delete,
+    Watch,
+}
+
+#[derive(Debug, Clone)]
+pub struct OperationResult {
+    pub verb: KubernetesVerb,
+    pub success: bool,
+    pub error_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectKindTestResult {
+    pub kind: KubernetesObject,
+    pub autonomy_results: Vec<OperationResult>,
+    pub isolation_results: Vec<OperationResult>,
+    pub has_autonomy: bool,
+    pub has_isolation: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnhancedObjectIsolationReport {
+    pub overall_isolation_success: bool,
+    pub overall_autonomy_success: bool,
+    pub object_results: Vec<ObjectKindTestResult>,
+    pub isolation_failures: Vec<String>,
+    pub autonomy_failures: Vec<String>,
+}
+
+impl std::fmt::Display for EnhancedObjectIsolationReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Enhanced Object Isolation Report")?;
+        writeln!(f, "=================================")?;
+        writeln!(
+            f,
+            "Overall Isolation: {}",
+            if self.overall_isolation_success {
+                "✅ PASS"
+            } else {
+                "❌ FAIL"
+            }
+        )?;
+        writeln!(
+            f,
+            "Overall Autonomy: {}",
+            if self.overall_autonomy_success {
+                "✅ PASS"
+            } else {
+                "❌ FAIL"
+            }
+        )?;
+
+        if !self.isolation_failures.is_empty() {
+            writeln!(f, "\nIsolation Failures:")?;
+            for failure in &self.isolation_failures {
+                writeln!(f, "  - {}", failure)?;
+            }
+        }
+
+        if !self.autonomy_failures.is_empty() {
+            writeln!(f, "\nAutonomy Failures:")?;
+            for failure in &self.autonomy_failures {
+                writeln!(f, "  - {}", failure)?;
+            }
+        }
+
+        writeln!(f, "\nDetailed Results by Object Kind:")?;
+        for result in &self.object_results {
+            writeln!(f, "  {} ({})", result.kind, result.kind.api_version())?;
+            writeln!(
+                f,
+                "    Autonomy: {}",
+                if result.has_autonomy { "✅" } else { "❌" }
+            )?;
+            writeln!(
+                f,
+                "    Isolation: {}",
+                if result.has_isolation { "✅" } else { "❌" }
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::cluster::{
         ControlPlaneIsolation, KindCluster, KubernetesCluster, KubernetesClusterBuilder,
     };
@@ -82,7 +187,11 @@ mod tests {
             namespace: "t2".to_string(),
         };
 
-        let result = check_object_isolation(&tenant1_config, &tenant2_config).await;
+        let result = crate::verifier::control_plane::isolation::check_object_isolation(
+            &tenant1_config,
+            &tenant2_config,
+        )
+        .await;
         assert!(result.is_err(), "Native cluster should fail isolation test");
 
         kind_cluster.delete().unwrap();
@@ -130,7 +239,11 @@ mod tests {
             namespace: "t2".to_string(),
         };
 
-        let result = check_object_isolation(&tenant1_config, &tenant2_config).await;
+        let result = crate::verifier::control_plane::isolation::check_object_isolation(
+            &tenant1_config,
+            &tenant2_config,
+        )
+        .await;
         assert!(result.is_ok(), "VCluster should pass isolation test");
 
         kind_cluster.delete().unwrap();
