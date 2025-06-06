@@ -1,7 +1,8 @@
 use crate::{
     cluster::KubernetesCluster,
     verifier::{
-        dispatch_k8s_operation, EnhancedObjectIsolationReport, KubernetesObject, KubernetesVerb,
+        dispatch_k8s_create, dispatch_k8s_delete, dispatch_k8s_get, dispatch_k8s_list,
+        dispatch_k8s_list, EnhancedObjectIsolationReport, KubernetesObject, KubernetesVerb,
         ObjectKindTestResult, OperationResult, TenantClusterConfig,
     },
 };
@@ -380,23 +381,13 @@ async fn test_cross_tenant_get(
     object_kind: &KubernetesObject,
     object_name: &str,
 ) -> Result<()> {
-    if object_kind.is_namespaced() {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant2
-                .cluster
-                .get_resource_in_namespace::<ResourceType>(object_name, &tenant1.namespace)
-                .await
-                .map(|_| ())
-        })
-    } else {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant2
-                .cluster
-                .get_cluster_resource::<ResourceType>(object_name)
-                .await
-                .map(|_| ())
-        })
-    }
+    dispatch_k8s_get!(
+        tenant2.cluster,
+        object_kind,
+        object_name,
+        tenant2.namespace.as_str()
+    )
+    .map(|_| ())
 }
 
 async fn test_cross_tenant_list(

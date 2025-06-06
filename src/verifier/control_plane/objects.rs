@@ -104,22 +104,103 @@ macro_rules! define_kubernetes_objects {
             }
         )*
 
-         /// Automatically generated macro to dispatch KubernetesObject to the appropriate generic method
-        macro_rules! dispatch_k8s_operation {
-            ($object_kind:expr, |$type_param:ident| $operation:expr) => {
+        /// Macro to dispatch GET operations, handling namespaced vs cluster-scoped resources
+        macro_rules! dispatch_k8s_get {
+            ($cluster:expr, $object_kind:expr, $name:expr, $namespace:expr) => {
                 match $object_kind {
                     $(
                         KubernetesObject::$variant => {
-                            type $type_param = $resource_type;
-                            $operation
+                            type ResourceType = $resource_type;
+                            if KubernetesObject::$variant::is_namespaced() {
+                                $cluster.get_resource_in_namespace::<ResourceType>($name, $namespace).await
+                            } else {
+                                $cluster.get_cluster_resource::<ResourceType>($name).await
+                            }
                         },
                     )*
                 }
             };
         }
 
-        // Export the macro for use outside this module
-        pub(crate) use dispatch_k8s_operation;
+        /// Macro to dispatch LIST operations
+        macro_rules! dispatch_k8s_list {
+            ($cluster:expr, $object_kind:expr, $namespace:expr) => {
+                match $object_kind {
+                    $(
+                        KubernetesObject::$variant => {
+                            type ResourceType = $resource_type;
+                            if KubernetesObject::$variant::is_namespaced() {
+                                $cluster.list_namespaced_resources::<ResourceType>($namespace).await.map(|_| ())
+                            } else {
+                                $cluster.list_cluster_resources::<ResourceType>().await.map(|_| ())
+                            }
+                        },
+                    )*
+                }
+            };
+        }
+
+        /// Macro to dispatch CREATE operations
+        macro_rules! dispatch_k8s_create {
+            ($cluster:expr, $object_kind:expr, $resource:expr, $namespace:expr) => {
+                match $object_kind {
+                    $(
+                        KubernetesObject::$variant => {
+                            type ResourceType = $resource_type;
+                            let obj: ResourceType = serde_json::from_value($resource)?;
+                            if KubernetesObject::$variant::is_namespaced() {
+                                $cluster.create_namespaced_resource(&obj, $namespace).await.map(|_| ())
+                            } else {
+                                $cluster.create_cluster_resource(&obj).await.map(|_| ())
+                            }
+                        },
+                    )*
+                }
+            };
+        }
+
+        /// Macro to dispatch DELETE operations
+        macro_rules! dispatch_k8s_delete {
+            ($cluster:expr, $object_kind:expr, $name:expr, $namespace:expr) => {
+                match $object_kind {
+                    $(
+                        KubernetesObject::$variant => {
+                            type ResourceType = $resource_type;
+                            if KubernetesObject::$variant::is_namespaced() {
+                                $cluster.delete_resource_in_namespace::<ResourceType>($name, $namespace).await
+                            } else {
+                                $cluster.delete_cluster_resource::<ResourceType>($name).await
+                            }
+                        },
+                    )*
+                }
+            };
+        }
+
+        /// Macro to dispatch PATCH operations
+        macro_rules! dispatch_k8s_patch {
+            ($cluster:expr, $object_kind:expr, $name:expr, $namespace:expr, $patch:expr) => {
+                match $object_kind {
+                    $(
+                        KubernetesObject::$variant => {
+                            type ResourceType = $resource_type;
+                            if KubernetesObject::$variant::is_namespaced() {
+                                $cluster.patch_namespaced_resource::<ResourceType, _>($name, $namespace, $patch).await.map(|_| ())
+                            } else {
+                                $cluster.patch_cluster_resource::<ResourceType, _>($name, $patch).await.map(|_| ())
+                            }
+                        },
+                    )*
+                }
+            };
+        }
+
+        // Export the macros for use outside this module
+        pub(crate) use dispatch_k8s_get;
+        pub(crate) use dispatch_k8s_list;
+        pub(crate) use dispatch_k8s_create;
+        pub(crate) use dispatch_k8s_delete;
+        pub(crate) use dispatch_k8s_patch;
 
     };
 }
