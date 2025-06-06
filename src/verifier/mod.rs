@@ -173,12 +173,15 @@ impl IsolationTest for ControlPlaneIsolationProperty {
             ControlPlaneIsolationProperty::ObjectIsolation => {
                 check_object_isolation(&tenant1, &tenant2)
                     .await
-                    .map(|is_isolated| TestResult {
-                        success: is_isolated,
-                        message: if is_isolated {
+                    .map(|report| TestResult {
+                        success: report.overall_isolation_success,
+                        message: if report.overall_isolation_success {
                             String::from("Object isolation test passed")
                         } else {
-                            String::from("Object isolation test failed")
+                            format!(
+                                "Object isolation test failed: {}",
+                                report.isolation_failures.join(", ")
+                            )
                         },
                     })
             }

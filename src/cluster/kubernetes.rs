@@ -9,15 +9,16 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomRe
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::{ClusterResourceScope, Metadata, NamespaceResourceScope, Resource};
 use kube::api::{
-    AttachParams, AttachedProcess, ListParams, ObjectList, ObjectMeta, Patch, PatchParams,
-    WatchEvent, WatchParams,
+    ApiResource, AttachParams, AttachedProcess, DynamicObject, ListParams, Object, ObjectList,
+    ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams,
 };
 use kube::config::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::discovery::{ApiCapabilities, Scope};
 use kube::runtime::reflector::Lookup;
 use kube::runtime::{watcher, WatchStreamExt};
-use kube::CustomResourceExt;
 use kube::{api::PostParams, Api, Client};
+use kube::{CustomResourceExt, Discovery};
 
 use futures::{StreamExt, TryStreamExt};
 use serde_json::json;
@@ -27,7 +28,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::pin;
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::verifier::KubernetesObject;
 
 use super::DummyCRD;
 
@@ -35,13 +39,15 @@ use super::DummyCRD;
 /// This struct is used to interact with a Kubernetes cluster using `kube` crate.
 pub struct KubernetesCluster {
     client: Client,
+    discovery: Arc<Discovery>,
 }
 
 impl KubernetesCluster {
     pub async fn infer() -> Result<Self> {
         let config = Config::infer().await?;
         let client = Client::try_from(config).context("Failed to create client")?;
-        Ok(Self { client })
+        let discovery = Arc::new(Discovery::new(client.clone()));
+        Ok(Self { client, discovery })
     }
 
     pub fn client(&self) -> Client {
@@ -53,7 +59,8 @@ impl KubernetesCluster {
         let options = KubeConfigOptions::default();
         let config = Config::from_custom_kubeconfig(kubeconfig, &options).await?;
         let client = Client::try_from(config)?;
-        Ok(Self { client })
+        let discovery = Arc::new(Discovery::new(client.clone()));
+        Ok(Self { client, discovery })
     }
 
     pub async fn patch_cluster_resource<R, P>(
@@ -426,6 +433,173 @@ impl KubernetesCluster {
         }
 
         Ok(())
+    }
+
+    // create a dynamic method that will get a resource by its kind string (look it in runtime)
+    pub async fn get_resource_dyn(
+        &self,
+        resource: &KubernetesObject,
+        resource_name: &str,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<DynamicObject> {
+        let kind = resource.kind();
+        // Common discovery, parameters, and api configuration for a single resource
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+            .with_context(|| format!("resource {resource:?} not found in cluster"))?;
+
+        let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
+
+        // get the resource
+        let resource = if let Some(ns) = namespace {
+            api.get(resource_name).await
+        } else {
+            api.get(resource_name).await
+        };
+
+        match resource {
+            Ok(res) => Ok(res),
+            Err(e) => Err(anyhow!("Failed to get resource {}: {}", resource_name, e)),
+        }
+    }
+
+    pub async fn list_resources_dyn(
+        &self,
+        resource: &KubernetesObject,
+        namespace: Option<&str>,
+    ) -> Result<ObjectList<DynamicObject>> {
+        let kind = resource.kind();
+        // Common discovery, parameters, and api configuration for a single resource
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+            .with_context(|| format!("resource {resource:?} not found in cluster"))?;
+
+        let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
+
+        // list the resources
+        let resources = if let Some(ns) = namespace {
+            api.list(&ListParams::default()).await
+        } else {
+            api.list(&ListParams::default()).await
+        };
+
+        resources.map_err(|e| anyhow!("Failed to list resources: {}", e))
+    }
+
+    pub async fn delete_resource_dyn(
+        &self,
+        resource: &KubernetesObject,
+        resource_name: &str,
+        namespace: Option<&str>,
+    ) -> Result<()> {
+        let kind = resource.kind();
+        // Common discovery, parameters, and api configuration for a single resource
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+            .with_context(|| format!("resource {resource:?} not found in cluster"))?;
+
+        let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
+
+        // delete the resource
+        if let Some(ns) = namespace {
+            api.delete(resource_name, &Default::default())
+                .await
+                .map_err(|e| anyhow!("Failed to delete resource {}: {}", resource_name, e))?;
+        } else {
+            api.delete(resource_name, &Default::default())
+                .await
+                .map_err(|e| anyhow!("Failed to delete resource {}: {}", resource_name, e))?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn patch_resource_dyn<P>(
+        &self,
+        resource: &KubernetesObject,
+        resource_name: &str,
+        patch: &Patch<P>,
+        namespace: Option<&str>,
+    ) -> Result<DynamicObject>
+    where
+        P: serde::Serialize + std::fmt::Debug,
+    {
+        let kind = resource.kind();
+        // Common discovery, parameters, and api configuration for a single resource
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+            .with_context(|| format!("resource {resource:?} not found in cluster"))?;
+
+        let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
+
+        // patch the resource
+        let patched_resource = if let Some(ns) = namespace {
+            api.patch(resource_name, &PatchParams::default(), patch)
+                .await
+        } else {
+            api.patch(resource_name, &PatchParams::default(), patch)
+                .await
+        };
+
+        patched_resource.map_err(|e| anyhow!("Failed to patch resource {}: {}", resource_name, e))
+    }
+    pub async fn create_resource_dyn(
+        &self,
+        resource: &KubernetesObject,
+        dynamic_object: &DynamicObject,
+        namespace: Option<&str>,
+    ) -> Result<DynamicObject> {
+        let kind = resource.kind();
+        // Common discovery, parameters, and api configuration for a single resource
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+            .with_context(|| format!("resource {resource:?} not found in cluster"))?;
+
+        let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
+
+        // create the resource
+        let created_resource = if let Some(ns) = namespace {
+            api.create(&PostParams::default(), dynamic_object).await
+        } else {
+            api.create(&PostParams::default(), dynamic_object).await
+        };
+
+        created_resource.map_err(|e| anyhow!("Failed to create resource: {}", e))
+    }
+
+    fn resolve_api_resource(
+        discovery: &Discovery,
+        name: &str,
+    ) -> Option<(ApiResource, ApiCapabilities)> {
+        // iterate through groups to find matching kind/plural names at recommended versions
+        // and then take the minimal match by group.name (equivalent to sorting groups by group.name).
+        // this is equivalent to kubectl's api group preference
+        discovery
+            .groups()
+            .flat_map(|group| {
+                group
+                    .resources_by_stability()
+                    .into_iter()
+                    .map(move |res| (group, res))
+            })
+            .filter(|(_, (res, _))| {
+                // match on both resource name and kind name
+                // ideally we should allow shortname matches as well
+                name.eq_ignore_ascii_case(&res.kind) || name.eq_ignore_ascii_case(&res.plural)
+            })
+            .min_by_key(|(group, _res)| group.name())
+            .map(|(_, res)| res)
+    }
+
+    fn dynamic_api(
+        ar: ApiResource,
+        caps: ApiCapabilities,
+        client: Client,
+        ns: Option<&str>,
+        all: bool,
+    ) -> Api<DynamicObject> {
+        if caps.scope == Scope::Cluster || all {
+            Api::all_with(client, &ar)
+        } else if let Some(namespace) = ns {
+            Api::namespaced_with(client, namespace, &ar)
+        } else {
+            Api::default_namespaced_with(client, &ar)
+        }
     }
 
     /*
@@ -873,7 +1047,8 @@ async fn get_output(mut attached: AttachedProcess) -> String {
 
 impl From<Client> for KubernetesCluster {
     fn from(client: Client) -> Self {
-        Self { client }
+        let discovery = Arc::new(Discovery::new(client.clone()));
+        Self { client, discovery }
     }
 }
 impl From<KubernetesCluster> for Client {

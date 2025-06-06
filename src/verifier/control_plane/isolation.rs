@@ -1,13 +1,13 @@
-use crate::{
-    cluster::KubernetesCluster,
-    verifier::{
-        dispatch_k8s_create, dispatch_k8s_delete, dispatch_k8s_get, dispatch_k8s_list,
-        dispatch_k8s_list, EnhancedObjectIsolationReport, KubernetesObject, KubernetesVerb,
-        ObjectKindTestResult, OperationResult, TenantClusterConfig,
-    },
+use crate::verifier::{
+    EnhancedObjectIsolationReport, KubernetesObject, KubernetesVerb, ObjectKindTestResult,
+    OperationResult, TenantClusterConfig,
 };
 
 use anyhow::{Context, Result};
+use kube::{
+    api::{DynamicObject, ObjectMeta, TypeMeta},
+    core::object,
+};
 
 /// Verifies that object isolation works between two tenant clusters
 /// Tests autonomy (can perform operations on own objects) and isolation (cannot access other tenant's objects)
@@ -165,9 +165,6 @@ async fn test_cross_tenant_isolation(
         KubernetesVerb::List => test_cross_tenant_list(tenant2, tenant1, object_kind).await,
         KubernetesVerb::Update => {
             test_cross_tenant_update(tenant2, tenant1, object_kind, &object_name).await
-        }
-        KubernetesVerb::Patch => {
-            test_cross_tenant_patch(tenant2, tenant1, object_kind, &object_name).await
         }
         KubernetesVerb::Delete => {
             test_cross_tenant_delete(tenant2, tenant1, object_kind, &object_name).await
@@ -381,13 +378,23 @@ async fn test_cross_tenant_get(
     object_kind: &KubernetesObject,
     object_name: &str,
 ) -> Result<()> {
-    dispatch_k8s_get!(
-        tenant2.cluster,
-        object_kind,
-        object_name,
-        tenant2.namespace.as_str()
-    )
-    .map(|_| ())
+    // Attempt to get an object created by tenant1 in tenant2's namespace
+    let namespace = tenant1.namespace.as_str();
+    let resource = tenant2
+        .cluster
+        .get_resource_dyn(object_kind, object_name, Some(namespace))
+        .await;
+
+    if resource.is_ok() {
+        Err(anyhow::anyhow!(
+            "Cross-tenant access detected: {} {} found in {}",
+            object_kind.kind(),
+            object_name,
+            namespace
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 async fn test_cross_tenant_list(
@@ -395,22 +402,21 @@ async fn test_cross_tenant_list(
     tenant1: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> Result<()> {
-    if object_kind.is_namespaced() {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant2
-                .cluster
-                .list_namespaced_resources::<ResourceType>(&tenant1.namespace)
-                .await
-                .map(|_| ())
-        })
+    // Attempt to list objects of a kind created by tenant1 in tenant2's namespace
+    let namespace = tenant1.namespace.as_str();
+    let resources = tenant2
+        .cluster
+        .list_resources_dyn(object_kind, Some(namespace))
+        .await;
+
+    if resources.is_ok() && !resources.unwrap().items.is_empty() {
+        Err(anyhow::anyhow!(
+            "Cross-tenant access detected: {} objects found in {}",
+            object_kind.kind(),
+            namespace
+        ))
     } else {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant2
-                .cluster
-                .list_cluster_resources::<ResourceType>()
-                .await
-                .map(|_| ())s
-        })
+        Ok(())
     }
 }
 
@@ -429,37 +435,22 @@ async fn test_cross_tenant_update(
         }
     }));
 
-    if object_kind.is_namespaced() {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant2
-                .cluster
-                .patch_namespaced_resource::<ResourceType, _>(
-                    object_name,
-                    &tenant1.namespace,
-                    &patch,
-                )
-                .await
-                .map(|_| ())
-        })
+    // Attempt to update an object created by tenant1 in tenant2's namespace
+    let namespace = tenant1.namespace.as_str();
+    let update_result = tenant2
+        .cluster
+        .patch_resource_dyn(object_kind, object_name, &patch, Some(namespace))
+        .await;
+    if update_result.is_ok() {
+        Err(anyhow::anyhow!(
+            "Cross-tenant access detected: {} {} updated in {}",
+            object_kind.kind(),
+            object_name,
+            namespace
+        ))
     } else {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant2
-                .cluster
-                .patch_cluster_resource::<ResourceType, _>(object_name, &patch)
-                .await
-                .map(|_| ())
-        })
+        Ok(())
     }
-}
-
-async fn test_cross_tenant_patch(
-    tenant2: &TenantClusterConfig,
-    tenant1: &TenantClusterConfig,
-    object_kind: &KubernetesObject,
-    object_name: &str,
-) -> Result<()> {
-    // Use the same implementation as update for patch testing
-    test_cross_tenant_update(tenant2, tenant1, object_kind, object_name).await
 }
 
 async fn test_cross_tenant_delete(
@@ -468,20 +459,21 @@ async fn test_cross_tenant_delete(
     object_kind: &KubernetesObject,
     object_name: &str,
 ) -> Result<()> {
-    if object_kind.is_namespaced() {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant2
-                .cluster
-                .delete_resource_in_namespace::<ResourceType>(object_name, &tenant1.namespace)
-                .await
-        })
+    // Attempt to delete the object created by tenant1
+    let namespace = tenant1.namespace.as_str();
+    let delete_result = tenant2
+        .cluster
+        .delete_resource_dyn(object_kind, object_name, Some(namespace))
+        .await;
+    if delete_result.is_ok() {
+        Err(anyhow::anyhow!(
+            "Cross-tenant access detected: {} {} deleted in {}",
+            object_kind.kind(),
+            object_name,
+            namespace
+        ))
     } else {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant2
-                .cluster
-                .delete_cluster_resource::<ResourceType>(object_name)
-                .await
-        })
+        Ok(())
     }
 }
 
@@ -493,26 +485,34 @@ async fn create_test_object(
 ) -> Result<()> {
     // Create a minimal test object based on the kind
     let test_object = create_minimal_object(object_kind, object_name, &tenant.namespace)?;
+    let dynamic_object = DynamicObject {
+        types: Some(TypeMeta {
+            api_version: object_kind.api_version().to_string(),
+            kind: object_kind.kind().to_string(),
+        }),
+        metadata: ObjectMeta {
+            name: Some(object_name.to_string()),
+            ..Default::default()
+        },
+        data: test_object,
+    };
 
-    if object_kind.is_namespaced() {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            let obj: ResourceType = serde_json::from_value(test_object)?;
-            tenant
-                .cluster
-                .create_namespaced_resource(&obj, &tenant.namespace)
-                .await
-                .map(|_| ())
-        })
-    } else {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            let obj: ResourceType = serde_json::from_value(test_object)?;
-            tenant
-                .cluster
-                .create_cluster_resource(&obj)
-                .await
-                .map(|_| ())
-        })
+    let namespace = tenant.namespace.as_str();
+
+    // Attempt to create the object in the tenant's cluster
+    let create_result = tenant
+        .cluster
+        .create_resource_dyn(object_kind, &dynamic_object, Some(namespace))
+        .await;
+    if create_result.is_err() {
+        return Err(anyhow::anyhow!(
+            "Failed to create {} {}: {}",
+            object_kind.kind(),
+            object_name,
+            create_result.unwrap_err()
+        ));
     }
+    Ok(())
 }
 
 async fn cleanup_test_object(
@@ -520,21 +520,22 @@ async fn cleanup_test_object(
     object_kind: &KubernetesObject,
     object_name: &str,
 ) -> Result<()> {
-    if object_kind.is_namespaced() {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant
-                .cluster
-                .delete_resource_in_namespace::<ResourceType>(object_name, &tenant.namespace)
-                .await
-        })
-    } else {
-        dispatch_k8s_operation!(object_kind, |ResourceType| {
-            tenant
-                .cluster
-                .delete_cluster_resource::<ResourceType>(object_name)
-                .await
-        })
+    // Attempt to delete the test object
+    let namespace = tenant.namespace.as_str();
+    let delete_result = tenant
+        .cluster
+        .delete_resource_dyn(object_kind, object_name, Some(namespace))
+        .await;
+
+    if delete_result.is_err() {
+        return Err(anyhow::anyhow!(
+            "Failed to cleanup {} {}: {}",
+            object_kind.kind(),
+            object_name,
+            delete_result.unwrap_err()
+        ));
     }
+    Ok(())
 }
 
 fn create_minimal_object(

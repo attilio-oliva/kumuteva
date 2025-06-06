@@ -1,17 +1,12 @@
 mod fairness;
 mod isolation;
-mod obj_isolation;
 mod objects;
 mod transparent_isolation;
 
 pub use fairness::*;
 pub use isolation::*;
-pub use obj_isolation::*;
 pub use objects::*;
 pub use transparent_isolation::*;
-
-use anyhow::Result;
-use std::collections::HashMap;
 
 use crate::cluster::NGINX_POD;
 

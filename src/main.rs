@@ -218,11 +218,16 @@ async fn main() -> anyhow::Result<()> {
                 verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
 
             match obj_isolation_result {
-                Ok(true) => println!("Object isolation test passed"),
-                Ok(false) => {
-                    println!("Object isolation test failed: tenant2 can access tenant1 objects")
+                Ok(report) => {
+                    if report.overall_autonomy_success {
+                        println!("Object isolation test passed");
+                    } else {
+                        println!("Object isolation test failed: {}", report);
+                    }
+
+                    println!("Detailed report:\n{}", report);
                 }
-                Err(e) => println!("Object isolation could not be verified: {}", e),
+                Err(e) => println!("Object isolation could not complete: {}", e),
             }
 
             let transparent_isolation_result = verifier::check_transparent_isolation_level(
