@@ -17,7 +17,6 @@
 
 use std::{
     collections::HashMap,
-    default,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -26,12 +25,14 @@ use crate::verifier::TenantClusterConfig;
 use anyhow::{Ok, Result};
 use k8s_openapi::api::{apps::v1::Deployment, core::v1::ConfigMap};
 use kube::{api::Patch, runtime::reflector::Lookup};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     sync::{broadcast, mpsc},
     task::JoinHandle,
 };
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FairnessTestConfig {
     pub regular_requesters: usize,
     pub malicious_requesters: usize,
@@ -41,6 +42,34 @@ pub struct FairnessTestConfig {
     pub test_duration: Duration,
     pub metrics_send_interval: Duration,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FairnessTestResults {
+    pub test_config: FairnessTestConfig,
+    pub baseline_metrics: BaselineMetrics,
+    pub regular_tenant_metrics: Vec<AverageMetrics>,
+    pub malicious_tenant_metrics: Vec<AverageMetrics>,
+    pub final_results: FinalResults,
+    pub test_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalResults {
+    pub regular_avg_latency_ms: f64,
+    pub regular_relative_increase_percent: f64,
+    pub regular_error_rate: f64,
+    pub malicious_avg_latency_ms: f64,
+    pub malicious_error_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineMetrics {
+    pub tenant1_avg_latency_ms: f64,
+    pub tenant2_avg_latency_ms: f64,
+    pub tenant1_error_rate: f64,
+    pub tenant2_error_rate: f64,
+}
+
 impl Default for FairnessTestConfig {
     fn default() -> Self {
         Self {
@@ -49,8 +78,8 @@ impl Default for FairnessTestConfig {
             regular_request_rate: 50.0,
             malicious_request_rate: 5000.0,
             baseline_test_duration: Duration::from_secs(10),
-            test_duration: Duration::from_secs(30),
-            metrics_send_interval: Duration::from_secs(5),
+            test_duration: Duration::from_secs(10),
+            metrics_send_interval: Duration::from_secs(1),
         }
     }
 }
@@ -174,8 +203,11 @@ pub async fn check_fairness(
         regular_t2_overseer.run(Arc::clone(&tenant2), config.baseline_test_duration);
 
     // Wait for the test to finish
-    let (baseline_metrics_t1, baseline_metrics_t2) =
+    let (baseline_test_t1, baseline_test_t2) =
         tokio::try_join!(baseline_result_t1, baseline_result_t2)?;
+
+    let (baseline_metrics_t1, baseline_metrics_history_t1) = baseline_test_t1;
+    let (baseline_metrics_t2, baseline_metrics_history_t2) = baseline_test_t2;
 
     // cleanup(&tenant1).await?;
     // cleanup(&tenant2).await?;
@@ -185,10 +217,13 @@ pub async fn check_fairness(
     let regular_result_t1 = regular_overseer.run(Arc::clone(&tenant1), config.test_duration);
     let malicious_result_t2 = malicious_overseer.run(Arc::clone(&tenant2), config.test_duration);
 
-    let (regular_result_t1, malicious_result_t2) =
+    let (regular_test_t1, malicious_test_t2) =
         tokio::try_join!(regular_result_t1, malicious_result_t2)?;
 
-    let regular_avg_response_time_t1 = regular_result_t1.average_duration;
+    let (regular_result, regular_metrics_history) = regular_test_t1;
+    let (malicious_result, malicious_metrics_history) = malicious_test_t2;
+
+    let regular_avg_response_time_t1 = regular_result.average_duration;
     // how much did t1 response time increase from baseline
     let relative_increase_avg_response_time_t1 = (regular_avg_response_time_t1.as_secs_f64()
         - baseline_avg_response_time_t1.as_secs_f64())
@@ -202,20 +237,20 @@ pub async fn check_fairness(
     );
 
     // Evaluate test success based on error rates
-    let regular_error_rate = regular_result_t1.error_rate;
+    let regular_error_rate = regular_result.error_rate;
     println!(
         "Regular tenant error rate: {:.2}% ({} errors out of {} requests)",
         regular_error_rate * 100.0,
-        regular_result_t1.error_count,
-        regular_result_t1.total_requests
+        regular_result.error_count,
+        regular_result.total_requests
     );
     // Malicious tenant error rate is not used in the fairness test, but can be logged
-    let malicious_error_rate = malicious_result_t2.error_rate;
+    let malicious_error_rate = malicious_result.error_rate;
     println!(
         "Malicious tenant error rate: {:.2}% ({} errors out of {} requests)",
         malicious_error_rate * 100.0,
-        malicious_result_t2.error_count,
-        malicious_result_t2.total_requests
+        malicious_result.error_count,
+        malicious_result.total_requests
     );
 
     // Test fails if regular tenant experiences significant errors
@@ -233,10 +268,103 @@ pub async fn check_fairness(
     cleanup(&tenant1).await?;
     cleanup(&tenant2).await?;
 
+    // Prepare the final results
+    let final_results = FinalResults {
+        regular_avg_latency_ms: regular_avg_response_time_t1.as_millis() as f64,
+        regular_relative_increase_percent: relative_increase_avg_response_time_t1 * 100.0,
+        regular_error_rate,
+        malicious_avg_latency_ms: malicious_result.average_duration.as_millis() as f64,
+        malicious_error_rate,
+    };
+
+    // Prepare the baseline metrics
+    let baseline_metrics = BaselineMetrics {
+        tenant1_avg_latency_ms: baseline_avg_response_time_t1.as_millis() as f64,
+        tenant2_avg_latency_ms: regular_avg_response_time_t1.as_millis() as f64,
+        tenant1_error_rate: regular_result.error_rate,
+        tenant2_error_rate: malicious_result.error_rate,
+    };
+
+    // Prepare the test results
+    let test_results = FairnessTestResults {
+        test_config: config,
+        baseline_metrics,
+        regular_tenant_metrics: regular_metrics_history,
+        malicious_tenant_metrics: malicious_metrics_history,
+        final_results,
+        test_passed,
+    };
+
+    // Save the results to CSV files
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    save_csv_data(&test_results, timestamp).await?;
+
     Ok(test_passed)
 }
 
-#[derive(Clone, Debug, Copy)]
+async fn save_csv_data(results: &FairnessTestResults, timestamp: u64) -> Result<()> {
+    use tokio::fs;
+
+    let regular_filename = format!("fairness_test_data_regular_{}.csv", timestamp);
+    let malicious_filename = format!("fairness_test_data_malicious_{}.csv", timestamp);
+    let mut regular_csv_content = String::from(
+        "start_time,end_time,role,latency_ms,std_dev_ms,error_rate,total_requests,error_count\n",
+    );
+    let mut malicious_csv_content = String::from(
+        "start_time,end_time,role,latency_ms,std_dev_ms,error_rate,total_requests,error_count\n",
+    );
+
+    for point in &results.regular_tenant_metrics {
+        regular_csv_content.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            point.start_time_seconds,
+            point.end_time_seconds,
+            point.initiator_role,
+            point.average_duration.as_millis(),
+            point.std_deviation.as_millis(),
+            point.error_rate,
+            point.total_requests,
+            point.error_count
+        ));
+    }
+
+    for point in &results.malicious_tenant_metrics {
+        malicious_csv_content.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            point.start_time_seconds,
+            point.end_time_seconds,
+            point.initiator_role,
+            point.average_duration.as_millis(),
+            point.std_deviation.as_millis(),
+            point.error_rate,
+            point.total_requests,
+            point.error_count
+        ));
+    }
+
+    fs::write(&regular_filename, regular_csv_content).await?;
+    fs::write(&malicious_filename, malicious_csv_content).await?;
+    println!("CSV data saved to: {}", regular_filename);
+    println!("CSV data saved to: {}", malicious_filename);
+
+    // Also save metadata as JSON
+    let metadata_filename = format!("fairness_test_metadata_{}.json", timestamp);
+    let metadata = serde_json::json!({
+        "test_config": results.test_config,
+        "baseline_metrics": results.baseline_metrics,
+        "final_results": results.final_results,
+        "test_passed": results.test_passed
+    });
+    fs::write(&metadata_filename, serde_json::to_string_pretty(&metadata)?).await?;
+    println!("Metadata saved to: {}", metadata_filename);
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Role {
     Malicious,
     Regular,
@@ -270,13 +398,13 @@ struct Request {
     operation: RequestOperation,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum ResourceKind {
     ConfigMap,
     Deployment,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum RequestOperation {
     Create,
     Update,
@@ -304,8 +432,10 @@ struct RequestMetrics {
     is_error: bool,
 }
 
-#[derive(Debug, Clone)]
-struct AverageMetrics {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AverageMetrics {
+    start_time_seconds: f64,
+    end_time_seconds: f64,
     request_type: ResourceKind,
     operation: RequestOperation,
     average_duration: Duration,
@@ -339,6 +469,8 @@ impl AverageMetrics {
         let error_rate = error_count as f64 / requests.len() as f64;
 
         Self {
+            start_time_seconds: requests[0].start_time.elapsed().as_secs_f64(),
+            end_time_seconds: requests.last().unwrap().start_time.elapsed().as_secs_f64(),
             request_type: requests[0].request_type.clone(),
             operation: requests[0].operation.clone(),
             average_duration,
@@ -380,6 +512,8 @@ impl AverageMetrics {
 
         // Use the first item's metadata for the aggregated metrics
         Self {
+            start_time_seconds: requests[0].start_time_seconds,
+            end_time_seconds: requests.last().unwrap().end_time_seconds,
             request_type: requests[0].request_type.clone(),
             operation: requests[0].operation.clone(),
             average_duration,
@@ -402,7 +536,7 @@ impl Overseer {
         &self,
         tenant_config: Arc<TenantClusterConfig>,
         duration: Duration,
-    ) -> Result<AverageMetrics> {
+    ) -> Result<(AverageMetrics, Vec<AverageMetrics>)> {
         // Create channel for metrics collection
         let (metrics_tx, mut metrics_rx) = mpsc::channel(5);
 
@@ -514,7 +648,12 @@ impl Overseer {
             average_metrics.std_deviation
         );
 
-        Ok(average_metrics)
+        let aggregated_historical_metrics = tenant_metrics
+            .into_values()
+            .flatten()
+            .collect::<Vec<AverageMetrics>>();
+
+        Ok((average_metrics, aggregated_historical_metrics))
     }
 }
 
