@@ -15,6 +15,7 @@
 //!   evaluating the stop conditions according to its *Role* for all the *InitiatorsPool*
 //!
 
+use std::fmt::Display;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -47,8 +48,8 @@ pub struct FairnessTestConfig {
 pub struct FairnessTestResults {
     pub test_config: FairnessTestConfig,
     pub baseline_metrics: BaselineMetrics,
-    pub regular_tenant_metrics: Vec<AverageMetrics>,
-    pub malicious_tenant_metrics: Vec<AverageMetrics>,
+    pub regular_tenant_metrics: Vec<RequestMetrics>,
+    pub malicious_tenant_metrics: Vec<RequestMetrics>,
     pub final_results: FinalResults,
     pub test_passed: bool,
 }
@@ -310,38 +311,32 @@ async fn save_csv_data(results: &FairnessTestResults, timestamp: u64) -> Result<
 
     let regular_filename = format!("fairness_test_data_regular_{}.csv", timestamp);
     let malicious_filename = format!("fairness_test_data_malicious_{}.csv", timestamp);
-    let mut regular_csv_content = String::from(
-        "start_time,end_time,role,latency_ms,std_dev_ms,error_rate,total_requests,error_count\n",
-    );
-    let mut malicious_csv_content = String::from(
-        "start_time,end_time,role,latency_ms,std_dev_ms,error_rate,total_requests,error_count\n",
-    );
+    let mut regular_csv_content =
+        String::from("start_time,role,duration_ms,operation,resource,is_error\n");
+    let mut malicious_csv_content =
+        String::from("start_time,role,duration_ms,operation,resource,is_error\n");
 
     for point in &results.regular_tenant_metrics {
         regular_csv_content.push_str(&format!(
-            "{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{}\n",
             point.start_time_seconds,
-            point.end_time_seconds,
             point.initiator_role,
-            point.average_duration.as_millis(),
-            point.std_deviation.as_millis(),
-            point.error_rate,
-            point.total_requests,
-            point.error_count
+            point.duration.as_millis(),
+            point.operation,
+            point.request_type,
+            point.is_error
         ));
     }
 
     for point in &results.malicious_tenant_metrics {
         malicious_csv_content.push_str(&format!(
-            "{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{}\n",
             point.start_time_seconds,
-            point.end_time_seconds,
             point.initiator_role,
-            point.average_duration.as_millis(),
-            point.std_deviation.as_millis(),
-            point.error_rate,
-            point.total_requests,
-            point.error_count
+            point.duration.as_millis(),
+            point.operation,
+            point.request_type,
+            point.is_error
         ));
     }
 
@@ -410,6 +405,24 @@ enum RequestOperation {
     Update,
     Delete,
 }
+impl Display for ResourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResourceKind::ConfigMap => write!(f, "ConfigMap"),
+            ResourceKind::Deployment => write!(f, "Deployment"),
+        }
+    }
+}
+
+impl Display for RequestOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestOperation::Create => write!(f, "Create"),
+            RequestOperation::Update => write!(f, "Update"),
+            RequestOperation::Delete => write!(f, "Delete"),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct InitiatorsPool {
@@ -422,11 +435,11 @@ struct Overseer {
     pool: InitiatorsPool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestMetrics {
     request_type: ResourceKind,
     operation: RequestOperation,
-    start_time: Instant,
+    start_time_seconds: f64,
     duration: Duration,
     initiator_role: Role,
     is_error: bool,
@@ -469,8 +482,8 @@ impl AverageMetrics {
         let error_rate = error_count as f64 / requests.len() as f64;
 
         Self {
-            start_time_seconds: requests[0].start_time.elapsed().as_secs_f64(),
-            end_time_seconds: requests.last().unwrap().start_time.elapsed().as_secs_f64(),
+            start_time_seconds: requests[0].start_time_seconds,
+            end_time_seconds: requests.last().unwrap().start_time_seconds,
             request_type: requests[0].request_type.clone(),
             operation: requests[0].operation.clone(),
             average_duration,
@@ -536,7 +549,7 @@ impl Overseer {
         &self,
         tenant_config: Arc<TenantClusterConfig>,
         duration: Duration,
-    ) -> Result<(AverageMetrics, Vec<AverageMetrics>)> {
+    ) -> Result<(AverageMetrics, Vec<RequestMetrics>)> {
         // Create channel for metrics collection
         let (metrics_tx, mut metrics_rx) = mpsc::channel(5);
 
@@ -552,7 +565,7 @@ impl Overseer {
 
         // Collect metrics for the specified duration
         let metrics_collector = tokio::spawn(async move {
-            let mut tenant_metrics: HashMap<String, Vec<AverageMetrics>> = HashMap::new();
+            let mut tenant_metrics: HashMap<String, Vec<RequestMetrics>> = HashMap::new();
             let mut completed = 0;
 
             // Use a timeout to ensure we don't wait forever
@@ -567,14 +580,14 @@ impl Overseer {
                         break;
                     }
                     // Receive metrics
-                    maybe_metric = metrics_rx.recv() => {
-                        match maybe_metric {
-                            Some(metric) => {
+                    maybe_metrics = metrics_rx.recv() => {
+                        match maybe_metrics {
+                            Some(metrics) => {
                                 // println!("Collected metric from role: {}", metric.initiator_role);
                                 tenant_metrics
-                                    .entry(metric.initiator_role.to_string())
+                                    .entry(metrics.first().unwrap().initiator_role.to_string())
                                     .or_default()
-                                    .push(metric);
+                                    .extend(metrics);
                             }
                             None => {
                                 println!("Metrics channel closed, ending collection");
@@ -630,16 +643,9 @@ impl Overseer {
                 self.role
             ));
         }
-        // Log collected metrics
-        let aggregated_periodic_metrics = tenant_metrics.get(&self.role.to_string()).unwrap();
-        if aggregated_periodic_metrics.is_empty() {
-            return Err(anyhow::anyhow!(
-                "No metrics collected for role: {}",
-                self.role
-            ));
-        }
 
-        let average_metrics = AverageMetrics::aggregate_averages(aggregated_periodic_metrics);
+        let average_metrics =
+            AverageMetrics::calculate(tenant_metrics.get(&self.role.to_string()).unwrap());
         println!(
             "Role: {}, Requests: {}, Avg Duration: {:.2?}, Std Dev: {:.2?}",
             self.role,
@@ -648,12 +654,10 @@ impl Overseer {
             average_metrics.std_deviation
         );
 
-        let aggregated_historical_metrics = tenant_metrics
-            .into_values()
-            .flatten()
-            .collect::<Vec<AverageMetrics>>();
-
-        Ok((average_metrics, aggregated_historical_metrics))
+        Ok((
+            average_metrics,
+            tenant_metrics.get(&self.role.to_string()).unwrap().to_vec(),
+        ))
     }
 }
 
@@ -661,7 +665,7 @@ impl Initiator {
     async fn run(
         mut self,
         scenario: Arc<Scenario>,
-        metrics_tx: mpsc::Sender<AverageMetrics>,
+        metrics_tx: mpsc::Sender<Vec<RequestMetrics>>,
         mut stop_rx: broadcast::Receiver<()>,
         completion_tx: mpsc::Sender<()>,
         tenant_config: Arc<TenantClusterConfig>,
@@ -680,8 +684,15 @@ impl Initiator {
                 }
                 _ = update_overseer_interval.tick() => {
                     if !self.request_metrics.is_empty() {
-                        let avg = AverageMetrics::calculate(&self.request_metrics);
-                        if metrics_tx.send(avg).await.is_err() { break; }
+                        //let avg = AverageMetrics::calculate(&self.request_metrics);
+                        //if metrics_tx.send(avg).await.is_err() { break; }
+                        if metrics_tx
+                            .send(self.request_metrics.clone())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                         self.request_metrics.clear();
                     }
                 }
@@ -696,12 +707,13 @@ impl Initiator {
 
     async fn send_final(
         &self,
-        metrics_tx: &mpsc::Sender<AverageMetrics>,
+        metrics_tx: &mpsc::Sender<Vec<RequestMetrics>>,
         completion_tx: &mpsc::Sender<()>,
     ) {
         if !self.request_metrics.is_empty() {
-            let avg = AverageMetrics::calculate(&self.request_metrics);
-            let _ = metrics_tx.send(avg).await;
+            // let avg = AverageMetrics::calculate(&self.request_metrics);
+            // let _ = metrics_tx.send(avg).await;
+            let _ = metrics_tx.send(self.request_metrics.clone()).await;
         }
         let _ = completion_tx.send(()).await;
     }
@@ -742,7 +754,7 @@ impl Initiator {
         self.request_metrics.push(RequestMetrics {
             request_type: request.resource.clone(),
             operation: request.operation.clone(),
-            start_time: start,
+            start_time_seconds: start.elapsed().as_secs_f64(),
             duration,
             initiator_role: self.role,
             is_error,
@@ -753,7 +765,7 @@ impl Initiator {
 impl InitiatorsPool {
     async fn spawn_initiators(
         &self,
-        metrics_tx: mpsc::Sender<AverageMetrics>,
+        metrics_tx: mpsc::Sender<Vec<RequestMetrics>>,
         completion_tx: mpsc::Sender<()>,
         tenant_config: Arc<TenantClusterConfig>,
     ) -> Vec<(JoinHandle<()>, broadcast::Sender<()>)> {
