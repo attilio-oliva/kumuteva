@@ -17,6 +17,7 @@
 
 use std::{
     collections::HashMap,
+    default,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,13 +32,35 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub struct FairnessTestConfig {
+    pub regular_requesters: usize,
+    pub malicious_requesters: usize,
+    pub regular_request_rate: f64,
+    pub malicious_request_rate: f64,
+    pub baseline_test_duration: Duration,
+    pub test_duration: Duration,
+    pub metrics_send_interval: Duration,
+}
+impl Default for FairnessTestConfig {
+    fn default() -> Self {
+        Self {
+            regular_requesters: 10,
+            malicious_requesters: 500,
+            regular_request_rate: 50.0,
+            malicious_request_rate: 5000.0,
+            baseline_test_duration: Duration::from_secs(10),
+            test_duration: Duration::from_secs(30),
+            metrics_send_interval: Duration::from_secs(5),
+        }
+    }
+}
+
 // Implement the check_fairness function
 pub async fn check_fairness(
     tenant1: Arc<TenantClusterConfig>,
     tenant2: Arc<TenantClusterConfig>,
+    config: FairnessTestConfig,
 ) -> Result<bool> {
-    let regular_requesters = 10;
-    let malicious_requesters = 500;
     // Create scenarios with synthetic test values
     let regular_scenario = Arc::new(Scenario {
         requests: vec![
@@ -99,28 +122,27 @@ pub async fn check_fairness(
 
     // Create initiator pools for both regular and malicious scenarios
     let regular_pool = InitiatorsPool {
-        initiators: (0..regular_requesters) // 3 regular initiators
+        initiators: (0..config.regular_requesters)
             .map(|idx| Initiator {
                 role: Role::Regular,
                 scenario: Arc::clone(&regular_scenario),
                 uid: format!("regular-initiator-{}", idx),
                 request_metrics: vec![],
-                metrics_send_interval: Duration::from_secs(3),
-                request_rate: 50.0,
+                metrics_send_interval: config.metrics_send_interval,
+                request_rate: config.regular_request_rate, // Regular initiators make fewer requests
             })
             .collect(),
     };
 
     let malicious_pool = InitiatorsPool {
-        initiators: (0..malicious_requesters)
-            .map(|idx| // 10 malicious initiators
-            Initiator {
+        initiators: (0..config.malicious_requesters)
+            .map(|idx| Initiator {
                 scenario: Arc::clone(&malicious_scenario),
                 role: Role::Malicious,
                 uid: format!("malicious-initiator-{}", idx),
                 request_metrics: vec![],
-                metrics_send_interval: Duration::from_secs(3),
-                request_rate: 5000.0, // Malicious initiators make more requests
+                metrics_send_interval: config.metrics_send_interval,
+                request_rate: config.malicious_request_rate, // Malicious initiators make more requests
             })
             .collect(),
     };
@@ -145,10 +167,11 @@ pub async fn check_fairness(
     );
 
     // Run the test for a specific duration
-    let test_duration = Duration::from_secs(10);
     let regular_t2_overseer = regular_overseer.clone();
-    let baseline_result_t1 = regular_overseer.run(Arc::clone(&tenant1), test_duration);
-    let baseline_result_t2 = regular_t2_overseer.run(Arc::clone(&tenant2), test_duration);
+    let baseline_result_t1 =
+        regular_overseer.run(Arc::clone(&tenant1), config.baseline_test_duration);
+    let baseline_result_t2 =
+        regular_t2_overseer.run(Arc::clone(&tenant2), config.baseline_test_duration);
 
     // Wait for the test to finish
     let (baseline_metrics_t1, baseline_metrics_t2) =
@@ -159,8 +182,8 @@ pub async fn check_fairness(
 
     let baseline_avg_response_time_t1 = baseline_metrics_t1.average_duration;
 
-    let regular_result_t1 = regular_overseer.run(Arc::clone(&tenant1), test_duration);
-    let malicious_result_t2 = malicious_overseer.run(Arc::clone(&tenant2), test_duration);
+    let regular_result_t1 = regular_overseer.run(Arc::clone(&tenant1), config.test_duration);
+    let malicious_result_t2 = malicious_overseer.run(Arc::clone(&tenant2), config.test_duration);
 
     let (regular_result_t1, malicious_result_t2) =
         tokio::try_join!(regular_result_t1, malicious_result_t2)?;
@@ -565,12 +588,12 @@ impl Initiator {
         let duration = start.elapsed();
 
         let is_error = result.is_err();
-        if is_error {
-            eprintln!(
-                "Error in request from {:?} initiator {}: {:?}",
-                self.role, self.uid, result
-            );
-        }
+        // if is_error {
+        //     eprintln!(
+        //         "Error in request from {:?} initiator {}: {:?}",
+        //         self.role, self.uid, result
+        //     );
+        // }
 
         // println!(
         //     "Role: {}, Request: {:?} / {:?}, Duration: {:.2?}, Error: {}",
@@ -895,7 +918,7 @@ mod tests {
             cluster: KubernetesCluster::infer().await.unwrap(),
         });
 
-        let result = check_fairness(tenant1, tenant2).await;
+        let result = check_fairness(tenant1, tenant2, FairnessTestConfig::default()).await;
         assert!(result.is_ok());
     }
 }
