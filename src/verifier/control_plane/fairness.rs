@@ -16,6 +16,7 @@
 //!
 
 use std::fmt::Display;
+use std::sync::OnceLock;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -85,12 +86,22 @@ impl Default for FairnessTestConfig {
     }
 }
 
+static GLOBAL_TEST_START: OnceLock<Instant> = OnceLock::new();
+
+fn get_global_timestamp() -> f64 {
+    let test_start = GLOBAL_TEST_START.get_or_init(Instant::now);
+    test_start.elapsed().as_secs_f64()
+}
+
 // Implement the check_fairness function
 pub async fn check_fairness(
     tenant1: Arc<TenantClusterConfig>,
     tenant2: Arc<TenantClusterConfig>,
     config: FairnessTestConfig,
 ) -> Result<bool> {
+    // Initialize global start time at the beginning of the test
+    GLOBAL_TEST_START.get_or_init(Instant::now);
+
     // Create scenarios with synthetic test values
     let regular_scenario = Arc::new(Scenario {
         requests: vec![
@@ -436,7 +447,7 @@ struct Overseer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RequestMetrics {
+pub struct RequestMetrics {
     request_type: ResourceKind,
     operation: RequestOperation,
     start_time_seconds: f64,
@@ -735,6 +746,7 @@ impl Initiator {
 
         let request = &scenario.requests[step_index];
         let start = Instant::now();
+        let start_timestamp = get_global_timestamp();
         let result = request.send(tenant_config, self.uid.clone()).await;
         let duration = start.elapsed();
 
@@ -754,7 +766,7 @@ impl Initiator {
         self.request_metrics.push(RequestMetrics {
             request_type: request.resource.clone(),
             operation: request.operation.clone(),
-            start_time_seconds: start.elapsed().as_secs_f64(),
+            start_time_seconds: start_timestamp,
             duration,
             initiator_role: self.role,
             is_error,
