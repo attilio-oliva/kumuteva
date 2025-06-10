@@ -15,6 +15,8 @@
 //!   evaluating the stop conditions according to its *Role* for all the *InitiatorsPool*
 //!
 
+use std::fmt::Display;
+use std::sync::OnceLock;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -25,19 +27,81 @@ use crate::verifier::TenantClusterConfig;
 use anyhow::{Ok, Result};
 use k8s_openapi::api::{apps::v1::Deployment, core::v1::ConfigMap};
 use kube::{api::Patch, runtime::reflector::Lookup};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     sync::{broadcast, mpsc},
     task::JoinHandle,
 };
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FairnessTestConfig {
+    pub regular_requesters: usize,
+    pub malicious_requesters: usize,
+    pub regular_request_rate: f64,
+    pub malicious_request_rate: f64,
+    pub baseline_test_duration: Duration,
+    pub test_duration: Duration,
+    pub metrics_send_interval: Duration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FairnessTestResults {
+    pub test_config: FairnessTestConfig,
+    pub baseline_metrics: BaselineMetrics,
+    pub regular_tenant_metrics: Vec<RequestMetrics>,
+    pub malicious_tenant_metrics: Vec<RequestMetrics>,
+    pub final_results: FinalResults,
+    pub test_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalResults {
+    pub regular_avg_latency_ms: f64,
+    pub regular_relative_increase_percent: f64,
+    pub regular_error_rate: f64,
+    pub malicious_avg_latency_ms: f64,
+    pub malicious_error_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineMetrics {
+    pub tenant1_avg_latency_ms: f64,
+    pub tenant2_avg_latency_ms: f64,
+    pub tenant1_error_rate: f64,
+    pub tenant2_error_rate: f64,
+}
+
+impl Default for FairnessTestConfig {
+    fn default() -> Self {
+        Self {
+            regular_requesters: 10,
+            malicious_requesters: 500,
+            regular_request_rate: 50.0,
+            malicious_request_rate: 5000.0,
+            baseline_test_duration: Duration::from_secs(10),
+            test_duration: Duration::from_secs(60),
+            metrics_send_interval: Duration::from_secs(1),
+        }
+    }
+}
+
+static GLOBAL_TEST_START: OnceLock<Instant> = OnceLock::new();
+
+fn get_global_timestamp() -> f64 {
+    let test_start = GLOBAL_TEST_START.get_or_init(Instant::now);
+    test_start.elapsed().as_secs_f64()
+}
+
 // Implement the check_fairness function
 pub async fn check_fairness(
     tenant1: Arc<TenantClusterConfig>,
     tenant2: Arc<TenantClusterConfig>,
+    config: FairnessTestConfig,
 ) -> Result<bool> {
-    let regular_requesters = 10;
-    let malicious_requesters = 500;
+    // Initialize global start time at the beginning of the test
+    GLOBAL_TEST_START.get_or_init(Instant::now);
+
     // Create scenarios with synthetic test values
     let regular_scenario = Arc::new(Scenario {
         requests: vec![
@@ -99,28 +163,27 @@ pub async fn check_fairness(
 
     // Create initiator pools for both regular and malicious scenarios
     let regular_pool = InitiatorsPool {
-        initiators: (0..regular_requesters) // 3 regular initiators
+        initiators: (0..config.regular_requesters)
             .map(|idx| Initiator {
                 role: Role::Regular,
                 scenario: Arc::clone(&regular_scenario),
                 uid: format!("regular-initiator-{}", idx),
                 request_metrics: vec![],
-                metrics_send_interval: Duration::from_secs(3),
-                request_rate: 50.0,
+                metrics_send_interval: config.metrics_send_interval,
+                request_rate: config.regular_request_rate, // Regular initiators make fewer requests
             })
             .collect(),
     };
 
     let malicious_pool = InitiatorsPool {
-        initiators: (0..malicious_requesters)
-            .map(|idx| // 10 malicious initiators
-            Initiator {
+        initiators: (0..config.malicious_requesters)
+            .map(|idx| Initiator {
                 scenario: Arc::clone(&malicious_scenario),
                 role: Role::Malicious,
                 uid: format!("malicious-initiator-{}", idx),
                 request_metrics: vec![],
-                metrics_send_interval: Duration::from_secs(3),
-                request_rate: 5000.0, // Malicious initiators make more requests
+                metrics_send_interval: config.metrics_send_interval,
+                request_rate: config.malicious_request_rate, // Malicious initiators make more requests
             })
             .collect(),
     };
@@ -145,27 +208,34 @@ pub async fn check_fairness(
     );
 
     // Run the test for a specific duration
-    let test_duration = Duration::from_secs(10);
     let regular_t2_overseer = regular_overseer.clone();
-    let baseline_result_t1 = regular_overseer.run(Arc::clone(&tenant1), test_duration);
-    let baseline_result_t2 = regular_t2_overseer.run(Arc::clone(&tenant2), test_duration);
+    let baseline_result_t1 =
+        regular_overseer.run(Arc::clone(&tenant1), config.baseline_test_duration);
+    let baseline_result_t2 =
+        regular_t2_overseer.run(Arc::clone(&tenant2), config.baseline_test_duration);
 
     // Wait for the test to finish
-    let (baseline_metrics_t1, baseline_metrics_t2) =
+    let (baseline_test_t1, baseline_test_t2) =
         tokio::try_join!(baseline_result_t1, baseline_result_t2)?;
+
+    let (baseline_metrics_t1, baseline_metrics_history_t1) = baseline_test_t1;
+    let (baseline_metrics_t2, baseline_metrics_history_t2) = baseline_test_t2;
 
     // cleanup(&tenant1).await?;
     // cleanup(&tenant2).await?;
 
     let baseline_avg_response_time_t1 = baseline_metrics_t1.average_duration;
 
-    let regular_result_t1 = regular_overseer.run(Arc::clone(&tenant1), test_duration);
-    let malicious_result_t2 = malicious_overseer.run(Arc::clone(&tenant2), test_duration);
+    let regular_result_t1 = regular_overseer.run(Arc::clone(&tenant1), config.test_duration);
+    let malicious_result_t2 = malicious_overseer.run(Arc::clone(&tenant2), config.test_duration);
 
-    let (regular_result_t1, malicious_result_t2) =
+    let (regular_test_t1, malicious_test_t2) =
         tokio::try_join!(regular_result_t1, malicious_result_t2)?;
 
-    let regular_avg_response_time_t1 = regular_result_t1.average_duration;
+    let (regular_result, regular_metrics_history) = regular_test_t1;
+    let (malicious_result, malicious_metrics_history) = malicious_test_t2;
+
+    let regular_avg_response_time_t1 = regular_result.average_duration;
     // how much did t1 response time increase from baseline
     let relative_increase_avg_response_time_t1 = (regular_avg_response_time_t1.as_secs_f64()
         - baseline_avg_response_time_t1.as_secs_f64())
@@ -179,20 +249,20 @@ pub async fn check_fairness(
     );
 
     // Evaluate test success based on error rates
-    let regular_error_rate = regular_result_t1.error_rate;
+    let regular_error_rate = regular_result.error_rate;
     println!(
         "Regular tenant error rate: {:.2}% ({} errors out of {} requests)",
         regular_error_rate * 100.0,
-        regular_result_t1.error_count,
-        regular_result_t1.total_requests
+        regular_result.error_count,
+        regular_result.total_requests
     );
     // Malicious tenant error rate is not used in the fairness test, but can be logged
-    let malicious_error_rate = malicious_result_t2.error_rate;
+    let malicious_error_rate = malicious_result.error_rate;
     println!(
         "Malicious tenant error rate: {:.2}% ({} errors out of {} requests)",
         malicious_error_rate * 100.0,
-        malicious_result_t2.error_count,
-        malicious_result_t2.total_requests
+        malicious_result.error_count,
+        malicious_result.total_requests
     );
 
     // Test fails if regular tenant experiences significant errors
@@ -210,10 +280,97 @@ pub async fn check_fairness(
     cleanup(&tenant1).await?;
     cleanup(&tenant2).await?;
 
+    // Prepare the final results
+    let final_results = FinalResults {
+        regular_avg_latency_ms: regular_avg_response_time_t1.as_millis() as f64,
+        regular_relative_increase_percent: relative_increase_avg_response_time_t1 * 100.0,
+        regular_error_rate,
+        malicious_avg_latency_ms: malicious_result.average_duration.as_millis() as f64,
+        malicious_error_rate,
+    };
+
+    // Prepare the baseline metrics
+    let baseline_metrics = BaselineMetrics {
+        tenant1_avg_latency_ms: baseline_avg_response_time_t1.as_millis() as f64,
+        tenant2_avg_latency_ms: regular_avg_response_time_t1.as_millis() as f64,
+        tenant1_error_rate: regular_result.error_rate,
+        tenant2_error_rate: malicious_result.error_rate,
+    };
+
+    // Prepare the test results
+    let test_results = FairnessTestResults {
+        test_config: config,
+        baseline_metrics,
+        regular_tenant_metrics: regular_metrics_history,
+        malicious_tenant_metrics: malicious_metrics_history,
+        final_results,
+        test_passed,
+    };
+
+    // Save the results to CSV files
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    save_csv_data(&test_results, timestamp).await?;
+
     Ok(test_passed)
 }
 
-#[derive(Clone, Debug, Copy)]
+async fn save_csv_data(results: &FairnessTestResults, timestamp: u64) -> Result<()> {
+    use tokio::fs;
+
+    let regular_filename = format!("fairness_test_data_regular_{}.csv", timestamp);
+    let malicious_filename = format!("fairness_test_data_malicious_{}.csv", timestamp);
+    let mut regular_csv_content =
+        String::from("start_time,role,duration_ms,operation,resource,is_error\n");
+    let mut malicious_csv_content =
+        String::from("start_time,role,duration_ms,operation,resource,is_error\n");
+
+    for point in &results.regular_tenant_metrics {
+        regular_csv_content.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            point.start_time_seconds,
+            point.initiator_role,
+            point.duration.as_millis(),
+            point.operation,
+            point.request_type,
+            point.is_error
+        ));
+    }
+
+    for point in &results.malicious_tenant_metrics {
+        malicious_csv_content.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            point.start_time_seconds,
+            point.initiator_role,
+            point.duration.as_millis(),
+            point.operation,
+            point.request_type,
+            point.is_error
+        ));
+    }
+
+    fs::write(&regular_filename, regular_csv_content).await?;
+    fs::write(&malicious_filename, malicious_csv_content).await?;
+    println!("CSV data saved to: {}", regular_filename);
+    println!("CSV data saved to: {}", malicious_filename);
+
+    // Also save metadata as JSON
+    let metadata_filename = format!("fairness_test_metadata_{}.json", timestamp);
+    let metadata = serde_json::json!({
+        "test_config": results.test_config,
+        "baseline_metrics": results.baseline_metrics,
+        "final_results": results.final_results,
+        "test_passed": results.test_passed
+    });
+    fs::write(&metadata_filename, serde_json::to_string_pretty(&metadata)?).await?;
+    println!("Metadata saved to: {}", metadata_filename);
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Role {
     Malicious,
     Regular,
@@ -247,17 +404,35 @@ struct Request {
     operation: RequestOperation,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum ResourceKind {
     ConfigMap,
     Deployment,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum RequestOperation {
     Create,
     Update,
     Delete,
+}
+impl Display for ResourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResourceKind::ConfigMap => write!(f, "ConfigMap"),
+            ResourceKind::Deployment => write!(f, "Deployment"),
+        }
+    }
+}
+
+impl Display for RequestOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestOperation::Create => write!(f, "Create"),
+            RequestOperation::Update => write!(f, "Update"),
+            RequestOperation::Delete => write!(f, "Delete"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -271,18 +446,20 @@ struct Overseer {
     pool: InitiatorsPool,
 }
 
-#[derive(Debug, Clone)]
-struct RequestMetrics {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestMetrics {
     request_type: ResourceKind,
     operation: RequestOperation,
-    start_time: Instant,
+    start_time_seconds: f64,
     duration: Duration,
     initiator_role: Role,
     is_error: bool,
 }
 
-#[derive(Debug, Clone)]
-struct AverageMetrics {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AverageMetrics {
+    start_time_seconds: f64,
+    end_time_seconds: f64,
     request_type: ResourceKind,
     operation: RequestOperation,
     average_duration: Duration,
@@ -316,6 +493,8 @@ impl AverageMetrics {
         let error_rate = error_count as f64 / requests.len() as f64;
 
         Self {
+            start_time_seconds: requests[0].start_time_seconds,
+            end_time_seconds: requests.last().unwrap().start_time_seconds,
             request_type: requests[0].request_type.clone(),
             operation: requests[0].operation.clone(),
             average_duration,
@@ -357,6 +536,8 @@ impl AverageMetrics {
 
         // Use the first item's metadata for the aggregated metrics
         Self {
+            start_time_seconds: requests[0].start_time_seconds,
+            end_time_seconds: requests.last().unwrap().end_time_seconds,
             request_type: requests[0].request_type.clone(),
             operation: requests[0].operation.clone(),
             average_duration,
@@ -379,7 +560,7 @@ impl Overseer {
         &self,
         tenant_config: Arc<TenantClusterConfig>,
         duration: Duration,
-    ) -> Result<AverageMetrics> {
+    ) -> Result<(AverageMetrics, Vec<RequestMetrics>)> {
         // Create channel for metrics collection
         let (metrics_tx, mut metrics_rx) = mpsc::channel(5);
 
@@ -395,7 +576,7 @@ impl Overseer {
 
         // Collect metrics for the specified duration
         let metrics_collector = tokio::spawn(async move {
-            let mut tenant_metrics: HashMap<String, Vec<AverageMetrics>> = HashMap::new();
+            let mut tenant_metrics: HashMap<String, Vec<RequestMetrics>> = HashMap::new();
             let mut completed = 0;
 
             // Use a timeout to ensure we don't wait forever
@@ -410,14 +591,14 @@ impl Overseer {
                         break;
                     }
                     // Receive metrics
-                    maybe_metric = metrics_rx.recv() => {
-                        match maybe_metric {
-                            Some(metric) => {
+                    maybe_metrics = metrics_rx.recv() => {
+                        match maybe_metrics {
+                            Some(metrics) => {
                                 // println!("Collected metric from role: {}", metric.initiator_role);
                                 tenant_metrics
-                                    .entry(metric.initiator_role.to_string())
+                                    .entry(metrics.first().unwrap().initiator_role.to_string())
                                     .or_default()
-                                    .push(metric);
+                                    .extend(metrics);
                             }
                             None => {
                                 println!("Metrics channel closed, ending collection");
@@ -473,16 +654,9 @@ impl Overseer {
                 self.role
             ));
         }
-        // Log collected metrics
-        let aggregated_periodic_metrics = tenant_metrics.get(&self.role.to_string()).unwrap();
-        if aggregated_periodic_metrics.is_empty() {
-            return Err(anyhow::anyhow!(
-                "No metrics collected for role: {}",
-                self.role
-            ));
-        }
 
-        let average_metrics = AverageMetrics::aggregate_averages(aggregated_periodic_metrics);
+        let average_metrics =
+            AverageMetrics::calculate(tenant_metrics.get(&self.role.to_string()).unwrap());
         println!(
             "Role: {}, Requests: {}, Avg Duration: {:.2?}, Std Dev: {:.2?}",
             self.role,
@@ -491,7 +665,10 @@ impl Overseer {
             average_metrics.std_deviation
         );
 
-        Ok(average_metrics)
+        Ok((
+            average_metrics,
+            tenant_metrics.get(&self.role.to_string()).unwrap().to_vec(),
+        ))
     }
 }
 
@@ -499,7 +676,7 @@ impl Initiator {
     async fn run(
         mut self,
         scenario: Arc<Scenario>,
-        metrics_tx: mpsc::Sender<AverageMetrics>,
+        metrics_tx: mpsc::Sender<Vec<RequestMetrics>>,
         mut stop_rx: broadcast::Receiver<()>,
         completion_tx: mpsc::Sender<()>,
         tenant_config: Arc<TenantClusterConfig>,
@@ -518,8 +695,15 @@ impl Initiator {
                 }
                 _ = update_overseer_interval.tick() => {
                     if !self.request_metrics.is_empty() {
-                        let avg = AverageMetrics::calculate(&self.request_metrics);
-                        if metrics_tx.send(avg).await.is_err() { break; }
+                        //let avg = AverageMetrics::calculate(&self.request_metrics);
+                        //if metrics_tx.send(avg).await.is_err() { break; }
+                        if metrics_tx
+                            .send(self.request_metrics.clone())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                         self.request_metrics.clear();
                     }
                 }
@@ -534,12 +718,13 @@ impl Initiator {
 
     async fn send_final(
         &self,
-        metrics_tx: &mpsc::Sender<AverageMetrics>,
+        metrics_tx: &mpsc::Sender<Vec<RequestMetrics>>,
         completion_tx: &mpsc::Sender<()>,
     ) {
         if !self.request_metrics.is_empty() {
-            let avg = AverageMetrics::calculate(&self.request_metrics);
-            let _ = metrics_tx.send(avg).await;
+            // let avg = AverageMetrics::calculate(&self.request_metrics);
+            // let _ = metrics_tx.send(avg).await;
+            let _ = metrics_tx.send(self.request_metrics.clone()).await;
         }
         let _ = completion_tx.send(()).await;
     }
@@ -561,16 +746,17 @@ impl Initiator {
 
         let request = &scenario.requests[step_index];
         let start = Instant::now();
+        let start_timestamp = get_global_timestamp();
         let result = request.send(tenant_config, self.uid.clone()).await;
         let duration = start.elapsed();
 
         let is_error = result.is_err();
-        if is_error {
-            eprintln!(
-                "Error in request from {:?} initiator {}: {:?}",
-                self.role, self.uid, result
-            );
-        }
+        // if is_error {
+        //     eprintln!(
+        //         "Error in request from {:?} initiator {}: {:?}",
+        //         self.role, self.uid, result
+        //     );
+        // }
 
         // println!(
         //     "Role: {}, Request: {:?} / {:?}, Duration: {:.2?}, Error: {}",
@@ -580,7 +766,7 @@ impl Initiator {
         self.request_metrics.push(RequestMetrics {
             request_type: request.resource.clone(),
             operation: request.operation.clone(),
-            start_time: start,
+            start_time_seconds: start_timestamp,
             duration,
             initiator_role: self.role,
             is_error,
@@ -591,7 +777,7 @@ impl Initiator {
 impl InitiatorsPool {
     async fn spawn_initiators(
         &self,
-        metrics_tx: mpsc::Sender<AverageMetrics>,
+        metrics_tx: mpsc::Sender<Vec<RequestMetrics>>,
         completion_tx: mpsc::Sender<()>,
         tenant_config: Arc<TenantClusterConfig>,
     ) -> Vec<(JoinHandle<()>, broadcast::Sender<()>)> {
@@ -895,7 +1081,7 @@ mod tests {
             cluster: KubernetesCluster::infer().await.unwrap(),
         });
 
-        let result = check_fairness(tenant1, tenant2).await;
+        let result = check_fairness(tenant1, tenant2, FairnessTestConfig::default()).await;
         assert!(result.is_ok());
     }
 }

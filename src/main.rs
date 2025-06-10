@@ -16,6 +16,8 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
 use verifier::{TenantClusterConfig, TransparentIsolationLevel};
 
+use crate::verifier::FairnessTestConfig;
+
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
 pub struct Cli {
@@ -296,8 +298,12 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => println!("Storage isolation test failed: {}", e),
             }
 
-            let fairness =
-                verifier::check_fairness(Arc::new(tenant1_config), Arc::new(tenant2_config)).await;
+            let fairness = verifier::check_fairness(
+                Arc::new(tenant1_config),
+                Arc::new(tenant2_config),
+                FairnessTestConfig::default(),
+            )
+            .await;
             match fairness {
                 Ok(_) => println!("Fairness test passed"),
                 Err(e) => println!("Fairness test failed: {}", e),

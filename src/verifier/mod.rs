@@ -189,7 +189,7 @@ impl IsolationTest for ControlPlaneIsolationProperty {
                 level.run(tenant1, tenant2).await
             }
             ControlPlaneIsolationProperty::Fairness => {
-                check_fairness(tenant1, tenant2)
+                check_fairness(tenant1, tenant2, FairnessTestConfig::default())
                     .await
                     .map(|is_fair| TestResult {
                         success: is_fair,
