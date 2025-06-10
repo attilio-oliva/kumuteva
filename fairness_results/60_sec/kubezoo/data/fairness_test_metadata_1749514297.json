@@ -1,16 +1,16 @@
 {
   "baseline_metrics": {
-    "tenant1_avg_latency_ms": 123.0,
-    "tenant1_error_rate": 0.09375,
-    "tenant2_avg_latency_ms": 677.0,
+    "tenant1_avg_latency_ms": 26.0,
+    "tenant1_error_rate": 0.020802377414561663,
+    "tenant2_avg_latency_ms": 906.0,
     "tenant2_error_rate": 0.0
   },
   "final_results": {
-    "malicious_avg_latency_ms": 1152.0,
+    "malicious_avg_latency_ms": 866.0,
     "malicious_error_rate": 0.0,
-    "regular_avg_latency_ms": 677.0,
-    "regular_error_rate": 0.09375,
-    "regular_relative_increase_percent": 449.8492510229167
+    "regular_avg_latency_ms": 906.0,
+    "regular_error_rate": 0.020802377414561663,
+    "regular_relative_increase_percent": 3368.871463671818
   },
   "test_config": {
     "baseline_test_duration": {
@@ -27,8 +27,8 @@
     "regular_requesters": 10,
     "test_duration": {
       "nanos": 0,
-      "secs": 10
+      "secs": 60
     }
   },
-  "test_passed": false
+  "test_passed": true
 }

@@ -80,7 +80,7 @@ impl Default for FairnessTestConfig {
             regular_request_rate: 50.0,
             malicious_request_rate: 5000.0,
             baseline_test_duration: Duration::from_secs(10),
-            test_duration: Duration::from_secs(10),
+            test_duration: Duration::from_secs(60),
             metrics_send_interval: Duration::from_secs(1),
         }
     }
