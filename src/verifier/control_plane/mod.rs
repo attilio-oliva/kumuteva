@@ -3,6 +3,8 @@ mod isolation;
 mod objects;
 mod transparent_isolation;
 
+use std::fmt::Display;
+
 pub use fairness::*;
 pub use isolation::*;
 pub use objects::*;
@@ -36,6 +38,21 @@ pub enum KubernetesVerb {
     Patch,
     Delete,
     Watch,
+}
+
+impl Display for KubernetesVerb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let verb_str = match self {
+            KubernetesVerb::Create => "CREATE",
+            KubernetesVerb::Get => "GET",
+            KubernetesVerb::List => "LIST",
+            KubernetesVerb::Update => "UPDATE",
+            KubernetesVerb::Patch => "PATCH",
+            KubernetesVerb::Delete => "DELETE",
+            KubernetesVerb::Watch => "WATCH",
+        };
+        write!(f, "{}", verb_str)
+    }
 }
 
 #[derive(Debug, Clone)]

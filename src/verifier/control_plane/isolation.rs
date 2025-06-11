@@ -121,6 +121,13 @@ async fn test_tenant_autonomy(
         KubernetesVerb::Watch => test_watch_operation(tenant, object_kind).await,
     };
 
+    println!(
+        "Testing autonomy for {} {}: {:?}",
+        object_kind.kind(),
+        verb,
+        result
+    );
+
     match result {
         Ok(_) => OperationResult {
             verb,
@@ -150,6 +157,10 @@ async fn test_cross_tenant_isolation(
 
     let create_result = create_test_object(tenant1, object_kind, &object_name).await;
     if create_result.is_err() {
+        println!(
+            "Failed to create test object for isolation test: {}",
+            create_result.unwrap_err()
+        );
         return OperationResult {
             verb,
             success: true, // If we can't create, isolation is irrelevant for this test
@@ -175,15 +186,21 @@ async fn test_cross_tenant_isolation(
     // Cleanup
     let _ = cleanup_test_object(tenant1, object_kind, &object_name).await;
 
+    println!(
+        "Testing isolation (cross) for {} {}: {:?}",
+        object_kind.kind(),
+        verb,
+        access_result
+    );
     match access_result {
-        Ok(_) => OperationResult {
+        Err(_) => OperationResult {
             verb,
             success: false, // If tenant2 can access tenant1's object, isolation failed
             error_reason: Some(
                 "Cross-tenant access was successful - isolation breach detected".to_string(),
             ),
         },
-        Err(_) => OperationResult {
+        Ok(_) => OperationResult {
             verb,
             success: true, // If tenant2 cannot access tenant1's object, isolation works
             error_reason: None,
@@ -209,11 +226,7 @@ async fn test_list_operation(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> Result<()> {
-    let resource_name = if object_kind.kind() == "Namespace" {
-        "namespaces"
-    } else {
-        &object_kind.kind().to_lowercase()
-    };
+    let resource_name = object_kind.plural_kind();
 
     let namespace = if object_kind.is_namespaced() {
         Some(tenant.namespace.as_str())
@@ -223,7 +236,7 @@ async fn test_list_operation(
 
     let is_authorized = tenant
         .cluster
-        .is_authorized_to("list", resource_name, namespace)
+        .is_authorized_to("list", &resource_name, namespace)
         .await?;
 
     if is_authorized {
@@ -240,11 +253,7 @@ async fn test_get_operation(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> Result<()> {
-    let resource_name = if object_kind.kind() == "Namespace" {
-        "namespaces"
-    } else {
-        &object_kind.kind().to_lowercase()
-    };
+    let resource_name = object_kind.plural_kind();
 
     let namespace = if object_kind.is_namespaced() {
         Some(tenant.namespace.as_str())
@@ -254,7 +263,7 @@ async fn test_get_operation(
 
     let is_authorized = tenant
         .cluster
-        .is_authorized_to("get", resource_name, namespace)
+        .is_authorized_to("get", &resource_name, namespace)
         .await?;
 
     if is_authorized {
@@ -271,7 +280,7 @@ async fn test_update_operation(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> Result<()> {
-    let resource_name = &object_kind.kind().to_lowercase();
+    let resource_name = object_kind.plural_kind();
     let namespace = if object_kind.is_namespaced() {
         Some(tenant.namespace.as_str())
     } else {
@@ -280,7 +289,7 @@ async fn test_update_operation(
 
     let is_authorized = tenant
         .cluster
-        .is_authorized_to("update", resource_name, namespace)
+        .is_authorized_to("update", &resource_name, namespace)
         .await?;
 
     if is_authorized {
@@ -297,7 +306,7 @@ async fn test_patch_operation(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> Result<()> {
-    let resource_name = &object_kind.kind().to_lowercase();
+    let resource_name = object_kind.plural_kind();
     let namespace = if object_kind.is_namespaced() {
         Some(tenant.namespace.as_str())
     } else {
@@ -306,7 +315,7 @@ async fn test_patch_operation(
 
     let is_authorized = tenant
         .cluster
-        .is_authorized_to("patch", resource_name, namespace)
+        .is_authorized_to("patch", &resource_name, namespace)
         .await?;
 
     if is_authorized {
@@ -323,7 +332,7 @@ async fn test_delete_operation(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> Result<()> {
-    let resource_name = &object_kind.kind().to_lowercase();
+    let resource_name = object_kind.plural_kind();
     let namespace = if object_kind.is_namespaced() {
         Some(tenant.namespace.as_str())
     } else {
@@ -332,7 +341,7 @@ async fn test_delete_operation(
 
     let is_authorized = tenant
         .cluster
-        .is_authorized_to("delete", resource_name, namespace)
+        .is_authorized_to("delete", &resource_name, namespace)
         .await?;
 
     if is_authorized {
@@ -349,7 +358,7 @@ async fn test_watch_operation(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> Result<()> {
-    let resource_name = &object_kind.kind().to_lowercase();
+    let resource_name = object_kind.plural_kind();
     let namespace = if object_kind.is_namespaced() {
         Some(tenant.namespace.as_str())
     } else {
@@ -358,7 +367,7 @@ async fn test_watch_operation(
 
     let is_authorized = tenant
         .cluster
-        .is_authorized_to("watch", resource_name, namespace)
+        .is_authorized_to("watch", &resource_name, namespace)
         .await?;
 
     if is_authorized {
@@ -435,6 +444,39 @@ async fn test_cross_tenant_update(
         }
     }));
 
+    // Print the whole resource from the cluster for debugging
+    let resource = tenant1
+        .cluster
+        .get_resource_dyn(object_kind, object_name, Some(tenant1.namespace.as_str()))
+        .await;
+    if let Ok(resource) = resource {
+        println!(
+            "Resource before update: {}",
+            serde_json::to_string_pretty(&resource).unwrap()
+        );
+    } else {
+        println!(
+            "Failed to get resource for debugging: {}",
+            resource.unwrap_err()
+        );
+        // try to get the resource from tenant2
+        let resource = tenant2
+            .cluster
+            .get_resource_dyn(object_kind, object_name, Some(tenant1.namespace.as_str()))
+            .await;
+        if let Ok(resource) = resource {
+            println!(
+                "Resource from tenant2 before update: {}",
+                serde_json::to_string_pretty(&resource).unwrap()
+            );
+        } else {
+            println!(
+                "Failed to get resource from tenant2 for debugging: {}",
+                resource.unwrap_err()
+            );
+        }
+    }
+
     // Attempt to update an object created by tenant1 in tenant2's namespace
     let namespace = tenant1.namespace.as_str();
     let update_result = tenant2
@@ -443,10 +485,11 @@ async fn test_cross_tenant_update(
         .await;
     if update_result.is_ok() {
         Err(anyhow::anyhow!(
-            "Cross-tenant access detected: {} {} updated in {}",
+            "Cross-tenant access detected: {} {} updated in {} ({:?})",
             object_kind.kind(),
             object_name,
-            namespace
+            namespace,
+            update_result.unwrap()
         ))
     } else {
         Ok(())
@@ -558,6 +601,14 @@ fn create_minimal_object(
 
     // Add kind-specific required fields
     match object_kind {
+        KubernetesObject::Pod => {
+            base_object["spec"] = serde_json::json!({
+                "containers": [{
+                    "name": "test-container",
+                    "image": "nginx:latest"
+                }]
+            });
+        }
         KubernetesObject::Deployment => {
             base_object["spec"] = serde_json::json!({
                 "replicas": 1,

@@ -88,6 +88,10 @@ macro_rules! define_kubernetes_objects {
             pub fn cluster_scoped_resources() -> Vec<Self> {
                 Self::all().into_iter().filter(|obj| !obj.is_namespaced()).collect()
             }
+
+            pub fn plural_kind(&self) -> String {
+                format!("{}s", self.kind().to_lowercase())
+            }
         }
 
         $(
