@@ -46,8 +46,15 @@ impl KubernetesCluster {
     pub async fn infer() -> Result<Self> {
         let config = Config::infer().await?;
         let client = Client::try_from(config).context("Failed to create client")?;
-        let discovery = Arc::new(Discovery::new(client.clone()));
-        Ok(Self { client, discovery })
+        let discovery = Discovery::new(client.clone())
+            .run()
+            .await
+            .context("Failed to run discovery")?;
+
+        Ok(Self {
+            client,
+            discovery: Arc::new(discovery),
+        })
     }
 
     pub fn client(&self) -> Client {
@@ -59,8 +66,15 @@ impl KubernetesCluster {
         let options = KubeConfigOptions::default();
         let config = Config::from_custom_kubeconfig(kubeconfig, &options).await?;
         let client = Client::try_from(config)?;
-        let discovery = Arc::new(Discovery::new(client.clone()));
-        Ok(Self { client, discovery })
+        let discovery = Discovery::new(client.clone())
+            .run()
+            .await
+            .context("Failed to run discovery")?;
+
+        Ok(Self {
+            client,
+            discovery: Arc::new(discovery),
+        })
     }
 
     pub async fn patch_cluster_resource<R, P>(
@@ -450,11 +464,7 @@ impl KubernetesCluster {
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
 
         // get the resource
-        let resource = if let Some(ns) = namespace {
-            api.get(resource_name).await
-        } else {
-            api.get(resource_name).await
-        };
+        let resource = api.get(resource_name).await;
 
         match resource {
             Ok(res) => Ok(res),
@@ -529,13 +539,9 @@ impl KubernetesCluster {
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
 
         // patch the resource
-        let patched_resource = if let Some(ns) = namespace {
-            api.patch(resource_name, &PatchParams::default(), patch)
-                .await
-        } else {
-            api.patch(resource_name, &PatchParams::default(), patch)
-                .await
-        };
+        let patched_resource = api
+            .patch(resource_name, &PatchParams::default(), patch)
+            .await;
 
         patched_resource.map_err(|e| anyhow!("Failed to patch resource {}: {}", resource_name, e))
     }
@@ -553,11 +559,7 @@ impl KubernetesCluster {
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
 
         // create the resource
-        let created_resource = if let Some(ns) = namespace {
-            api.create(&PostParams::default(), dynamic_object).await
-        } else {
-            api.create(&PostParams::default(), dynamic_object).await
-        };
+        let created_resource = api.create(&PostParams::default(), dynamic_object).await;
 
         created_resource.map_err(|e| anyhow!("Failed to create resource: {}", e))
     }
@@ -584,6 +586,17 @@ impl KubernetesCluster {
             })
             .min_by_key(|(group, _res)| group.name())
             .map(|(_, res)| res)
+    }
+    pub fn debug_available_resources(&self) -> Vec<String> {
+        self.discovery
+            .groups()
+            .flat_map(|group| {
+                group
+                    .resources_by_stability()
+                    .into_iter()
+                    .map(|(res, _)| format!("{}/{} (kind: {})", group.name(), res.plural, res.kind))
+            })
+            .collect()
     }
 
     fn dynamic_api(
