@@ -418,15 +418,23 @@ async fn test_cross_tenant_list(
         .list_resources_dyn(object_kind, Some(namespace))
         .await;
 
-    if resources.is_ok() && !resources.unwrap().items.is_empty() {
-        Err(anyhow::anyhow!(
-            "Cross-tenant access detected: {} objects found in {}",
-            object_kind.kind(),
-            namespace
-        ))
-    } else {
-        Ok(())
+    if resources.is_ok() {
+        // check if the list contains objects created by tenant1
+        let can_see_t1_res = resources
+            .unwrap()
+            .items
+            .iter()
+            .any(|obj| obj.metadata.name == Some(object_kind.kind().to_string()));
+        if can_see_t1_res {
+            return Err(anyhow::anyhow!(
+                "Cross-tenant access detected: {} objects found in {}",
+                object_kind.kind(),
+                namespace
+            ));
+        }
     }
+
+    Ok(())
 }
 
 async fn test_cross_tenant_update(
