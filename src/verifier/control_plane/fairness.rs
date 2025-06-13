@@ -221,6 +221,18 @@ pub async fn check_fairness(
     let (baseline_metrics_t1, baseline_metrics_history_t1) = baseline_test_t1;
     let (baseline_metrics_t2, baseline_metrics_history_t2) = baseline_test_t2;
 
+    // Export baseline data immediately after collection
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    save_baseline_csv_data(
+        &baseline_metrics_history_t1,
+        &baseline_metrics_history_t2,
+        timestamp,
+    )
+    .await?;
+
     // cleanup(&tenant1).await?;
     // cleanup(&tenant2).await?;
 
@@ -315,6 +327,82 @@ pub async fn check_fairness(
     save_csv_data(&test_results, timestamp).await?;
 
     Ok(test_passed)
+}
+
+async fn save_baseline_csv_data(
+    tenant1_metrics: &[RequestMetrics],
+    tenant2_metrics: &[RequestMetrics],
+    timestamp: u64,
+) -> Result<()> {
+    use tokio::fs;
+
+    let baseline_t1_filename = format!("fairness_baseline_tenant1_{}.csv", timestamp);
+    let baseline_t2_filename = format!("fairness_baseline_tenant2_{}.csv", timestamp);
+
+    let mut t1_csv_content =
+        String::from("start_time,role,duration_ms,operation,resource,is_error\n");
+    let mut t2_csv_content =
+        String::from("start_time,role,duration_ms,operation,resource,is_error\n");
+
+    for point in tenant1_metrics {
+        t1_csv_content.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            point.start_time_seconds,
+            point.initiator_role,
+            point.duration.as_millis(),
+            point.operation,
+            point.request_type,
+            point.is_error
+        ));
+    }
+
+    for point in tenant2_metrics {
+        t2_csv_content.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            point.start_time_seconds,
+            point.initiator_role,
+            point.duration.as_millis(),
+            point.operation,
+            point.request_type,
+            point.is_error
+        ));
+    }
+
+    fs::write(&baseline_t1_filename, t1_csv_content).await?;
+    fs::write(&baseline_t2_filename, t2_csv_content).await?;
+
+    println!("Baseline CSV data saved to: {}", baseline_t1_filename);
+    println!("Baseline CSV data saved to: {}", baseline_t2_filename);
+
+    // Also save baseline metadata
+    let baseline_metadata_filename = format!("fairness_baseline_metadata_{}.csv", timestamp);
+    let baseline_t1_avg = AverageMetrics::calculate(tenant1_metrics);
+    let baseline_t2_avg = AverageMetrics::calculate(tenant2_metrics);
+
+    let baseline_metadata = serde_json::json!({
+        "tenant1_metrics": {
+            "avg_latency_ms": baseline_t1_avg.average_duration.as_millis(),
+            "total_requests": baseline_t1_avg.total_requests,
+            "error_rate": baseline_t1_avg.error_rate,
+            "std_deviation_ms": baseline_t1_avg.std_deviation.as_millis()
+        },
+        "tenant2_metrics": {
+            "avg_latency_ms": baseline_t2_avg.average_duration.as_millis(),
+            "total_requests": baseline_t2_avg.total_requests,
+            "error_rate": baseline_t2_avg.error_rate,
+            "std_deviation_ms": baseline_t2_avg.std_deviation.as_millis()
+        },
+        "test_phase": "baseline"
+    });
+
+    fs::write(
+        &baseline_metadata_filename,
+        serde_json::to_string_pretty(&baseline_metadata)?,
+    )
+    .await?;
+    println!("Baseline metadata saved to: {}", baseline_metadata_filename);
+
+    Ok(())
 }
 
 async fn save_csv_data(results: &FairnessTestResults, timestamp: u64) -> Result<()> {
