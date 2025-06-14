@@ -1054,6 +1054,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kumuteva"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "rand 0.9.0",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tokio-util",
+ "yaml-rust2",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.169"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1105,25 +1124,6 @@ dependencies = [
  "libc",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "multi_tenancy_verifier"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "futures",
- "k8s-openapi",
- "kube",
- "rand 0.9.0",
- "schemars",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokio",
- "tokio-util",
- "yaml-rust2",
 ]
 
 [[package]]
