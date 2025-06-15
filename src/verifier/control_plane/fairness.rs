@@ -371,7 +371,7 @@ async fn save_baseline_csv_data(
     println!("Baseline CSV data saved to: {}", baseline_t2_filename);
 
     // Also save baseline metadata
-    let baseline_metadata_filename = format!("fairness_baseline_metadata_{}.csv", timestamp);
+    let baseline_metadata_filename = format!("fairness_baseline_metadata_{}.json", timestamp);
     let baseline_t1_avg = AverageMetrics::calculate(tenant1_metrics);
     let baseline_t2_avg = AverageMetrics::calculate(tenant2_metrics);
 
