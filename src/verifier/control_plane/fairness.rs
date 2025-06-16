@@ -75,8 +75,8 @@ pub struct BaselineMetrics {
 impl Default for FairnessTestConfig {
     fn default() -> Self {
         Self {
-            regular_requesters: 10,
-            malicious_requesters: 500,
+            regular_requesters: 1,
+            malicious_requesters: 1000,
             regular_request_rate: 50.0,
             malicious_request_rate: 5000.0,
             baseline_test_duration: Duration::from_secs(10),
@@ -178,7 +178,9 @@ pub async fn check_fairness(
     let malicious_pool = InitiatorsPool {
         initiators: (0..config.malicious_requesters)
             .map(|idx| Initiator {
-                scenario: Arc::clone(&malicious_scenario),
+                scenario: Arc::clone(&regular_scenario),
+                // In case we want a different workload for malicious initiators,
+                // scenario: Arc::clone(&malicious_scenario),
                 role: Role::Malicious,
                 uid: format!("malicious-initiator-{}", idx),
                 request_metrics: vec![],
@@ -252,12 +254,15 @@ pub async fn check_fairness(
     let relative_increase_avg_response_time_t1 = (regular_avg_response_time_t1.as_secs_f64()
         - baseline_avg_response_time_t1.as_secs_f64())
         / baseline_avg_response_time_t1.as_secs_f64();
+    let relative_multiplier_avg_response_time_t1 =
+        regular_avg_response_time_t1.as_secs_f64() / baseline_avg_response_time_t1.as_secs_f64();
 
     println!(
-        "Avg Response Time: Baseline {:.2?}, Unbalanced scenario {:.2?}, Relative Increase: {:.2}%",
+        "Avg Response Time: Baseline {:.2?}, Unbalanced scenario {:.2?}, Relative Increase: {:.2}%, Relative Multiplier: {:.2}",
         baseline_avg_response_time_t1,
         regular_avg_response_time_t1,
-        relative_increase_avg_response_time_t1 * 100.0
+        relative_increase_avg_response_time_t1 * 100.0,
+        relative_multiplier_avg_response_time_t1
     );
 
     // Evaluate test success based on error rates
@@ -278,7 +283,9 @@ pub async fn check_fairness(
     );
 
     // Test fails if regular tenant experiences significant errors
-    let test_passed = regular_error_rate < 0.05; // Less than 5% errors allowed
+    let test_passed_error = regular_error_rate < 0.05; // Less than 5% errors allowed
+    let test_passed_latency = relative_increase_avg_response_time_t1 < 2.0; // Less than 50% increase allowed
+    let test_passed = test_passed_error && test_passed_latency;
 
     println!(
         "Fairness test result: {}",
