@@ -1,9 +1,16 @@
-KV_VER="1.3.0"
+KV_VER="v1.5.0"
 USE_NESTED_VIRTUALIZATION="n"
 KUBECONFIG_PATH="$1"
+
 if [ -z "$KUBECONFIG_PATH" ]; then
     echo "Usage: $0 <kubeconfig_path>"
     exit 1
+fi
+
+# Check if KubeVirt is already installed
+if kubectl get ns kubevirt --kubeconfig "$KUBECONFIG_PATH" &>/dev/null; then
+    echo "KubeVirt is already installed. Exiting."
+    exit 0
 fi
 
 # deploy required CRDs
