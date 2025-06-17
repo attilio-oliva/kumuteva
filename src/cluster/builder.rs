@@ -356,7 +356,7 @@ impl KubernetesClusterBuilder {
         // create this crd resource
         create_tenant(&cluster, tenant_resource).await?;
 
-        let output = Command::new("capsule/create-user.sh")
+        let output = Command::new("provisioner/capsule/create-user.sh")
             .arg(&tenant_admin_user)
             .arg(tenant_name)
             .output()

@@ -1,0 +1,17 @@
+controlPlane:
+  distro:
+    k8s:
+      enabled: true
+  backingStore:
+    etcd:
+      deploy:
+        enabled: true
+exportKubeConfig:
+  insecure: true
+sync:
+  fromHost:
+    nodes:
+      enabled: true
+      syncBackChanges: true
+    storageClasses:
+      enabled: true
