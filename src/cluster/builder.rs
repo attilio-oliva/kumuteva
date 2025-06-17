@@ -25,7 +25,7 @@ pub enum ControlPlaneIsolation {
     Capsule(String),
     /// vCluster virtual control plane in the given namespace
     VCluster(String),
-    KubeVirt,
+    KubeVirt(String),
 }
 
 #[derive(Debug, Clone)]
@@ -173,8 +173,8 @@ impl KubernetesClusterBuilder {
                 self.dummy_control_plane_isolation(&namespace).await
             }
 
-            ControlPlaneIsolation::KubeVirt => {
-                Err(anyhow!("KubeVirt isolation is not implemented yet"))
+            ControlPlaneIsolation::KubeVirt(namespace) => {
+                self.deploy_kubevirt_cluster(&namespace).await
             }
         }
     }
@@ -532,6 +532,27 @@ impl KubernetesClusterBuilder {
         // Basically, we are not isolating the control plane and reusing the same kubeconfig
         let kubeconfig = std::fs::read_to_string(&self.kind_cluster.kubeconfig_path)?;
         std::fs::write(&self.kubeconfig_path, kubeconfig)?;
+        Ok(())
+    }
+
+    async fn deploy_kubevirt_cluster(&self, namespace: &str) -> anyhow::Result<()> {
+        let tenant1_service = self.kind_cluster.port_mappings.tenant1.clone();
+        let tenant2_service = self.kind_cluster.port_mappings.tenant2.clone();
+        // Use the shell script to deploy KubeVirt
+        let output = Command::new("provisioner/kubevirt/deploy-kubevirt.sh")
+            .arg(namespace)
+            .arg(tenant1_service.host_port.to_string())
+            .arg(tenant2_service.host_port.to_string())
+            .output()
+            .context("Failed to execute KubeVirt deployment script")?;
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        }
+        // Wait for KubeVirt to be ready
+        let tenant_cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
+        tenant_cluster.ensure_cluster_is_ready().await?;
+        tenant_cluster.create_namespace(namespace).await?;
+
         Ok(())
     }
 }
