@@ -432,9 +432,9 @@ impl KubernetesClusterBuilder {
             .list_pods_with_label_in_namespace(label, namespace)
             .await?;
 
-        // retry up to 5 times
+        // retry up to 10 times
 
-        for _ in 0..5 {
+        for _ in 0..10 {
             if !pods.items.is_empty() {
                 break;
             }
