@@ -1,73 +1,21 @@
-use std::{
-    fs::File,
-    io::Write,
-    path::{Path, PathBuf},
-    process::{self, Command},
-    str,
-};
+use std::{fs::File, io::Write, path::Path, process::Command, str};
 
-use anyhow::{Context, Error, Result};
+use anyhow::Context;
 use serde_json::json;
 
-#[derive(Debug, Clone)]
-pub struct KindCluster {
-    pub name: String,
-    pub kubeconfig_path: PathBuf,
-    pub port_mappings: TenantsPortMapping,
-}
+use crate::cluster::{terminal_stderr_to_error, ClusterProvider, HostCluster, TenantsPortMapping};
+
+pub type KindCluster = HostCluster<KindProvider>;
 
 #[derive(Debug, Clone)]
-pub struct TenantsPortMapping {
-    pub tenant1: PortMapping,
-    pub tenant2: PortMapping,
-}
+pub struct KindProvider;
 
-#[derive(Debug, Clone)]
-pub struct PortMapping {
-    pub container_port: u16,
-    pub host_port: u16,
-}
-
-impl Default for TenantsPortMapping {
-    fn default() -> Self {
-        Self {
-            tenant1: PortMapping {
-                container_port: 30010,
-                host_port: 30001,
-            },
-            tenant2: PortMapping {
-                container_port: 30020,
-                host_port: 30002,
-            },
-        }
-    }
-}
-
-impl TenantsPortMapping {
-    pub fn new(tenant1: PortMapping, tenant2: PortMapping) -> Self {
-        Self { tenant1, tenant2 }
-    }
-
-    pub fn from_tuple(tenant1: (u16, u16), tenant2: (u16, u16)) -> Self {
-        Self {
-            tenant1: PortMapping {
-                container_port: tenant1.0,
-                host_port: tenant1.1,
-            },
-            tenant2: PortMapping {
-                container_port: tenant2.0,
-                host_port: tenant2.1,
-            },
-        }
-    }
-}
-
-impl KindCluster {
-    pub fn create(
+impl ClusterProvider for KindProvider {
+    async fn create(
         name: &str,
-        kubeconfig_path: PathBuf,
+        kubeconfig_path: &Path,
         tenants_port_mapping: TenantsPortMapping,
-    ) -> Result<Self> {
+    ) -> anyhow::Result<()> {
         let (tenant1_mapping, tenant2_mapping) =
             (&tenants_port_mapping.tenant1, &tenants_port_mapping.tenant2);
 
@@ -101,24 +49,22 @@ impl KindCluster {
         let output = Command::new("kind")
             .arg("create")
             .arg("cluster")
+            .arg("--name")
+            .arg(name)
             .arg("--config")
             .arg(config_path)
             .output()
             .context("Failed to execute kind create command")?;
 
         if output.status.success() {
-            let name = String::from(name);
-            Self::export_kubeconfig(&name, &kubeconfig_path)?;
-            Ok(Self {
-                name,
-                kubeconfig_path,
-                port_mappings: tenants_port_mapping,
-            })
+            Self::export_kubeconfig(name, kubeconfig_path).await?;
+            Ok(())
         } else {
             Err(terminal_stderr_to_error(output))
         }
     }
-    pub fn exists(name: &str) -> Result<bool> {
+
+    async fn exists(name: &str) -> anyhow::Result<bool> {
         let output = Command::new("kind")
             .arg("get")
             .arg("clusters")
@@ -134,35 +80,7 @@ impl KindCluster {
         }
     }
 
-    pub fn load(name: &str, kubeconfig_path: PathBuf) -> Result<Self> {
-        // Check if the cluster exists
-        let output = Command::new("kind")
-            .arg("get")
-            .arg("clusters")
-            .output()
-            .context("Failed to execute kind get clusters command")?;
-
-        if output.status.success() {
-            let clusters = str::from_utf8(&output.stdout)
-                .context("Failed to parse kind get clusters output")?;
-            if clusters.contains(name) {
-                let name = String::from(name);
-                Self::export_kubeconfig(&name, &kubeconfig_path)?;
-                Ok(Self {
-                    name,
-                    kubeconfig_path,
-                    // TODO: load port mappings by parsing the kind cluster config
-                    port_mappings: TenantsPortMapping::default(),
-                })
-            } else {
-                Err(Error::msg("Cluster does not exist"))
-            }
-        } else {
-            Err(terminal_stderr_to_error(output))
-        }
-    }
-
-    fn export_kubeconfig(name: &str, path: &Path) -> Result<()> {
+    async fn export_kubeconfig(name: &str, path: &Path) -> anyhow::Result<()> {
         let output = Command::new("kind")
             .arg("get")
             .arg("kubeconfig")
@@ -181,12 +99,12 @@ impl KindCluster {
         }
     }
 
-    pub fn delete(&self) -> Result<()> {
+    async fn delete_cluster(name: &str) -> anyhow::Result<()> {
         let output = Command::new("kind")
             .arg("delete")
             .arg("cluster")
             .arg("--name")
-            .arg(&self.name)
+            .arg(name)
             .output()
             .context("Failed to execute kind delete command")?;
 
@@ -200,22 +118,19 @@ impl KindCluster {
     }
 }
 
-fn terminal_stderr_to_error(output: process::Output) -> Error {
-    let stderr = str::from_utf8(&output.stderr)
-        .unwrap_or("Non utf-8 characters in stderr")
-        .to_string();
-    Error::msg(stderr)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use crate::cluster::PortMapping;
+
     use super::*;
 
     const CLUSTER_NAME: &str = "test-cluster";
     const TEMP_KUBECONFIG_PATH: &str = "/tmp/kubeconfig";
 
-    #[test]
-    fn test_create_and_delete_kind_cluster() {
+    #[tokio::test]
+    async fn test_create_and_delete_kind_cluster() {
         let dummy_port_mapping = TenantsPortMapping {
             tenant1: PortMapping {
                 container_port: 31111,
@@ -230,7 +145,9 @@ mod tests {
             CLUSTER_NAME,
             PathBuf::from(TEMP_KUBECONFIG_PATH),
             dummy_port_mapping,
-        );
+        )
+        .await;
+
         assert!(
             cluster.is_ok(),
             "Failed to create a Kind cluster: {:?}",
@@ -240,14 +157,15 @@ mod tests {
         let cluster = cluster.unwrap();
 
         // check if the new cluster exists and can be loaded
-        let load_cluster = KindCluster::load(CLUSTER_NAME, PathBuf::from(TEMP_KUBECONFIG_PATH));
+        let load_cluster =
+            KindCluster::load(CLUSTER_NAME, PathBuf::from(TEMP_KUBECONFIG_PATH)).await;
         assert!(
             load_cluster.is_ok(),
             "Failed to load Kind cluster: {:?}",
             load_cluster.err()
         );
 
-        let deletion = cluster.delete();
+        let deletion = cluster.delete().await;
         assert!(
             deletion.is_ok(),
             "Failed to delete Kind cluster: {:?}",

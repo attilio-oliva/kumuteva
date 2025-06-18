@@ -1,5 +1,5 @@
 use crate::{
-    cluster::{KubernetesCluster, NGINX_POD},
+    cluster::{KubernetesClient, NGINX_POD},
     verifier::TenantClusterConfig,
 };
 
@@ -27,7 +27,7 @@ pub async fn check_object_isolation(
 }
 
 async fn deploy_tenant_pod(
-    cluster: &KubernetesCluster,
+    cluster: &KubernetesClient,
     pod_name: &str,
     namespace: &str,
 ) -> Result<()> {
@@ -45,7 +45,7 @@ async fn deploy_tenant_pod(
 }
 
 async fn assert_pod_isolation(
-    other_cluster: &KubernetesCluster,
+    other_cluster: &KubernetesClient,
     pod_name: &str,
     namespace: &str,
 ) -> bool {
@@ -56,7 +56,7 @@ async fn assert_pod_isolation(
 }
 
 async fn cleanup_tenant_pod(
-    cluster: &KubernetesCluster,
+    cluster: &KubernetesClient,
     pod_name: &str,
     namespace: &str,
 ) -> Result<()> {

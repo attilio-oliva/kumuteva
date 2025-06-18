@@ -1,10 +1,10 @@
 mod builder;
-mod kind;
-mod kubernetes;
+mod client;
+mod provider;
 
 pub use builder::*;
-pub use kind::*;
-pub use kubernetes::KubernetesCluster;
+pub use client::KubernetesClient;
+pub use provider::*;
 
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
 use kube::api::ObjectMeta;

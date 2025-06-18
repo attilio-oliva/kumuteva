@@ -33,11 +33,11 @@ use super::DummyCRD;
 
 /// An abstraction over a Kubernetes client.
 /// This struct is used to interact with a Kubernetes cluster using `kube` crate.
-pub struct KubernetesCluster {
+pub struct KubernetesClient {
     client: Client,
 }
 
-impl KubernetesCluster {
+impl KubernetesClient {
     pub async fn infer() -> Result<Self> {
         let config = Config::infer().await?;
         let client = Client::try_from(config).context("Failed to create client")?;
@@ -54,6 +54,20 @@ impl KubernetesCluster {
         let config = Config::from_custom_kubeconfig(kubeconfig, &options).await?;
         let client = Client::try_from(config)?;
         Ok(Self { client })
+    }
+
+    pub async fn is_healthy(&self) -> bool {
+        // Use the /healthz endpoint to check cluster health
+        match self.client.apiserver_version().await {
+            Ok(_) => {
+                // If we can get the API server version, the cluster is healthy
+                true
+            }
+            Err(_) => {
+                // If we can't get the API server version, the cluster is not healthy
+                false
+            }
+        }
     }
 
     pub async fn patch_cluster_resource<R, P>(
@@ -507,8 +521,8 @@ impl KubernetesCluster {
         let mut stream = api.watch(&lp, "0").await?.boxed();
 
         while let Some(status) = stream.try_next().await? {
-            if let WatchEvent::Added(s) = status {
-                //println!("Resource added: {:?}", s.name());
+            if let WatchEvent::Added(_s) = status {
+                //println!("Resource added: {:?}", _s.name());
                 return Ok(());
             } else {
                 //println!("New event on resource: {:?}", status);
@@ -871,13 +885,13 @@ async fn get_output(mut attached: AttachedProcess) -> String {
     out
 }
 
-impl From<Client> for KubernetesCluster {
+impl From<Client> for KubernetesClient {
     fn from(client: Client) -> Self {
         Self { client }
     }
 }
-impl From<KubernetesCluster> for Client {
-    fn from(cluster: KubernetesCluster) -> Self {
+impl From<KubernetesClient> for Client {
+    fn from(cluster: KubernetesClient) -> Self {
         cluster.client
     }
 }
@@ -887,7 +901,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::cluster::KindCluster;
-    use crate::cluster::KubernetesCluster;
+    use crate::cluster::KubernetesClient;
     use crate::cluster::NGINX_POD;
 
     const CLUSTER_NAME_PREFIX: &str = "test-k8s";
@@ -899,19 +913,19 @@ mod tests {
         path
     }
 
-    fn setup_kind_cluster(name: &str) -> anyhow::Result<KindCluster> {
+    async fn setup_kind_cluster(name: &str) -> anyhow::Result<KindCluster> {
         let kubeconfig_path = temp_kubeconfig_path(name);
-        KindCluster::create(name, kubeconfig_path, Default::default())
+        KindCluster::create(name, kubeconfig_path, Default::default()).await
     }
 
     async fn teardown_kind_cluster(cluster: KindCluster) -> anyhow::Result<()> {
-        cluster.delete()
+        cluster.delete().await
     }
 
     #[tokio::test]
     async fn setup_and_use_client() {
         let temp_cluster_name = format!("{}-setup", CLUSTER_NAME_PREFIX);
-        let setup_temp_cluster = setup_kind_cluster(&temp_cluster_name);
+        let setup_temp_cluster = setup_kind_cluster(&temp_cluster_name).await;
         assert!(
             setup_temp_cluster.is_ok(),
             "Failed to setup kind cluster: {:?}",
@@ -921,7 +935,7 @@ mod tests {
         let temp_cluster = setup_temp_cluster.unwrap();
 
         let kubeconfig_path = temp_kubeconfig_path(&temp_cluster_name);
-        let cluster = KubernetesCluster::load(&kubeconfig_path).await;
+        let cluster = KubernetesClient::load(&kubeconfig_path).await;
         assert!(
             cluster.is_ok(),
             "Failed to create client: {:?}",
@@ -952,7 +966,7 @@ mod tests {
     #[tokio::test]
     async fn create_and_delete_pod() {
         let temp_cluster_name = format!("{}-create-delete", CLUSTER_NAME_PREFIX);
-        let setup_temp_cluster = setup_kind_cluster(&temp_cluster_name);
+        let setup_temp_cluster = setup_kind_cluster(&temp_cluster_name).await;
 
         assert!(
             setup_temp_cluster.is_ok(),
@@ -963,7 +977,7 @@ mod tests {
         let temp_cluster = setup_temp_cluster.unwrap();
 
         let kubeconfig_path = temp_kubeconfig_path(&temp_cluster_name);
-        let client = KubernetesCluster::load(&kubeconfig_path).await;
+        let client = KubernetesClient::load(&kubeconfig_path).await;
         assert!(
             client.is_ok(),
             "Failed to create client: {:?}",

@@ -5,9 +5,12 @@ use k8s_openapi::api::{core::v1::Secret, networking::v1::NetworkPolicy};
 use kube::{api::ObjectMeta, runtime::reflector::Lookup};
 use tokio::time::sleep;
 
-use crate::external_crds::{capsule, create_tenant};
+use crate::{
+    cluster::HostClusterType,
+    external_crds::{capsule, create_tenant},
+};
 
-use super::{KindCluster, KubernetesCluster};
+use super::KubernetesClient;
 
 use serde_json::json;
 
@@ -87,15 +90,15 @@ impl From<NetworkIsolationStrategy> for IsolationTechnology {
 }
 
 pub struct KubernetesClusterBuilder {
-    kind_cluster: KindCluster,
+    host_cluster: HostClusterType,
     kubeconfig_path: PathBuf,
     isolation_technologies: Vec<IsolationTechnology>,
 }
 
 impl KubernetesClusterBuilder {
-    pub fn new(kind_cluster: KindCluster) -> Self {
+    pub fn new(host_cluster: HostClusterType) -> Self {
         Self {
-            kind_cluster,
+            host_cluster,
             kubeconfig_path: PathBuf::new(),
             isolation_technologies: vec![],
         }
@@ -115,7 +118,7 @@ impl KubernetesClusterBuilder {
         self
     }
 
-    pub async fn build(self) -> anyhow::Result<KubernetesCluster> {
+    pub async fn build(self) -> anyhow::Result<KubernetesClient> {
         let control_plane_isolation_technologies: Vec<ControlPlaneIsolation> = self
             .isolation_technologies
             .iter()
@@ -144,7 +147,7 @@ impl KubernetesClusterBuilder {
         }
 
         // Ensure that the cluster is ready before applying data plane isolation technologies
-        let _ = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path)
+        let _ = KubernetesClient::load(self.host_cluster.kubeconfig_path())
             .await?
             .ensure_cluster_is_ready()
             .await;
@@ -154,7 +157,7 @@ impl KubernetesClusterBuilder {
                 .await?;
         }
 
-        let kubernetes_cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
+        let kubernetes_cluster = KubernetesClient::load(&self.kubeconfig_path).await?;
         Ok(kubernetes_cluster)
     }
 
@@ -174,6 +177,7 @@ impl KubernetesClusterBuilder {
             }
 
             ControlPlaneIsolation::KubeVirt(namespace) => {
+                println!("Deploying KubeVirt cluster in namespace: {}", namespace);
                 self.deploy_kubevirt_cluster(&namespace).await
             }
         }
@@ -205,7 +209,7 @@ impl KubernetesClusterBuilder {
         &self,
         tenant_namespace: &str,
     ) -> anyhow::Result<()> {
-        let admin_cluster = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path).await?;
+        let admin_cluster = KubernetesClient::load(self.host_cluster.kubeconfig_path()).await?;
         let deny_all_network_policy = json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -327,7 +331,7 @@ impl KubernetesClusterBuilder {
     async fn deploy_capsule_tenant(&self, tenant_name: &str) -> anyhow::Result<()> {
         Self::install_capsule()?;
 
-        let cluster = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path).await?;
+        let cluster = KubernetesClient::load(self.host_cluster.kubeconfig_path()).await?;
 
         let tenant_admin_user = format!("{}-admin", tenant_name);
         // Create the tenant crd
@@ -386,7 +390,7 @@ impl KubernetesClusterBuilder {
         }
 
         // create a namespace for the tenant
-        let tenant_cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
+        let tenant_cluster = KubernetesClient::load(&self.kubeconfig_path).await?;
         tenant_cluster.create_namespace(tenant_name).await?;
 
         Ok(())
@@ -412,7 +416,7 @@ impl KubernetesClusterBuilder {
             .arg(namespace)
             .arg("--create-namespace")
             .arg("--kubeconfig")
-            .arg(&self.kind_cluster.kubeconfig_path)
+            .arg(self.host_cluster.kubeconfig_path())
             .output()
             .context("Failed to execute helm upgrade command")?;
 
@@ -420,7 +424,7 @@ impl KubernetesClusterBuilder {
             return Err(terminal_stderr_to_error(output));
         }
 
-        let cluster = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path).await?;
+        let cluster = KubernetesClient::load(self.host_cluster.kubeconfig_path()).await?;
 
         // Wait for the vcluster api server pod to appear.
         let label = "app=vcluster";
@@ -458,8 +462,8 @@ impl KubernetesClusterBuilder {
         // We need to force the API server port to be on a specific port
         // because the kind mapping takes it and maps it to a different host port
         let tenant_mapping = match namespace {
-            "tenant1" => &self.kind_cluster.port_mappings.tenant1,
-            "tenant2" => &self.kind_cluster.port_mappings.tenant2,
+            "tenant1" => &self.host_cluster.port_mappings().tenant1,
+            "tenant2" => &self.host_cluster.port_mappings().tenant2,
             _ => return Err(anyhow!("No port mapping for namespace {}", namespace)),
         };
 
@@ -492,7 +496,7 @@ impl KubernetesClusterBuilder {
         std::fs::write(&self.kubeconfig_path, kubeconfig)?;
 
         // create a namespace to deploy workloads
-        let tenant_cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
+        let tenant_cluster = KubernetesClient::load(&self.kubeconfig_path).await?;
         tenant_cluster.ensure_cluster_is_ready().await?;
         tenant_cluster.create_namespace(namespace).await?;
 
@@ -500,7 +504,7 @@ impl KubernetesClusterBuilder {
     }
 
     async fn get_vcluster_kubeconfig(
-        cluster: &KubernetesCluster,
+        cluster: &KubernetesClient,
         namespace: &str,
         vcluster_name: &str,
     ) -> anyhow::Result<String> {
@@ -526,30 +530,67 @@ impl KubernetesClusterBuilder {
         Ok(config)
     }
     async fn dummy_control_plane_isolation(&self, namespace: &str) -> anyhow::Result<()> {
-        let cluster = KubernetesCluster::load(&self.kind_cluster.kubeconfig_path).await?;
+        let cluster = KubernetesClient::load(self.host_cluster.kubeconfig_path()).await?;
         cluster.create_namespace(namespace).await?;
         // use the kind kubeconfig as the tenant kubeconfig
         // Basically, we are not isolating the control plane and reusing the same kubeconfig
-        let kubeconfig = std::fs::read_to_string(&self.kind_cluster.kubeconfig_path)?;
+        let kubeconfig = std::fs::read_to_string(self.host_cluster.kubeconfig_path())?;
         std::fs::write(&self.kubeconfig_path, kubeconfig)?;
         Ok(())
     }
 
     async fn deploy_kubevirt_cluster(&self, namespace: &str) -> anyhow::Result<()> {
-        let tenant1_service = self.kind_cluster.port_mappings.tenant1.clone();
-        let tenant2_service = self.kind_cluster.port_mappings.tenant2.clone();
+        let tenant1_service = self.host_cluster.port_mappings().tenant1.clone();
+        let tenant2_service = self.host_cluster.port_mappings().tenant2.clone();
+
+        // sleep for a while to ensure the host cluster is ready
+        sleep(Duration::from_secs(10)).await;
+
         // Use the shell script to deploy KubeVirt
         let output = Command::new("provisioner/kubevirt/deploy-kubevirt.sh")
-            .arg(namespace)
-            .arg(tenant1_service.host_port.to_string())
-            .arg(tenant2_service.host_port.to_string())
+            .arg(self.host_cluster.kubeconfig_path())
             .output()
             .context("Failed to execute KubeVirt deployment script")?;
         if !output.status.success() {
             return Err(terminal_stderr_to_error(output));
+        } else {
+            println!(
+                "Kubevirt deployment output: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
         }
+
+        let output = Command::new("provisioner/kubevirt/deploy-capi-provider.sh")
+            .arg(self.host_cluster.kubeconfig_path())
+            .output()
+            .context("Failed to execute CAPI provider deployment script")?;
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        } else {
+            println!(
+                "CAPI provider deployment output: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        let output = Command::new("create-kubevirt-cluster.sh")
+            .arg(self.host_cluster.kubeconfig_path())
+            .arg(self.kubeconfig_path.to_str().unwrap())
+            .arg(namespace)
+            .output()
+            .context("Failed to execute CAPI controller deployment script")?;
+
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        } else {
+            println!(
+                "CAPI controller deployment output: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
         // Wait for KubeVirt to be ready
-        let tenant_cluster = KubernetesCluster::load(&self.kubeconfig_path).await?;
+        let tenant_cluster = KubernetesClient::load(&self.kubeconfig_path).await?;
         tenant_cluster.ensure_cluster_is_ready().await?;
         tenant_cluster.create_namespace(namespace).await?;
 
@@ -626,6 +667,8 @@ fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::cluster::KindCluster;
+
     use super::*;
     use std::path::PathBuf;
 
@@ -639,7 +682,9 @@ mod tests {
     impl TestCluster {
         async fn create(name: &str) -> anyhow::Result<Self> {
             let kubeconfig_path = temp_kubeconfig_path(name);
-            let _ = KindCluster::create(name, kubeconfig_path.clone(), Default::default())?;
+            let _ = KindCluster::create(name, kubeconfig_path.clone(), Default::default())
+                .await
+                .context("Failed to create kind cluster")?;
             Ok(Self {
                 name: name.to_string(),
                 kubeconfig_path,
@@ -655,8 +700,8 @@ mod tests {
     }
 
     async fn teardown_kind_cluster(cluster: TestCluster) -> anyhow::Result<()> {
-        let kind_cluster = KindCluster::load(&cluster.name, cluster.kubeconfig_path)?;
-        kind_cluster.delete()
+        let kind_cluster = KindCluster::load(&cluster.name, cluster.kubeconfig_path).await?;
+        kind_cluster.delete().await
     }
 
     #[tokio::test]
@@ -669,13 +714,17 @@ mod tests {
             temp_kubeconfig_path(format!("{}-inner", temp_cluster_name).as_str());
 
         let namespace = "tenant1";
-        let cluster = KubernetesClusterBuilder::new(
-            KindCluster::load(&temp_cluster_name, kind_kubeconfig_path).unwrap(),
-        )
-        .with_kubeconfig_path(vcluster_kubeconfig_path)
-        .with_isolation_technology(ControlPlaneIsolation::VCluster(String::from(namespace)))
-        .build()
-        .await;
+        let host_cluster = HostClusterType::Kind(
+            KindCluster::load(&temp_cluster_name, kind_kubeconfig_path.clone())
+                .await
+                .unwrap(),
+        );
+
+        let cluster = KubernetesClusterBuilder::new(host_cluster)
+            .with_kubeconfig_path(vcluster_kubeconfig_path)
+            .with_isolation_technology(ControlPlaneIsolation::VCluster(String::from(namespace)))
+            .build()
+            .await;
         assert!(
             cluster.is_ok(),
             "Failed to create client: {:?}",

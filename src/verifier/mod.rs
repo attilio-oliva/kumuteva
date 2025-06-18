@@ -7,7 +7,7 @@ mod data_plane;
 pub use control_plane::*;
 pub use data_plane::*;
 
-use crate::cluster::KubernetesCluster;
+use crate::cluster::KubernetesClient;
 
 pub struct IsolationReport {
     control_plane: ControlPlaneReport,
@@ -360,7 +360,7 @@ impl fmt::Display for TestResult {
 
 /// All the configuration needed to test a tenant cluster isolation.
 pub struct TenantClusterConfig {
-    pub cluster: KubernetesCluster,
+    pub cluster: KubernetesClient,
     /// The namespace to use for the tenant's resources created during the tests.
     pub namespace: String,
 }

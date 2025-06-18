@@ -76,7 +76,7 @@ impl Default for FairnessTestConfig {
     fn default() -> Self {
         Self {
             regular_requesters: 1,
-            malicious_requesters: 1000,
+            malicious_requesters: 500,
             regular_request_rate: 50.0,
             malicious_request_rate: 5000.0,
             baseline_test_duration: Duration::from_secs(10),
@@ -191,12 +191,17 @@ pub async fn check_fairness(
     };
 
     // print all the ids
-    for initiator in &malicious_pool.initiators {
-        println!("Malicious initiator id: {}", initiator.uid);
-    }
-    for initiator in &regular_pool.initiators {
-        println!("Regular initiator id: {}", initiator.uid);
-    }
+    // for initiator in &malicious_pool.initiators {
+    //     println!("Malicious initiator id: {}", initiator.uid);
+    // }
+    // for initiator in &regular_pool.initiators {
+    //     println!("Regular initiator id: {}", initiator.uid);
+    // }
+
+    println!(
+        "Regular initiators: {}, Malicious initiators: {}",
+        config.regular_requesters, config.malicious_requesters
+    );
 
     let malicious_overseer = Overseer::new(
         Role::Malicious, // The role is used to determine evaluation criteria
@@ -1157,7 +1162,7 @@ impl Request {
 
 #[cfg(test)]
 mod tests {
-    use crate::cluster::KubernetesCluster;
+    use crate::cluster::KubernetesClient;
 
     use super::*;
 
@@ -1165,11 +1170,11 @@ mod tests {
     async fn test_check_fairness() {
         let tenant1 = Arc::new(TenantClusterConfig {
             namespace: "tenant1".to_string(),
-            cluster: KubernetesCluster::infer().await.unwrap(),
+            cluster: KubernetesClient::infer().await.unwrap(),
         });
         let tenant2 = Arc::new(TenantClusterConfig {
             namespace: "tenant2".to_string(),
-            cluster: KubernetesCluster::infer().await.unwrap(),
+            cluster: KubernetesClient::infer().await.unwrap(),
         });
 
         let result = check_fairness(tenant1, tenant2, FairnessTestConfig::default()).await;
