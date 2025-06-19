@@ -1,0 +1,15 @@
+{
+  "tenant1_metrics": {
+    "avg_latency_ms": 14,
+    "error_rate": 0.0,
+    "std_deviation_ms": 10,
+    "total_requests": 501
+  },
+  "tenant2_metrics": {
+    "avg_latency_ms": 14,
+    "error_rate": 0.0,
+    "std_deviation_ms": 9,
+    "total_requests": 500
+  },
+  "test_phase": "baseline"
+}
