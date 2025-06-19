@@ -74,11 +74,19 @@ pub struct BaselineMetrics {
 
 impl Default for FairnessTestConfig {
     fn default() -> Self {
+        // Helper function to parse environment variables with defaults
+        fn parse_env_var<T: std::str::FromStr>(var_name: &str, default: T) -> T {
+            std::env::var(var_name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
         Self {
-            regular_requesters: 1,
-            malicious_requesters: 500,
-            regular_request_rate: 50.0,
-            malicious_request_rate: 5000.0,
+            regular_requesters: parse_env_var("REGULAR_REQUESTERS", 1),
+            malicious_requesters: parse_env_var("MALICIOUS_REQUESTERS", 500),
+            regular_request_rate: parse_env_var("REGULAR_REQUEST_RATE", 50.0),
+            malicious_request_rate: parse_env_var("MALICIOUS_REQUEST_RATE", 5000.0),
             baseline_test_duration: Duration::from_secs(10),
             test_duration: Duration::from_secs(60),
             metrics_send_interval: Duration::from_secs(1),
