@@ -467,8 +467,27 @@ impl KubernetesClusterBuilder {
             _ => return Err(anyhow!("No port mapping for namespace {}", namespace)),
         };
 
-        let nodeport = tenant_mapping.container_port;
+        let mut nodeport = tenant_mapping.container_port;
         let host_port = tenant_mapping.host_port;
+
+        // if the cluster is not kind the nodeport = host_port
+        match self.host_cluster {
+            HostClusterType::Kind(_) => {
+                // For kind, we need to create a NodePort service to expose the vcluster API server
+                println!(
+                    "Creating NodePort service for vcluster in namespace {} on port {}",
+                    namespace, nodeport
+                );
+            }
+            _ => {
+                // For other clusters, we assume the host_port is already set correctly
+                println!(
+                    "Using host port {} for vcluster in namespace {}",
+                    host_port, namespace
+                );
+                nodeport = host_port;
+            }
+        }
 
         let selector = Some({
             let mut map = BTreeMap::new();
@@ -573,7 +592,7 @@ impl KubernetesClusterBuilder {
             );
         }
 
-        let output = Command::new("create-kubevirt-cluster.sh")
+        let output = Command::new("provisioner/kubevirt/create-kubevirt-cluster.sh")
             .arg(self.host_cluster.kubeconfig_path())
             .arg(self.kubeconfig_path.to_str().unwrap())
             .arg(namespace)
@@ -600,7 +619,8 @@ impl KubernetesClusterBuilder {
 
 fn terminal_stderr_to_error(output: std::process::Output) -> anyhow::Error {
     anyhow::anyhow!(
-        "Command failed with exit code: {}\nstderr: {}",
+        "{}\nCommand failed with exit code: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         output.status,
         String::from_utf8_lossy(&output.stderr)
     )

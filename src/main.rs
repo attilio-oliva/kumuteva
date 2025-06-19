@@ -85,7 +85,7 @@ enum Commands {
         #[clap(long = "type", short = 't', default_value = "vcluster")]
         kind: ClusterEnvironmentType,
         /// Host cluster provider to use for the underlying cluster
-        #[clap(long = "provider", short = 'p', default_value = "k3s")]
+        #[clap(long = "provider", short = 'p', default_value = "kind")]
         provider: ChosenClusterProvider,
         #[clap(flatten)]
         tenant1: Tenant1SetupConfig,
