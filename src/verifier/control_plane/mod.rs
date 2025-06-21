@@ -139,7 +139,8 @@ impl std::fmt::Display for EnhancedObjectIsolationReport {
 #[cfg(test)]
 mod tests {
     use crate::cluster::{
-        ControlPlaneIsolation, KindCluster, KubernetesCluster, KubernetesClusterBuilder,
+        ControlPlaneIsolation, HostClusterType, KindCluster, KubernetesClient,
+        KubernetesClusterBuilder,
     };
     use crate::verifier::TenantClusterConfig;
     use anyhow::Result;
@@ -168,8 +169,8 @@ mod tests {
         std::env::temp_dir().join(format!("{}.kubeconfig", cluster_name))
     }
 
-    async fn setup_test_cluster(config: &TestClusterConfig) -> Result<KubernetesCluster> {
-        let cluster = KubernetesCluster::load(&config.kubeconfig_path).await?;
+    async fn setup_test_cluster(config: &TestClusterConfig) -> Result<KubernetesClient> {
+        let cluster = KubernetesClient::load(&config.kubeconfig_path).await?;
         cluster.ensure_cluster_is_ready().await?;
         Ok(cluster)
     }
@@ -184,6 +185,7 @@ mod tests {
             config.kubeconfig_path.clone(),
             Default::default(),
         )
+        .await
         .unwrap();
 
         let tenant1_cluster = setup_test_cluster(&config).await.unwrap();
@@ -206,7 +208,7 @@ mod tests {
         .await;
         assert!(result.is_err(), "Native cluster should fail isolation test");
 
-        kind_cluster.delete().unwrap();
+        kind_cluster.delete().await.unwrap();
     }
 
     #[tokio::test]
@@ -218,26 +220,33 @@ mod tests {
             base_config.kubeconfig_path.clone(),
             Default::default(),
         )
+        .await
         .unwrap();
 
         let tenant1_config = TestClusterConfig::new(&format!("tenant1-{}", base_config.name));
         let tenant2_config = TestClusterConfig::new(&format!("tenant2-{}", base_config.name));
 
-        let tenant1_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-            .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant1_config.name.clone()))
-            .with_kubeconfig_path(tenant1_config.kubeconfig_path)
-            .build()
-            .await
-            .unwrap();
+        let tenant1_cluster =
+            KubernetesClusterBuilder::new(HostClusterType::Kind(kind_cluster.clone()))
+                .with_isolation_technology(ControlPlaneIsolation::VCluster(
+                    tenant1_config.name.clone(),
+                ))
+                .with_kubeconfig_path(tenant1_config.kubeconfig_path)
+                .build()
+                .await
+                .unwrap();
 
         tenant1_cluster.ensure_cluster_is_ready().await.unwrap();
 
-        let tenant2_cluster = KubernetesClusterBuilder::new(kind_cluster.clone())
-            .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant2_config.name.clone()))
-            .with_kubeconfig_path(tenant2_config.kubeconfig_path)
-            .build()
-            .await
-            .unwrap();
+        let tenant2_cluster =
+            KubernetesClusterBuilder::new(HostClusterType::Kind(kind_cluster.clone()))
+                .with_isolation_technology(ControlPlaneIsolation::VCluster(
+                    tenant2_config.name.clone(),
+                ))
+                .with_kubeconfig_path(tenant2_config.kubeconfig_path)
+                .build()
+                .await
+                .unwrap();
 
         tenant2_cluster.ensure_cluster_is_ready().await.unwrap();
 
@@ -258,6 +267,6 @@ mod tests {
         .await;
         assert!(result.is_ok(), "VCluster should pass isolation test");
 
-        kind_cluster.delete().unwrap();
+        kind_cluster.delete().await.unwrap();
     }
 }

@@ -74,11 +74,19 @@ pub struct BaselineMetrics {
 
 impl Default for FairnessTestConfig {
     fn default() -> Self {
+        // Helper function to parse environment variables with defaults
+        fn parse_env_var<T: std::str::FromStr>(var_name: &str, default: T) -> T {
+            std::env::var(var_name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
         Self {
-            regular_requesters: 10,
-            malicious_requesters: 500,
-            regular_request_rate: 50.0,
-            malicious_request_rate: 5000.0,
+            regular_requesters: parse_env_var("REGULAR_REQUESTERS", 1),
+            malicious_requesters: parse_env_var("MALICIOUS_REQUESTERS", 500),
+            regular_request_rate: parse_env_var("REGULAR_REQUEST_RATE", 50.0),
+            malicious_request_rate: parse_env_var("MALICIOUS_REQUEST_RATE", 5000.0),
             baseline_test_duration: Duration::from_secs(10),
             test_duration: Duration::from_secs(60),
             metrics_send_interval: Duration::from_secs(1),
@@ -178,7 +186,9 @@ pub async fn check_fairness(
     let malicious_pool = InitiatorsPool {
         initiators: (0..config.malicious_requesters)
             .map(|idx| Initiator {
-                scenario: Arc::clone(&malicious_scenario),
+                scenario: Arc::clone(&regular_scenario),
+                // In case we want a different workload for malicious initiators,
+                // scenario: Arc::clone(&malicious_scenario),
                 role: Role::Malicious,
                 uid: format!("malicious-initiator-{}", idx),
                 request_metrics: vec![],
@@ -189,12 +199,17 @@ pub async fn check_fairness(
     };
 
     // print all the ids
-    for initiator in &malicious_pool.initiators {
-        println!("Malicious initiator id: {}", initiator.uid);
-    }
-    for initiator in &regular_pool.initiators {
-        println!("Regular initiator id: {}", initiator.uid);
-    }
+    // for initiator in &malicious_pool.initiators {
+    //     println!("Malicious initiator id: {}", initiator.uid);
+    // }
+    // for initiator in &regular_pool.initiators {
+    //     println!("Regular initiator id: {}", initiator.uid);
+    // }
+
+    println!(
+        "Regular initiators: {}, Malicious initiators: {}",
+        config.regular_requesters, config.malicious_requesters
+    );
 
     let malicious_overseer = Overseer::new(
         Role::Malicious, // The role is used to determine evaluation criteria
@@ -221,6 +236,18 @@ pub async fn check_fairness(
     let (baseline_metrics_t1, baseline_metrics_history_t1) = baseline_test_t1;
     let (baseline_metrics_t2, baseline_metrics_history_t2) = baseline_test_t2;
 
+    // Export baseline data immediately after collection
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    save_baseline_csv_data(
+        &baseline_metrics_history_t1,
+        &baseline_metrics_history_t2,
+        timestamp,
+    )
+    .await?;
+
     // cleanup(&tenant1).await?;
     // cleanup(&tenant2).await?;
 
@@ -240,12 +267,15 @@ pub async fn check_fairness(
     let relative_increase_avg_response_time_t1 = (regular_avg_response_time_t1.as_secs_f64()
         - baseline_avg_response_time_t1.as_secs_f64())
         / baseline_avg_response_time_t1.as_secs_f64();
+    let relative_multiplier_avg_response_time_t1 =
+        regular_avg_response_time_t1.as_secs_f64() / baseline_avg_response_time_t1.as_secs_f64();
 
     println!(
-        "Avg Response Time: Baseline {:.2?}, Unbalanced scenario {:.2?}, Relative Increase: {:.2}%",
+        "Avg Response Time: Baseline {:.2?}, Unbalanced scenario {:.2?}, Relative Increase: {:.2}%, Relative Multiplier: {:.2}",
         baseline_avg_response_time_t1,
         regular_avg_response_time_t1,
-        relative_increase_avg_response_time_t1 * 100.0
+        relative_increase_avg_response_time_t1 * 100.0,
+        relative_multiplier_avg_response_time_t1
     );
 
     // Evaluate test success based on error rates
@@ -266,7 +296,9 @@ pub async fn check_fairness(
     );
 
     // Test fails if regular tenant experiences significant errors
-    let test_passed = regular_error_rate < 0.05; // Less than 5% errors allowed
+    let test_passed_error = regular_error_rate < 0.05; // Less than 5% errors allowed
+    let test_passed_latency = relative_increase_avg_response_time_t1 < 2.0; // Less than 50% increase allowed
+    let test_passed = test_passed_error && test_passed_latency;
 
     println!(
         "Fairness test result: {}",
@@ -308,13 +340,85 @@ pub async fn check_fairness(
     };
 
     // Save the results to CSV files
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
     save_csv_data(&test_results, timestamp).await?;
 
     Ok(test_passed)
+}
+
+async fn save_baseline_csv_data(
+    tenant1_metrics: &[RequestMetrics],
+    tenant2_metrics: &[RequestMetrics],
+    timestamp: u64,
+) -> Result<()> {
+    use tokio::fs;
+
+    let baseline_t1_filename = format!("fairness_baseline_tenant1_{}.csv", timestamp);
+    let baseline_t2_filename = format!("fairness_baseline_tenant2_{}.csv", timestamp);
+
+    let mut t1_csv_content =
+        String::from("start_time,role,duration_ms,operation,resource,is_error\n");
+    let mut t2_csv_content =
+        String::from("start_time,role,duration_ms,operation,resource,is_error\n");
+
+    for point in tenant1_metrics {
+        t1_csv_content.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            point.start_time_seconds,
+            point.initiator_role,
+            point.duration.as_millis(),
+            point.operation,
+            point.request_type,
+            point.is_error
+        ));
+    }
+
+    for point in tenant2_metrics {
+        t2_csv_content.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            point.start_time_seconds,
+            point.initiator_role,
+            point.duration.as_millis(),
+            point.operation,
+            point.request_type,
+            point.is_error
+        ));
+    }
+
+    fs::write(&baseline_t1_filename, t1_csv_content).await?;
+    fs::write(&baseline_t2_filename, t2_csv_content).await?;
+
+    println!("Baseline CSV data saved to: {}", baseline_t1_filename);
+    println!("Baseline CSV data saved to: {}", baseline_t2_filename);
+
+    // Also save baseline metadata
+    let baseline_metadata_filename = format!("fairness_baseline_metadata_{}.json", timestamp);
+    let baseline_t1_avg = AverageMetrics::calculate(tenant1_metrics);
+    let baseline_t2_avg = AverageMetrics::calculate(tenant2_metrics);
+
+    let baseline_metadata = serde_json::json!({
+        "tenant1_metrics": {
+            "avg_latency_ms": baseline_t1_avg.average_duration.as_millis(),
+            "total_requests": baseline_t1_avg.total_requests,
+            "error_rate": baseline_t1_avg.error_rate,
+            "std_deviation_ms": baseline_t1_avg.std_deviation.as_millis()
+        },
+        "tenant2_metrics": {
+            "avg_latency_ms": baseline_t2_avg.average_duration.as_millis(),
+            "total_requests": baseline_t2_avg.total_requests,
+            "error_rate": baseline_t2_avg.error_rate,
+            "std_deviation_ms": baseline_t2_avg.std_deviation.as_millis()
+        },
+        "test_phase": "baseline"
+    });
+
+    fs::write(
+        &baseline_metadata_filename,
+        serde_json::to_string_pretty(&baseline_metadata)?,
+    )
+    .await?;
+    println!("Baseline metadata saved to: {}", baseline_metadata_filename);
+
+    Ok(())
 }
 
 async fn save_csv_data(results: &FairnessTestResults, timestamp: u64) -> Result<()> {
@@ -1066,7 +1170,7 @@ impl Request {
 
 #[cfg(test)]
 mod tests {
-    use crate::cluster::KubernetesCluster;
+    use crate::cluster::KubernetesClient;
 
     use super::*;
 
@@ -1074,11 +1178,11 @@ mod tests {
     async fn test_check_fairness() {
         let tenant1 = Arc::new(TenantClusterConfig {
             namespace: "tenant1".to_string(),
-            cluster: KubernetesCluster::infer().await.unwrap(),
+            cluster: KubernetesClient::infer().await.unwrap(),
         });
         let tenant2 = Arc::new(TenantClusterConfig {
             namespace: "tenant2".to_string(),
-            cluster: KubernetesCluster::infer().await.unwrap(),
+            cluster: KubernetesClient::infer().await.unwrap(),
         });
 
         let result = check_fairness(tenant1, tenant2, FairnessTestConfig::default()).await;

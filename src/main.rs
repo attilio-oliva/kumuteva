@@ -9,13 +9,14 @@ use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand, ValueEnum};
 use cluster::TenantsPortMapping;
 use cluster::{
-    ControlPlaneIsolation, KindCluster, KubernetesCluster, KubernetesClusterBuilder,
+    ControlPlaneIsolation, KindCluster, KubernetesClient, KubernetesClusterBuilder,
     NetworkIsolationStrategy,
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
-use verifier::{TenantClusterConfig, TransparentIsolationLevel};
+use verifier::TenantClusterConfig;
 
+use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
 use crate::verifier::FairnessTestConfig;
 
 #[derive(Debug, Parser)]
@@ -31,8 +32,8 @@ enum ClusterEnvironmentType {
     Native,
     #[clap(name = "capsule", alias = "cap", alias = "caps")]
     Capsule,
-    #[clap(name = "kcp")]
-    Kcp,
+    #[clap(name = "kubezoo", alias = "kz")]
+    KubeZoo,
     #[clap(name = "vcluster", alias = "vc")]
     VCluster,
     #[clap(name = "kubevirt", alias = "kv")]
@@ -44,9 +45,29 @@ impl ClusterEnvironmentType {
         match self {
             ClusterEnvironmentType::Native => "native",
             ClusterEnvironmentType::Capsule => "capsule",
-            ClusterEnvironmentType::Kcp => "kcp",
+            ClusterEnvironmentType::KubeZoo => "kubezoo",
             ClusterEnvironmentType::VCluster => "vcluster",
             ClusterEnvironmentType::KubeVirt => "kubevirt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ChosenClusterProvider {
+    #[clap(name = "kind")]
+    Kind,
+    #[clap(name = "k3s")]
+    K3s,
+    #[clap(name = "none")]
+    None,
+}
+
+impl ChosenClusterProvider {
+    fn as_str(&self) -> &str {
+        match self {
+            ChosenClusterProvider::Kind => "kind",
+            ChosenClusterProvider::K3s => "k3s",
+            ChosenClusterProvider::None => "none",
         }
     }
 }
@@ -63,6 +84,9 @@ enum Commands {
         cluster_name: String,
         #[clap(long = "type", short = 't', default_value = "vcluster")]
         kind: ClusterEnvironmentType,
+        /// Host cluster provider to use for the underlying cluster
+        #[clap(long = "provider", short = 'p', default_value = "kind")]
+        provider: ChosenClusterProvider,
         #[clap(flatten)]
         tenant1: Tenant1SetupConfig,
         #[clap(flatten)]
@@ -192,12 +216,21 @@ async fn main() -> anyhow::Result<()> {
             existing_cluster,
             cluster_name,
             kind,
+            provider,
             tenant1,
             tenant2,
         } => {
             println!("Setting up test environment...");
             let cluster_name = format!("{}-{}", cluster_name, kind.as_str());
-            setup_test_environment(existing_cluster, &cluster_name, kind, tenant1, tenant2).await?;
+            setup_test_environment(
+                existing_cluster,
+                &cluster_name,
+                kind,
+                provider,
+                tenant1,
+                tenant2,
+            )
+            .await?;
             println!("Test environment setup complete");
         }
         Commands::Verify {
@@ -208,11 +241,11 @@ async fn main() -> anyhow::Result<()> {
         } => {
             println!("Verifying cluster isolation...");
             let tenant1_config = TenantClusterConfig {
-                cluster: KubernetesCluster::load(&tenant1_kubeconfig_path).await?,
+                cluster: KubernetesClient::load(&tenant1_kubeconfig_path).await?,
                 namespace: tenant1_namespace,
             };
             let tenant2_config = TenantClusterConfig {
-                cluster: KubernetesCluster::load(&tenant2_kubeconfig_path).await?,
+                cluster: KubernetesClient::load(&tenant2_kubeconfig_path).await?,
                 namespace: tenant2_namespace,
             };
 
@@ -315,12 +348,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn get_or_create_tenant_cluster(
-    kind_cluster: &KindCluster,
+    host_cluster: &HostClusterType,
     tenant: &str,
     kubeconfig_path: PathBuf,
     env_type: ClusterEnvironmentType,
-) -> anyhow::Result<KubernetesCluster> {
-    if let Ok(existing_cluster) = KubernetesCluster::load(&kubeconfig_path).await {
+) -> anyhow::Result<KubernetesClient> {
+    if let Ok(existing_cluster) = KubernetesClient::load(&kubeconfig_path).await {
         println!("Tenant {} cluster already exists", tenant);
         if let Ok(health) = existing_cluster.list_all_pods().await {
             println!(
@@ -338,7 +371,7 @@ async fn get_or_create_tenant_cluster(
 
     let tenant_cluster = match env_type {
         ClusterEnvironmentType::Capsule => {
-            KubernetesClusterBuilder::new(kind_cluster.clone())
+            KubernetesClusterBuilder::new(host_cluster.clone())
                 .with_isolation_technology(ControlPlaneIsolation::Capsule(tenant.to_string()))
                 .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
                     tenant.to_string(),
@@ -348,7 +381,7 @@ async fn get_or_create_tenant_cluster(
                 .await?
         }
         ClusterEnvironmentType::VCluster => {
-            KubernetesClusterBuilder::new(kind_cluster.clone())
+            KubernetesClusterBuilder::new(host_cluster.clone())
                 .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant.to_string()))
                 // .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
                 //     tenant.to_string(),
@@ -357,8 +390,15 @@ async fn get_or_create_tenant_cluster(
                 .build()
                 .await?
         }
+        ClusterEnvironmentType::KubeVirt => {
+            KubernetesClusterBuilder::new(host_cluster.clone())
+                .with_isolation_technology(ControlPlaneIsolation::KubeVirt(tenant.to_string()))
+                .with_kubeconfig_path(kubeconfig_path)
+                .build()
+                .await?
+        }
         ClusterEnvironmentType::Native => {
-            KubernetesClusterBuilder::new(kind_cluster.clone())
+            KubernetesClusterBuilder::new(host_cluster.clone())
                 .with_isolation_technology(ControlPlaneIsolation::None(tenant.to_string()))
                 .with_kubeconfig_path(kubeconfig_path)
                 .build()
@@ -376,6 +416,7 @@ async fn setup_test_environment(
     existing_cluster: bool,
     cluster_name: &str,
     env: ClusterEnvironmentType,
+    provider: ChosenClusterProvider,
     tenant1: Tenant1SetupConfig,
     tenant2: Tenant2SetupConfig,
 ) -> anyhow::Result<()> {
@@ -393,12 +434,50 @@ async fn setup_test_environment(
     let port_mappings = TenantsPortMapping::from_tuple(tenant1_mapping, tenant2_mapping);
     let test_kubeconfig = PathBuf::from(format!("/tmp/{}.kubeconfig", cluster_name));
 
-    let kind_cluster = if existing_cluster {
-        println!("Using existing kind cluster '{}'", cluster_name);
-        KindCluster::load(cluster_name, test_kubeconfig.clone())?
-    } else {
-        println!("Creating new kind cluster '{}'", cluster_name);
-        KindCluster::create(cluster_name, test_kubeconfig.clone(), port_mappings)?
+    // Create base cluster based on provider type
+    let base_cluster = match provider {
+        ChosenClusterProvider::Kind => {
+            let cluster = if existing_cluster {
+                println!("Using existing kind cluster '{}'", cluster_name);
+                KindCluster::load(cluster_name, test_kubeconfig.clone())
+                    .await
+                    .context("Failed to load existing kind cluster")?
+            } else {
+                println!("Creating new kind cluster '{}'", cluster_name);
+                KindCluster::create(cluster_name, test_kubeconfig.clone(), port_mappings)
+                    .await
+                    .context("Failed to create new kind cluster")?
+            };
+            HostClusterType::Kind(cluster)
+        }
+        ChosenClusterProvider::K3s => {
+            let cluster = if existing_cluster {
+                println!("Using existing k3s cluster '{}'", cluster_name);
+                K3sCluster::load(cluster_name, test_kubeconfig.clone())
+                    .await
+                    .context("Failed to load existing k3s cluster")?
+            } else {
+                println!("Creating new k3s cluster '{}'", cluster_name);
+                K3sCluster::create(cluster_name, test_kubeconfig.clone(), port_mappings)
+                    .await
+                    .context("Failed to create new k3s cluster")?
+            };
+            HostClusterType::K3s(cluster)
+        }
+        ChosenClusterProvider::None => {
+            let cluster = if existing_cluster {
+                println!("Using existing pre-existing cluster '{}'", cluster_name);
+                PreExistingCluster::load(cluster_name, test_kubeconfig.clone())
+                    .await
+                    .context("Failed to load existing pre-existing cluster")?
+            } else {
+                println!("Creating new pre-existing cluster '{}'", cluster_name);
+                PreExistingCluster::create(cluster_name, test_kubeconfig.clone(), port_mappings)
+                    .await
+                    .context("Failed to create new pre-existing cluster")?
+            };
+            HostClusterType::PreExisting(cluster)
+        }
     };
 
     let tenant1_kubeconfig_name = format!("tenant1-{}", cluster_name);
@@ -407,10 +486,10 @@ async fn setup_test_environment(
     let tenant2_kubeconfig = PathBuf::from(format!("/tmp/{}.kubeconfig", tenant2_kubeconfig_name));
 
     let tenant1_cluster =
-        get_or_create_tenant_cluster(&kind_cluster, "tenant1", tenant1_kubeconfig.clone(), env)
+        get_or_create_tenant_cluster(&base_cluster, "tenant1", tenant1_kubeconfig.clone(), env)
             .await?;
     let tenant2_cluster =
-        get_or_create_tenant_cluster(&kind_cluster, "tenant2", tenant2_kubeconfig.clone(), env)
+        get_or_create_tenant_cluster(&base_cluster, "tenant2", tenant2_kubeconfig.clone(), env)
             .await?;
 
     tenant1_cluster.ensure_cluster_is_ready().await?;

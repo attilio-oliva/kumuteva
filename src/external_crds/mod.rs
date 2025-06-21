@@ -1,4 +1,4 @@
-use crate::cluster::KubernetesCluster;
+use crate::cluster::KubernetesClient;
 
 pub mod capsule;
 
@@ -8,7 +8,7 @@ use kube::{
     Api,
 };
 
-pub async fn create_tenant(cluster: &KubernetesCluster, tenant: Tenant) -> Result<(), kube::Error> {
+pub async fn create_tenant(cluster: &KubernetesClient, tenant: Tenant) -> Result<(), kube::Error> {
     let tenant_name = tenant.metadata.name.clone().unwrap();
     let patch_params = PatchParams::apply(&tenant_name);
     let patch = Patch::Apply(tenant);
