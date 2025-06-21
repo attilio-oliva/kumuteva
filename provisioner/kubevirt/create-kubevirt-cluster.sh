@@ -12,7 +12,7 @@ fi
 
 # Create a Kubevirt Cluster from the provided YAML file
 
-export CLUSTER_NAME=${TENANT_NAME}-cluster
+export CLUSTER_NAME=${TENANT_NAME}-kv
 export NAMESPACE=${TENANT_NAME}
 export NODE_VM_IMAGE_TEMPLATE="quay.io/capk/ubuntu-2404-container-disk:v1.32.1"
 export CONTROL_PLANE_MACHINE_COUNT=1
@@ -21,6 +21,9 @@ export KUBERNETES_VERSION="v1.32.1"
 export CRI_PATH="/run/containerd/containerd.sock"
 
 kubectl create namespace "$NAMESPACE" --kubeconfig "$KUBECONFIG_PATH"
+
+# save the applied YAML file to this directory
+envsubst < "$THIS_DIR"/tenant-cluster.yaml > "$CLUSTER_NAME"-applied.yaml
 
 # Replace variables and apply
 envsubst < "$THIS_DIR"/tenant-cluster.yaml | kubectl apply -f - --kubeconfig "$KUBECONFIG_PATH"
