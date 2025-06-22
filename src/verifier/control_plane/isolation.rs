@@ -1,20 +1,17 @@
 use crate::verifier::{
-    EnhancedObjectIsolationReport, KubernetesObject, KubernetesVerb, ObjectKindTestResult,
+    ControlPlaneIsolationReport, KubernetesObject, KubernetesVerb, ObjectPropertyAssessment,
     OperationResult, TenantClusterConfig,
 };
 
 use anyhow::{Context, Result};
-use kube::{
-    api::{DynamicObject, ObjectMeta, TypeMeta},
-    core::object,
-};
+use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
 
 /// Verifies that object isolation works between two tenant clusters
 /// Tests autonomy (can perform operations on own objects) and isolation (cannot access other tenant's objects)
 pub async fn check_object_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> Result<EnhancedObjectIsolationReport> {
+) -> Result<ControlPlaneIsolationReport> {
     let object_kinds = KubernetesObject::all();
     let verbs = [
         KubernetesVerb::Create,
@@ -27,7 +24,6 @@ pub async fn check_object_isolation(
     ];
 
     let mut object_results = Vec::new();
-    let mut isolation_failures = Vec::new();
     let mut autonomy_failures = Vec::new();
 
     for object_kind in object_kinds {
@@ -37,12 +33,12 @@ pub async fn check_object_isolation(
             object_kind.api_version()
         );
 
-        let result = test_object_kind_comprehensive(tenant1, tenant2, &object_kind, &verbs)
+        let result = assess_object_kind_accessibility(tenant1, tenant2, &object_kind, &verbs)
             .await
             .context(format!("Failed to test object kind {}", object_kind.kind()))?;
 
         // Collect failures
-        if !result.has_isolation {
+        if !result.is_valid {
             isolation_failures.push(format!(
                 "{}/{}: Cross-tenant access detected",
                 object_kind.api_version(),
@@ -64,21 +60,21 @@ pub async fn check_object_isolation(
     let overall_isolation_success = isolation_failures.is_empty();
     let overall_autonomy_success = autonomy_failures.is_empty();
 
-    Ok(EnhancedObjectIsolationReport {
+    Ok(ControlPlaneIsolationReport {
         overall_isolation_success,
         overall_autonomy_success,
-        object_results,
-        isolation_failures,
+        objects_assessment: object_results,
+        failures: isolation_failures,
         autonomy_failures,
     })
 }
 
-async fn test_object_kind_comprehensive(
+async fn assess_object_kind_accessibility(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
     object_kind: &KubernetesObject,
     verbs: &[KubernetesVerb],
-) -> Result<ObjectKindTestResult> {
+) -> Result<ObjectPropertyAssessment> {
     let mut autonomy_results = Vec::new();
     let mut isolation_results = Vec::new();
 
@@ -97,12 +93,12 @@ async fn test_object_kind_comprehensive(
     let has_autonomy = autonomy_results.iter().all(|r| r.success);
     let has_isolation = isolation_results.iter().all(|r| r.success);
 
-    Ok(ObjectKindTestResult {
+    Ok(ObjectPropertyAssessment {
         kind: object_kind.clone(),
         autonomy_results,
-        isolation_results,
+        issued_operations: isolation_results,
         has_autonomy,
-        has_isolation,
+        is_valid: has_isolation,
     })
 }
 

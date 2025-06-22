@@ -1,3 +1,4 @@
+mod autonomy;
 mod fairness;
 mod isolation;
 mod objects;
@@ -5,6 +6,7 @@ mod transparent_isolation;
 
 use std::fmt::Display;
 
+pub use autonomy::*;
 pub use fairness::*;
 pub use isolation::*;
 pub use objects::*;
@@ -20,13 +22,6 @@ fn get_example_pod_name() -> String {
         .name
         .clone()
         .unwrap_or_else(|| POD_DEFAULT_NAME.to_string())
-}
-
-#[derive(Debug, Clone)]
-pub struct ObjectKind {
-    pub api_version: String,
-    pub kind: String,
-    pub namespaced: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -63,24 +58,94 @@ pub struct OperationResult {
 }
 
 #[derive(Debug, Clone)]
-pub struct ObjectKindTestResult {
+pub struct ObjectPropertyAssessment {
     pub kind: KubernetesObject,
-    pub autonomy_results: Vec<OperationResult>,
+    pub issued_operations: Vec<OperationResult>,
+    pub is_valid: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectAutonomyReport {
+    pub kind: KubernetesObject,
     pub isolation_results: Vec<OperationResult>,
-    pub has_autonomy: bool,
     pub has_isolation: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct EnhancedObjectIsolationReport {
+pub struct ControlPlaneIsolationReport {
     pub overall_isolation_success: bool,
-    pub overall_autonomy_success: bool,
-    pub object_results: Vec<ObjectKindTestResult>,
-    pub isolation_failures: Vec<String>,
-    pub autonomy_failures: Vec<String>,
+    pub objects_assessment: Vec<ObjectPropertyAssessment>,
+    pub failures: Vec<String>,
 }
 
-impl std::fmt::Display for EnhancedObjectIsolationReport {
+#[derive(Debug, Clone)]
+pub struct ControlPlaneAutonomyReport {
+    pub autonomy_level: ControlPlaneAutonomy,
+    pub objects_assessment: Vec<ObjectPropertyAssessment>,
+    pub failures: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlPlaneAutonomy {
+    pub namespace_level: bool,
+    pub node_level: bool,
+    pub cluster_level: bool,
+}
+
+impl Display for ControlPlaneAutonomy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Control Plane Autonomy:")?;
+        writeln!(
+            f,
+            "  Namespace Level: {}",
+            if self.namespace_level { "✅" } else { "❌" }
+        )?;
+        writeln!(
+            f,
+            "  Node Level: {}",
+            if self.node_level { "✅" } else { "❌" }
+        )?;
+        writeln!(
+            f,
+            "  Cluster Level: {}",
+            if self.cluster_level { "✅" } else { "❌" }
+        )?;
+        Ok(())
+    }
+}
+
+impl From<&[ObjectPropertyAssessment]> for ControlPlaneAutonomy {
+    fn from(assessments: &[ObjectPropertyAssessment]) -> Self {
+        let namespace_level = assessments
+            .iter()
+            .filter(|assessment| {
+                assessment.kind.is_namespaced() || assessment.kind == KubernetesObject::Namespace
+            })
+            .all(|autonomy| autonomy.is_valid);
+
+        let node_level = assessments
+            .iter()
+            .filter(|assessment| assessment.kind == KubernetesObject::Node)
+            .all(|autonomy| autonomy.is_valid);
+
+        let cluster_level = assessments
+            .iter()
+            .filter(|assessment| {
+                assessment.kind.is_cluster_wide()
+                    && assessment.kind != KubernetesObject::Namespace
+                    && assessment.kind != KubernetesObject::Node
+            })
+            .all(|autonomy| autonomy.is_valid);
+
+        Self {
+            namespace_level,
+            node_level,
+            cluster_level,
+        }
+    }
+}
+
+impl std::fmt::Display for ControlPlaneIsolationReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Enhanced Object Isolation Report")?;
         writeln!(f, "=================================")?;
@@ -103,9 +168,9 @@ impl std::fmt::Display for EnhancedObjectIsolationReport {
             }
         )?;
 
-        if !self.isolation_failures.is_empty() {
+        if !self.failures.is_empty() {
             writeln!(f, "\nIsolation Failures:")?;
-            for failure in &self.isolation_failures {
+            for failure in &self.failures {
                 writeln!(f, "  - {}", failure)?;
             }
         }
@@ -118,7 +183,7 @@ impl std::fmt::Display for EnhancedObjectIsolationReport {
         }
 
         writeln!(f, "\nDetailed Results by Object Kind:")?;
-        for result in &self.object_results {
+        for result in &self.objects_assessment {
             writeln!(f, "  {} ({})", result.kind, result.kind.api_version())?;
             writeln!(
                 f,
@@ -128,7 +193,7 @@ impl std::fmt::Display for EnhancedObjectIsolationReport {
             writeln!(
                 f,
                 "    Isolation: {}",
-                if result.has_isolation { "✅" } else { "❌" }
+                if result.is_valid { "✅" } else { "❌" }
             )?;
         }
 

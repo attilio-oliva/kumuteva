@@ -180,7 +180,7 @@ impl IsolationTest for ControlPlaneIsolationProperty {
                         } else {
                             format!(
                                 "Object isolation test failed: {}",
-                                report.isolation_failures.join(", ")
+                                report.failures.join(", ")
                             )
                         },
                     })

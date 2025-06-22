@@ -25,6 +25,13 @@ macro_rules! define_kubernetes_objects {
                 }
             }
 
+            /// Returns true if this resource type is cluster-scoped
+            pub fn is_cluster_wide(&self) -> bool {
+                !self.is_namespaced()
+            }
+
+
+
             /// Returns the API version for this resource
             pub fn api_version(&self) -> &'static str {
                 match self {
@@ -109,43 +116,6 @@ macro_rules! define_kubernetes_objects {
         )*
 
     };
-}
-
-// Convert the old ObjectKind struct to use the new enum
-impl From<KubernetesObject> for super::ObjectKind {
-    fn from(obj: KubernetesObject) -> Self {
-        Self {
-            api_version: obj.api_version().to_string(),
-            kind: obj.kind().to_string(),
-            namespaced: obj.is_namespaced(),
-        }
-    }
-}
-
-impl From<super::ObjectKind> for KubernetesObject {
-    fn from(kind: super::ObjectKind) -> Self {
-        // This is a fallback conversion - ideally you'd use the enum directly
-        match (kind.api_version.as_str(), kind.kind.as_str()) {
-            ("v1", "Pod") => Self::Pod,
-            ("v1", "Service") => Self::Service,
-            ("v1", "ConfigMap") => Self::ConfigMap,
-            ("v1", "Secret") => Self::Secret,
-            ("v1", "Namespace") => Self::Namespace,
-            ("apps/v1", "Deployment") => Self::Deployment,
-            ("apps/v1", "ReplicaSet") => Self::ReplicaSet,
-            ("apps/v1", "StatefulSet") => Self::StatefulSet,
-            ("apps/v1", "DaemonSet") => Self::DaemonSet,
-            ("batch/v1", "Job") => Self::Job,
-            ("batch/v1", "CronJob") => Self::CronJob,
-            ("networking.k8s.io/v1", "NetworkPolicy") => Self::NetworkPolicy,
-            ("networking.k8s.io/v1", "Ingress") => Self::Ingress,
-            ("rbac.authorization.k8s.io/v1", "Role") => Self::Role,
-            ("rbac.authorization.k8s.io/v1", "RoleBinding") => Self::RoleBinding,
-            ("rbac.authorization.k8s.io/v1", "ClusterRole") => Self::ClusterRole,
-            ("rbac.authorization.k8s.io/v1", "ClusterRoleBinding") => Self::ClusterRoleBinding,
-            _ => Self::Pod, // Default fallback
-        }
-    }
 }
 
 // Define all the Kubernetes objects we want to test

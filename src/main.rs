@@ -265,43 +265,14 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => println!("Object isolation could not complete: {}", e),
             }
 
-            let transparent_isolation_result = verifier::check_transparent_isolation_level(
-                &tenant1_config,
-                &tenant2_config,
-                TransparentIsolationLevel::Cluster,
-            )
-            .await;
-
-            match transparent_isolation_result {
-                Ok(_) => println!("Transparent isolation test at cluster level passed"),
-                Err(e) => println!("Transparent isolation test at cluster level failed: {}", e),
-            }
-
-            let transparent_isolation_result = verifier::check_transparent_isolation_level(
-                &tenant1_config,
-                &tenant2_config,
-                TransparentIsolationLevel::Node,
-            )
-            .await;
-
-            match transparent_isolation_result {
-                Ok(_) => println!("Transparent isolation test at node level passed"),
-                Err(e) => println!("Transparent isolation test at node level failed: {}", e),
-            }
-
-            let transparent_isolation_result = verifier::check_transparent_isolation_level(
-                &tenant1_config,
-                &tenant2_config,
-                TransparentIsolationLevel::Namespace,
-            )
-            .await;
-
-            match transparent_isolation_result {
-                Ok(_) => println!("Transparent isolation test at namespace level passed"),
-                Err(e) => println!(
-                    "Transparent isolation test at namespace level failed: {}",
-                    e
-                ),
+            let autonomy_result =
+                verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
+            match autonomy_result {
+                Ok(report) => {
+                    println!("{}", report.autonomy_level.to_string());
+                    println!("Detailed autonomy report:\n{}", report);
+                }
+                Err(e) => println!("Control plane autonomy could not complete: {}", e),
             }
 
             /* This will do the same as above, but formatted in a nice way
@@ -312,35 +283,35 @@ async fn main() -> anyhow::Result<()> {
             println!("Control plane isolation test results:\n{}", report);
             */
 
-            let is_network_isolated =
-                verifier::check_network_isolation(&tenant1_config, &tenant2_config)
-                    .await
-                    .context("Failed to verify network isolation")?;
+            // let is_network_isolated =
+            //     verifier::check_network_isolation(&tenant1_config, &tenant2_config)
+            //         .await
+            //         .context("Failed to verify network isolation")?;
 
-            if is_network_isolated {
-                println!("Network isolation test passed");
-            } else {
-                println!("Network isolation test failed");
-            }
+            // if is_network_isolated {
+            //     println!("Network isolation test passed");
+            // } else {
+            //     println!("Network isolation test failed");
+            // }
 
-            let is_storage_isolated =
-                verifier::check_storage_isolation(&tenant1_config, &tenant2_config).await;
+            // let is_storage_isolated =
+            //     verifier::check_storage_isolation(&tenant1_config, &tenant2_config).await;
 
-            match is_storage_isolated {
-                Ok(_) => println!("Storage isolation test passed"),
-                Err(e) => println!("Storage isolation test failed: {}", e),
-            }
+            // match is_storage_isolated {
+            //     Ok(_) => println!("Storage isolation test passed"),
+            //     Err(e) => println!("Storage isolation test failed: {}", e),
+            // }
 
-            let fairness = verifier::check_fairness(
-                Arc::new(tenant1_config),
-                Arc::new(tenant2_config),
-                FairnessTestConfig::default(),
-            )
-            .await;
-            match fairness {
-                Ok(_) => println!("Fairness test passed"),
-                Err(e) => println!("Fairness test failed: {}", e),
-            }
+            // let fairness = verifier::check_fairness(
+            //     Arc::new(tenant1_config),
+            //     Arc::new(tenant2_config),
+            //     FairnessTestConfig::default(),
+            // )
+            // .await;
+            // match fairness {
+            //     Ok(_) => println!("Fairness test passed"),
+            //     Err(e) => println!("Fairness test failed: {}", e),
+            // }
         }
     }
 
