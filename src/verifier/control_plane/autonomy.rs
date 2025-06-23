@@ -25,11 +25,11 @@ pub async fn check_control_plane_autonomy(
     let mut autonomy_failures = Vec::new();
 
     for object_kind in object_kinds {
-        println!(
-            "Testing object kind: {} ({})",
-            object_kind.kind(),
-            object_kind.api_version()
-        );
+        // println!(
+        //     "Testing object kind: {} ({})",
+        //     object_kind.kind(),
+        //     object_kind.api_version()
+        // );
 
         let object_autonomy = assess_object_kind_accessibility(tenant1, &object_kind, &verbs)
             .await

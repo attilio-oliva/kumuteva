@@ -260,12 +260,12 @@ impl Display for ControlPlaneIsolationReport {
 
             writeln!(f, "    Operations:")?;
             for op in &assessment.issued_operations {
-                let result_emoji = if op.success && op.error_reason.is_none() {
-                    "✅"
+                let result_status = if op.success && op.error_reason.is_none() {
+                    "true"
                 } else if !op.success && op.error_reason.is_some() {
-                    "❌"
+                    "false"
                 } else {
-                    "⚠️"
+                    "unknown"
                 };
                 let error_info = match &op.error_reason {
                     Some(reason) => format!("({})", reason),
@@ -278,7 +278,7 @@ impl Display for ControlPlaneIsolationReport {
                         }
                     }
                 };
-                writeln!(f, "      {}: {} {}", op.verb, result_emoji, error_info)?;
+                writeln!(f, "      {}: {} {}", op.verb, result_status, error_info)?;
             }
         }
 

@@ -248,6 +248,15 @@ async fn main() -> anyhow::Result<()> {
                 cluster: KubernetesClient::load(&tenant2_kubeconfig_path).await?,
                 namespace: tenant2_namespace,
             };
+            let autonomy_result =
+                verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
+            match autonomy_result {
+                Ok(report) => {
+                    println!("{}", report.autonomy_level);
+                    println!("Detailed autonomy report:\n{}", report);
+                }
+                Err(e) => println!("Control plane autonomy could not complete: {}", e),
+            }
 
             let obj_isolation_result =
                 verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
@@ -263,16 +272,6 @@ async fn main() -> anyhow::Result<()> {
                     println!("Detailed report:\n{}", report);
                 }
                 Err(e) => println!("Object isolation could not complete: {}", e),
-            }
-
-            let autonomy_result =
-                verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
-            match autonomy_result {
-                Ok(report) => {
-                    println!("{}", report.autonomy_level);
-                    println!("Detailed autonomy report:\n{}", report);
-                }
-                Err(e) => println!("Control plane autonomy could not complete: {}", e),
             }
 
             /* This will do the same as above, but formatted in a nice way
