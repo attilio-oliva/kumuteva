@@ -1,6 +1,6 @@
 use crate::verifier::{
-    ControlPlaneIsolationReport, KubernetesObject, KubernetesVerb, ObjectPropertyAssessment,
-    OperationResult, TenantClusterConfig,
+    control_plane::autonomy, AssessmentResult, ControlPlaneIsolationReport, KubernetesObject,
+    KubernetesVerb, ObjectPropertyAssessment, OperationResult, TenantClusterConfig,
 };
 
 use anyhow::{Context, Result};
@@ -27,18 +27,18 @@ pub async fn check_object_isolation(
     let mut isolation_failures = Vec::new();
 
     for object_kind in object_kinds {
-        println!(
-            "Testing object kind: {} ({})",
-            object_kind.kind(),
-            object_kind.api_version()
-        );
+        // println!(
+        //     "Testing object kind: {} ({})",
+        //     object_kind.kind(),
+        //     object_kind.api_version()
+        // );
 
-        let result = assess_object_kind_accessibility(tenant1, tenant2, &object_kind, &verbs)
+        let result = assess_object_isolation(tenant1, tenant2, &object_kind, &verbs)
             .await
             .context(format!("Failed to test object kind {}", object_kind.kind()))?;
 
         // Collect failures
-        if !result.is_valid {
+        if !result.is_valid() {
             isolation_failures.push(format!(
                 "{}/{}: Cross-tenant access detected",
                 object_kind.api_version(),
@@ -57,109 +57,231 @@ pub async fn check_object_isolation(
     })
 }
 
-async fn assess_object_kind_accessibility(
+async fn assess_object_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
     object_kind: &KubernetesObject,
     verbs: &[KubernetesVerb],
 ) -> Result<ObjectPropertyAssessment> {
-    let mut isolation_results = Vec::new();
+    // Try to get or create a test object for isolation testing
+    let object_name = match setup_test_object(tenant1, object_kind).await {
+        Ok(name) => name,
+        Err(e) => {
+            // If we can't create/find an object, fall back to autonomy testing
+            return fallback_to_autonomy_testing(tenant1, object_kind, e).await;
+        }
+    };
 
-    // Test isolation - create object with tenant1, try to access with tenant2
-    for verb in verbs {
-        let result = test_cross_tenant_isolation(tenant1, tenant2, object_kind, *verb).await;
-        isolation_results.push(result);
-    }
+    // println!(
+    //     "Created or found object {} {} for isolation tests",
+    //     object_kind.kind(),
+    //     object_name
+    // );
+
+    // Test cross-tenant isolation for each verb
+    let isolation_results =
+        test_cross_tenant_operations(tenant1, tenant2, object_kind, &object_name, verbs).await;
+
+    // Cleanup the test object
+    let _ = cleanup_test_object(tenant1, object_kind, &object_name).await;
 
     let has_isolation = isolation_results.iter().all(|r| r.success);
+    let result = if has_isolation {
+        AssessmentResult::Success
+    } else {
+        AssessmentResult::Unsuccessful(format!(
+            "Cross-tenant access detected for {}: [{}]",
+            object_kind.kind(),
+            isolation_results
+                .iter()
+                .filter(|r| !r.success)
+                .map(|r| r.verb.to_string().to_uppercase())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    };
 
     Ok(ObjectPropertyAssessment {
         kind: object_kind.clone(),
         issued_operations: isolation_results,
-        is_valid: has_isolation,
+        result,
     })
 }
 
-async fn test_cross_tenant_isolation(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
+async fn setup_test_object(
+    tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
-    verb: KubernetesVerb,
-) -> OperationResult {
-    // First, tenant1 creates an object
-    let object_name = format!(
+) -> Result<String> {
+    let random_object_name = format!(
         "test-{}-{}",
         object_kind.kind().to_lowercase(),
         uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
     );
 
-    let create_result = create_test_object(tenant1, object_kind, &object_name).await;
-    if create_result.is_err() {
-        println!(
-            "Failed to create test object for isolation test: {}",
-            create_result.unwrap_err()
-        );
-        return OperationResult {
-            verb,
-            success: true, // If we can't create, isolation is irrelevant for this test
-            error_reason: Some("Could not create test object for isolation test".to_string()),
-        };
-    }
-
-    // Then tenant2 tries to access tenant1's object
-    let access_result = match verb {
-        KubernetesVerb::Get => {
-            test_cross_tenant_get(tenant2, tenant1, object_kind, &object_name).await
+    // Try to create a new test object
+    match create_test_object(tenant, object_kind, &random_object_name).await {
+        Ok(_) => Ok(random_object_name),
+        Err(creation_error) => {
+            // If creation fails, try to find an existing object
+            find_existing_object(tenant, object_kind, creation_error).await
         }
-        KubernetesVerb::List => test_cross_tenant_list(tenant2, tenant1, object_kind).await,
-        KubernetesVerb::Update => {
-            test_cross_tenant_update(tenant2, tenant1, object_kind, &object_name).await
-        }
-        KubernetesVerb::Delete => {
-            test_cross_tenant_delete(tenant2, tenant1, object_kind, &object_name).await
-        }
-        _ => Ok(()), // Skip other verbs for cross-tenant testing
-    };
-
-    // Cleanup
-    let _ = cleanup_test_object(tenant1, object_kind, &object_name).await;
-
-    println!(
-        "Testing isolation (cross) for {} {}: {:?}",
-        object_kind.kind(),
-        verb,
-        access_result
-    );
-    match access_result {
-        Err(_) => OperationResult {
-            verb,
-            success: false, // If tenant2 can access tenant1's object, isolation failed
-            error_reason: Some(
-                "Cross-tenant access was successful - isolation breach detected".to_string(),
-            ),
-        },
-        Ok(_) => OperationResult {
-            verb,
-            success: true, // If tenant2 cannot access tenant1's object, isolation works
-            error_reason: None,
-        },
     }
 }
 
-// Individual operation test implementations
-async fn test_create_operation(
+async fn find_existing_object(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
-) -> Result<()> {
-    let object_name = format!(
-        "autonomy-test-{}",
-        uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
-    );
-    create_test_object(tenant, object_kind, &object_name).await?;
-    cleanup_test_object(tenant, object_kind, &object_name).await?;
-    Ok(())
+    creation_error: anyhow::Error,
+) -> Result<String> {
+    let namespace = if object_kind.is_namespaced() {
+        Some(tenant.namespace.as_str())
+    } else {
+        None
+    };
+
+    let resources = tenant
+        .cluster
+        .list_resources_dyn(object_kind, namespace)
+        .await
+        .context("Failed to list existing resources for isolation test")?;
+
+    if resources.items.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No existing objects found for isolation test on {}: {}",
+            object_kind.kind(),
+            creation_error
+        ));
+    }
+
+    let first_resource = resources.items.first().unwrap();
+    let object_name = first_resource.metadata.name.clone().unwrap_or_default();
+
+    // println!("Using existing object {} for isolation test", object_name);
+
+    Ok(object_name)
 }
 
+async fn fallback_to_autonomy_testing(
+    tenant: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+    error: anyhow::Error,
+) -> Result<ObjectPropertyAssessment> {
+    let error_reason = format!(
+        "Could not test this allowed operation because CREATE is forbidden and no existing object to test was found {}",
+        error
+    );
+
+    // Test basic operations to determine if tenant has permissions
+    let operations = [
+        (
+            KubernetesVerb::Create,
+            autonomy::test_operation(tenant, object_kind, KubernetesVerb::Create).await,
+        ),
+        (
+            KubernetesVerb::Get,
+            autonomy::test_operation(tenant, object_kind, KubernetesVerb::Get).await,
+        ),
+        (
+            KubernetesVerb::List,
+            autonomy::test_operation(tenant, object_kind, KubernetesVerb::List).await,
+        ),
+        (
+            KubernetesVerb::Update,
+            autonomy::test_operation(tenant, object_kind, KubernetesVerb::Update).await,
+        ),
+        (
+            KubernetesVerb::Delete,
+            autonomy::test_operation(tenant, object_kind, KubernetesVerb::Delete).await,
+        ),
+    ];
+
+    let operation_results: Vec<OperationResult> = operations
+        .into_iter()
+        .map(|(verb, result)| OperationResult {
+            verb,
+            success: result.is_err(), // Success means operation was denied (no permissions)
+            error_reason: if result.is_ok() {
+                Some(format!("{}: {}", verb, error_reason))
+            } else {
+                None
+            },
+        })
+        .collect();
+
+    let no_operation_is_allowed = operation_results.iter().all(|r| r.success);
+    let result = if no_operation_is_allowed {
+        AssessmentResult::Success
+    } else {
+        AssessmentResult::NotEvaluated(
+            format!("Operations [{}] are allowed, but not [CREATE] and there are no existing object to test isolation",
+                    operation_results
+                        .iter()
+                        .filter(|r| r.success)
+                        .map(|r| r.verb.to_string().to_uppercase())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+        )
+        )
+    };
+
+    Ok(ObjectPropertyAssessment {
+        kind: object_kind.clone(),
+        issued_operations: operation_results,
+        result,
+    })
+}
+
+async fn test_cross_tenant_operations(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+    object_name: &str,
+    verbs: &[KubernetesVerb],
+) -> Vec<OperationResult> {
+    let mut results = Vec::new();
+
+    for verb in verbs {
+        let test_result = match verb {
+            KubernetesVerb::Get => {
+                test_cross_tenant_get(tenant2, tenant1, object_kind, object_name).await
+            }
+            KubernetesVerb::List => test_cross_tenant_list(tenant2, tenant1, object_kind).await,
+            KubernetesVerb::Update => {
+                test_cross_tenant_update(tenant2, tenant1, object_kind, object_name).await
+            }
+            KubernetesVerb::Delete => {
+                test_cross_tenant_delete(tenant2, tenant1, object_kind, object_name).await
+            }
+            _ => Ok(()), // Skip other verbs for cross-tenant testing
+        };
+
+        // println!(
+        //     "Testing isolation (cross) for {} {}: {:?}",
+        //     object_kind.kind(),
+        //     verb,
+        //     test_result
+        // );
+
+        let operation_result = match test_result {
+            Ok(_) => OperationResult {
+                verb: *verb,
+                success: true, // If tenant2 cannot access tenant1's object, isolation works
+                error_reason: None,
+            },
+            Err(_) => OperationResult {
+                verb: *verb,
+                success: false, // If tenant2 can access tenant1's object, isolation failed
+                error_reason: Some(
+                    "Cross-tenant access was successful - isolation breach detected".to_string(),
+                ),
+            },
+        };
+
+        results.push(operation_result);
+    }
+
+    results
+}
 // Cross-tenant operation tests using the dispatch macro
 async fn test_cross_tenant_get(
     tenant2: &TenantClusterConfig,
@@ -238,33 +360,12 @@ async fn test_cross_tenant_update(
         .get_resource_dyn(object_kind, object_name, Some(tenant1.namespace.as_str()))
         .await;
 
-    if let Err(_) = resource {
-        println!(
-            "The object to update did not exist: {}",
-            resource.unwrap_err()
-        );
+    if resource.is_err() {
+        // println!(
+        //     "The object to update did not exist: {}",
+        //     resource.unwrap_err()
+        // );
         return Ok(());
-    } else {
-        println!(
-            "Failed to get resource for debugging: {}",
-            resource.unwrap_err()
-        );
-        // try to get the resource from tenant2
-        let resource = tenant2
-            .cluster
-            .get_resource_dyn(object_kind, object_name, Some(tenant1.namespace.as_str()))
-            .await;
-        if let Ok(resource) = resource {
-            println!(
-                "Resource from tenant2 before update: {}",
-                serde_json::to_string_pretty(&resource).unwrap()
-            );
-        } else {
-            println!(
-                "Failed to get resource from tenant2 for debugging: {}",
-                resource.unwrap_err()
-            );
-        }
     }
 
     // Attempt to update an object created by tenant1 by tenant2
@@ -462,6 +563,17 @@ fn create_minimal_object(
             base_object["type"] = serde_json::Value::String("Opaque".to_string());
             base_object["data"] = serde_json::json!({
                 "key": "dmFsdWU=" // base64 encoded "value"
+            });
+        }
+
+        KubernetesObject::PersistentVolumeClaim => {
+            base_object["spec"] = serde_json::json!({
+                "accessModes": ["ReadWriteOnce"],
+                "resources": {
+                    "requests": {
+                        "storage": "1Gi"
+                    }
+                }
             });
         }
         // Add more specific cases as needed

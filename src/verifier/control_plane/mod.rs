@@ -57,11 +57,27 @@ pub struct OperationResult {
     pub error_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssessmentResult {
+    Success,
+    NotEvaluated(String),
+    Unsuccessful(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectPropertyAssessment {
     pub kind: KubernetesObject,
     pub issued_operations: Vec<OperationResult>,
-    pub is_valid: bool,
+    pub result: AssessmentResult,
+}
+impl ObjectPropertyAssessment {
+    pub fn is_valid(&self) -> bool {
+        match self.result {
+            AssessmentResult::Success => true,
+            AssessmentResult::NotEvaluated(_) => true,
+            AssessmentResult::Unsuccessful(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -121,12 +137,12 @@ impl From<&[ObjectPropertyAssessment]> for ControlPlaneAutonomy {
             .filter(|assessment| {
                 assessment.kind.is_namespaced() || assessment.kind == KubernetesObject::Namespace
             })
-            .all(|autonomy| autonomy.is_valid);
+            .all(|autonomy| autonomy.is_valid());
 
         let node_level = assessments
             .iter()
             .filter(|assessment| assessment.kind == KubernetesObject::Node)
-            .all(|autonomy| autonomy.is_valid);
+            .all(|autonomy| autonomy.is_valid());
 
         let cluster_level = assessments
             .iter()
@@ -135,7 +151,7 @@ impl From<&[ObjectPropertyAssessment]> for ControlPlaneAutonomy {
                     && assessment.kind != KubernetesObject::Namespace
                     && assessment.kind != KubernetesObject::Node
             })
-            .all(|autonomy| autonomy.is_valid);
+            .all(|autonomy| autonomy.is_valid());
 
         Self {
             namespace_level,
@@ -159,14 +175,23 @@ impl Display for ControlPlaneAutonomyReport {
         }
 
         writeln!(f, "\nDetailed Results by Object Kind:")?;
-        for result in &self.objects_assessment {
-            writeln!(f, "  {} ({})", result.kind, result.kind.api_version())?;
+        for assessment in &self.objects_assessment {
+            writeln!(
+                f,
+                "  {} ({})",
+                assessment.kind,
+                assessment.kind.api_version()
+            )?;
             writeln!(
                 f,
                 "    Autonomy: {}",
-                if result.is_valid { "✅" } else { "❌" }
+                match assessment.result {
+                    AssessmentResult::Success => "✅",
+                    AssessmentResult::NotEvaluated(_) => "⚠️",
+                    AssessmentResult::Unsuccessful(_) => "❌",
+                }
             )?;
-            for operation in &result.issued_operations {
+            for operation in &assessment.issued_operations {
                 writeln!(f, "      - {}: {}", operation.verb, operation.success)?;
                 if let Some(reason) = &operation.error_reason {
                     writeln!(f, "        Reason: {}", reason)?;
@@ -191,6 +216,23 @@ impl Display for ControlPlaneIsolationReport {
             }
         )?;
 
+        // Also display the untested objects  as warning
+        if self
+            .objects_assessment
+            .iter()
+            .any(|assessment| matches!(assessment.result, AssessmentResult::NotEvaluated(_)))
+        {
+            writeln!(f, "⚠️ Some objects were not evaluated properly.")?;
+            writeln!(
+                f,
+                "Probably CREATE is disallowed and no existing object of a kind exists for tenant1."
+            )?;
+            writeln!(
+                f,
+                "Please check the detailed results below for more information."
+            )?;
+        }
+
         if !self.failures.is_empty() {
             writeln!(f, "\nIsolation Failures:")?;
             for failure in &self.failures {
@@ -199,13 +241,45 @@ impl Display for ControlPlaneIsolationReport {
         }
 
         writeln!(f, "\nDetailed Results by Object Kind:")?;
-        for result in &self.objects_assessment {
-            writeln!(f, "  {} ({})", result.kind, result.kind.api_version())?;
+        for assessment in &self.objects_assessment {
+            writeln!(
+                f,
+                "  {} ({})",
+                assessment.kind,
+                assessment.kind.api_version()
+            )?;
             writeln!(
                 f,
                 "    Isolation: {}",
-                if result.is_valid { "✅" } else { "❌" }
+                match assessment.result {
+                    AssessmentResult::Success => "✅",
+                    AssessmentResult::NotEvaluated(_) => "⚠️",
+                    AssessmentResult::Unsuccessful(_) => "❌",
+                }
             )?;
+
+            writeln!(f, "    Operations:")?;
+            for op in &assessment.issued_operations {
+                let result_emoji = if op.success && op.error_reason.is_none() {
+                    "✅"
+                } else if !op.success && op.error_reason.is_some() {
+                    "❌"
+                } else {
+                    "⚠️"
+                };
+                let error_info = match &op.error_reason {
+                    Some(reason) => format!("({})", reason),
+                    None => {
+                        if op.success {
+                            //"(Success)".to_string()
+                            "".to_string()
+                        } else {
+                            "(Failed)".to_string()
+                        }
+                    }
+                };
+                writeln!(f, "      {}: {} {}", op.verb, result_emoji, error_info)?;
+            }
         }
 
         Ok(())

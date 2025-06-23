@@ -1,6 +1,6 @@
 use crate::verifier::{
-    ControlPlaneAutonomy, ControlPlaneAutonomyReport, KubernetesObject, KubernetesVerb,
-    ObjectPropertyAssessment, OperationResult, TenantClusterConfig,
+    AssessmentResult, ControlPlaneAutonomy, ControlPlaneAutonomyReport, KubernetesObject,
+    KubernetesVerb, ObjectPropertyAssessment, OperationResult, TenantClusterConfig,
 };
 
 use anyhow::{Context, Result};
@@ -25,17 +25,17 @@ pub async fn check_control_plane_autonomy(
     let mut autonomy_failures = Vec::new();
 
     for object_kind in object_kinds {
-        println!(
-            "Testing object kind: {} ({})",
-            object_kind.kind(),
-            object_kind.api_version()
-        );
+        // println!(
+        //     "Testing object kind: {} ({})",
+        //     object_kind.kind(),
+        //     object_kind.api_version()
+        // );
 
         let object_autonomy = assess_object_kind_accessibility(tenant1, &object_kind, &verbs)
             .await
             .context(format!("Failed to test object kind {}", object_kind.kind()))?;
 
-        if !object_autonomy.is_valid {
+        if !object_autonomy.is_valid() {
             autonomy_failures.push(format!(
                 "{}/{}: Tenant cannot perform all required operations",
                 object_kind.api_version(),
@@ -69,11 +69,21 @@ async fn assess_object_kind_accessibility(
     }
 
     let has_autonomy = autonomy_results.iter().all(|r| r.success);
+    let result = if has_autonomy {
+        AssessmentResult::Success
+    } else {
+        AssessmentResult::Unsuccessful(
+            autonomy_results
+                .iter()
+                .filter_map(|r| r.error_reason.clone())
+                .collect(),
+        )
+    };
 
     Ok(ObjectPropertyAssessment {
         kind: object_kind.clone(),
         issued_operations: autonomy_results,
-        is_valid: has_autonomy,
+        result,
     })
 }
 
@@ -84,12 +94,12 @@ async fn test_tenant_autonomy(
 ) -> OperationResult {
     let result = test_operation(tenant, object_kind, verb).await;
 
-    println!(
-        "Tested autonomy for {} {}: {:?}",
-        object_kind.kind(),
-        verb,
-        result
-    );
+    // println!(
+    //     "Tested autonomy for {} {}: {:?}",
+    //     object_kind.kind(),
+    //     verb,
+    //     result
+    // );
 
     match result {
         Ok(_) => OperationResult {
@@ -107,7 +117,7 @@ async fn test_tenant_autonomy(
 
 // Generic operation test function
 // This function will call the specific operation test functions based on the verb
-async fn test_operation(
+pub async fn test_operation(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
     verb: KubernetesVerb,
