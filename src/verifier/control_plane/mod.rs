@@ -145,23 +145,46 @@ impl From<&[ObjectPropertyAssessment]> for ControlPlaneAutonomy {
     }
 }
 
-impl std::fmt::Display for ControlPlaneIsolationReport {
+impl Display for ControlPlaneAutonomyReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Enhanced Object Isolation Report")?;
+        writeln!(f, "Control Plane Autonomy Report")?;
+        writeln!(f, "==============================")?;
+        writeln!(f, "{}", self.autonomy_level)?;
+
+        if !self.failures.is_empty() {
+            writeln!(f, "\nAutonomy Failures:")?;
+            for failure in &self.failures {
+                writeln!(f, "  - {}", failure)?;
+            }
+        }
+
+        writeln!(f, "\nDetailed Results by Object Kind:")?;
+        for result in &self.objects_assessment {
+            writeln!(f, "  {} ({})", result.kind, result.kind.api_version())?;
+            writeln!(
+                f,
+                "    Autonomy: {}",
+                if result.is_valid { "✅" } else { "❌" }
+            )?;
+            for operation in &result.issued_operations {
+                writeln!(f, "      - {}: {}", operation.verb, operation.success)?;
+                if let Some(reason) = &operation.error_reason {
+                    writeln!(f, "        Reason: {}", reason)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Display for ControlPlaneIsolationReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Control Plane Isolation Report")?;
         writeln!(f, "=================================")?;
         writeln!(
             f,
             "Overall Isolation: {}",
             if self.overall_isolation_success {
-                "✅ PASS"
-            } else {
-                "❌ FAIL"
-            }
-        )?;
-        writeln!(
-            f,
-            "Overall Autonomy: {}",
-            if self.overall_autonomy_success {
                 "✅ PASS"
             } else {
                 "❌ FAIL"
@@ -175,21 +198,9 @@ impl std::fmt::Display for ControlPlaneIsolationReport {
             }
         }
 
-        if !self.autonomy_failures.is_empty() {
-            writeln!(f, "\nAutonomy Failures:")?;
-            for failure in &self.autonomy_failures {
-                writeln!(f, "  - {}", failure)?;
-            }
-        }
-
         writeln!(f, "\nDetailed Results by Object Kind:")?;
         for result in &self.objects_assessment {
             writeln!(f, "  {} ({})", result.kind, result.kind.api_version())?;
-            writeln!(
-                f,
-                "    Autonomy: {}",
-                if result.has_autonomy { "✅" } else { "❌" }
-            )?;
             writeln!(
                 f,
                 "    Isolation: {}",

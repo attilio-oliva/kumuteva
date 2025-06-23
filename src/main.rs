@@ -254,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
 
             match obj_isolation_result {
                 Ok(report) => {
-                    if report.overall_autonomy_success {
+                    if report.overall_isolation_success {
                         println!("Object isolation test passed");
                     } else {
                         println!("Object isolation test failed: {}", report);
@@ -269,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
                 verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
             match autonomy_result {
                 Ok(report) => {
-                    println!("{}", report.autonomy_level.to_string());
+                    println!("{}", report.autonomy_level);
                     println!("Detailed autonomy report:\n{}", report);
                 }
                 Err(e) => println!("Control plane autonomy could not complete: {}", e),
