@@ -17,7 +17,7 @@ use kube::{api::ListParams, Api, Client};
 use verifier::TenantClusterConfig;
 
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
-use crate::verifier::FairnessTestConfig;
+use crate::verifier::{ControlPlaneMultitenancyReport, FairnessTestConfig};
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
@@ -250,30 +250,41 @@ async fn main() -> anyhow::Result<()> {
             };
             let autonomy_result =
                 verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
-            match autonomy_result {
-                Ok(report) => {
-                    println!("{}", report.autonomy_level);
-                    println!("Detailed autonomy report:\n{}", report);
-                }
-                Err(e) => println!("Control plane autonomy could not complete: {}", e),
-            }
+
+            // match autonomy_result {
+            //     Ok(report) => {
+            //         println!("{}", report.autonomy_level);
+            //         println!("Detailed autonomy report:\n{}", report);
+            //     }
+            //     Err(e) => eprintln!("Control plane autonomy could not complete: {}", e),
+            // }
 
             let obj_isolation_result =
                 verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
 
-            match obj_isolation_result {
-                Ok(report) => {
-                    if report.overall_isolation_success {
-                        println!("Object isolation test passed");
-                    } else {
-                        println!("Object isolation test failed: {}", report);
-                    }
+            // match obj_isolation_result {
+            //     Ok(report) => {
+            //         if report.overall_isolation_success {
+            //             println!("Object isolation test passed");
+            //         } else {
+            //             println!("Object isolation test failed: {}", report);
+            //         }
 
-                    println!("Detailed report:\n{}", report);
-                }
-                Err(e) => println!("Object isolation could not complete: {}", e),
+            //         println!("Detailed report:\n{}", report);
+            //     }
+            //     Err(e) => eprintln!("Object isolation could not complete: {}", e),
+            // }
+
+            if autonomy_result.is_ok() && obj_isolation_result.is_ok() {
+                println!("Control plane autonomy and object isolation tests passed");
+                let report = ControlPlaneMultitenancyReport {
+                    autonomy: autonomy_result.unwrap(),
+                    isolation: obj_isolation_result.unwrap(),
+                };
+                println!("Detailed report:\n{}", report);
+            } else {
+                println!("Control plane autonomy or object isolation tests failed");
             }
-
             /* This will do the same as above, but formatted in a nice way
             let report = verifier::check_control_plane_isolation(&tenant1_config, &tenant2_config)
                 .await
