@@ -390,7 +390,7 @@ impl KubernetesClusterBuilder {
         }
 
         // create a namespace for the tenant
-        let tenant_cluster = KubernetesClient::load(&self.kubeconfig_path).await?;
+        let tenant_cluster = KubernetesClient::load_with_retry(&self.kubeconfig_path, 5).await?;
         tenant_cluster.create_namespace(tenant_name).await?;
 
         Ok(())
@@ -515,7 +515,7 @@ impl KubernetesClusterBuilder {
         std::fs::write(&self.kubeconfig_path, kubeconfig)?;
 
         // create a namespace to deploy workloads
-        let tenant_cluster = KubernetesClient::load(&self.kubeconfig_path).await?;
+        let tenant_cluster = KubernetesClient::load_with_retry(&self.kubeconfig_path, 10).await?;
         tenant_cluster.ensure_cluster_is_ready().await?;
         tenant_cluster.create_namespace(namespace).await?;
 
@@ -609,7 +609,7 @@ impl KubernetesClusterBuilder {
         }
 
         // Wait for KubeVirt to be ready
-        let tenant_cluster = KubernetesClient::load(&self.kubeconfig_path).await?;
+        let tenant_cluster = KubernetesClient::load_with_retry(&self.kubeconfig_path, 10).await?;
         tenant_cluster.ensure_cluster_is_ready().await?;
         tenant_cluster.create_namespace(namespace).await?;
 

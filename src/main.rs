@@ -241,11 +241,11 @@ async fn main() -> anyhow::Result<()> {
         } => {
             println!("Verifying cluster isolation...");
             let tenant1_config = TenantClusterConfig {
-                cluster: KubernetesClient::load(&tenant1_kubeconfig_path).await?,
+                cluster: KubernetesClient::load_with_retry(&tenant1_kubeconfig_path, 5).await?,
                 namespace: tenant1_namespace,
             };
             let tenant2_config = TenantClusterConfig {
-                cluster: KubernetesClient::load(&tenant2_kubeconfig_path).await?,
+                cluster: KubernetesClient::load_with_retry(&tenant2_kubeconfig_path, 5).await?,
                 namespace: tenant2_namespace,
             };
             let autonomy_result =
@@ -323,7 +323,7 @@ async fn get_or_create_tenant_cluster(
     kubeconfig_path: PathBuf,
     env_type: ClusterEnvironmentType,
 ) -> anyhow::Result<KubernetesClient> {
-    if let Ok(existing_cluster) = KubernetesClient::load(&kubeconfig_path).await {
+    if let Ok(existing_cluster) = KubernetesClient::load_with_retry(&kubeconfig_path, 3).await {
         println!("Tenant {} cluster already exists", tenant);
         if let Ok(health) = existing_cluster.list_all_pods().await {
             println!(

@@ -77,6 +77,46 @@ impl KubernetesClient {
         })
     }
 
+    /// Load a KubernetesClient with retry logic for Discovery initialization.
+    /// This is useful when connecting to clusters that might not be immediately ready,
+    /// such as freshly created vcluster instances.
+    pub async fn load_with_retry(kubeconfig_path: &Path, max_retries: u32) -> Result<Self> {
+        let kubeconfig = Kubeconfig::read_from(kubeconfig_path)?;
+        let options = KubeConfigOptions::default();
+        let config = Config::from_custom_kubeconfig(kubeconfig, &options).await?;
+        let client = Client::try_from(config)?;
+
+        let mut last_error = None;
+        for attempt in 1..=max_retries {
+            match Discovery::new(client.clone()).run().await {
+                Ok(discovery) => {
+                    return Ok(Self {
+                        client,
+                        discovery: Arc::new(discovery),
+                    });
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        println!(
+                            "Discovery failed on attempt {}/{}, retrying in 5 seconds: {}",
+                            attempt,
+                            max_retries,
+                            last_error.as_ref().unwrap()
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Failed to run discovery after {} attempts: {}",
+            max_retries,
+            last_error.unwrap()
+        ))
+    }
+
     pub async fn is_healthy(&self) -> bool {
         // Use the /healthz endpoint to check cluster health
         match self.client.apiserver_version().await {
@@ -499,11 +539,7 @@ impl KubernetesClient {
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
 
         // list the resources
-        let resources = if let Some(ns) = namespace {
-            api.list(&ListParams::default()).await
-        } else {
-            api.list(&ListParams::default()).await
-        };
+        let resources = api.list(&ListParams::default()).await;
 
         resources.map_err(|e| anyhow!("Failed to list resources: {}", e))
     }
@@ -522,15 +558,9 @@ impl KubernetesClient {
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
 
         // delete the resource
-        if let Some(ns) = namespace {
-            api.delete(resource_name, &Default::default())
-                .await
-                .map_err(|e| anyhow!("Failed to delete resource {}: {}", resource_name, e))?;
-        } else {
-            api.delete(resource_name, &Default::default())
-                .await
-                .map_err(|e| anyhow!("Failed to delete resource {}: {}", resource_name, e))?;
-        }
+        api.delete(resource_name, &Default::default())
+            .await
+            .map_err(|e| anyhow!("Failed to delete resource {}: {}", resource_name, e))?;
 
         Ok(())
     }
