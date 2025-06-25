@@ -108,6 +108,12 @@ pub struct ControlPlaneAutonomy {
     pub cluster_level: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ControlPlaneMultitenancyReport {
+    pub isolation: ControlPlaneIsolationReport,
+    pub autonomy: ControlPlaneAutonomyReport,
+}
+
 impl Display for ControlPlaneAutonomy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Control Plane Autonomy:")?;
@@ -279,6 +285,128 @@ impl Display for ControlPlaneIsolationReport {
                     }
                 };
                 writeln!(f, "      {}: {} {}", op.verb, result_status, error_info)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Display for ControlPlaneMultitenancyReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Multi-tenancy Control Plane Report")?;
+        writeln!(f, "==================================")?;
+
+        // Isolation summary
+        writeln!(
+            f,
+            "🔒 Isolation: {}",
+            if self.isolation.overall_isolation_success {
+                "✅ VERIFIED"
+            } else {
+                "❌ NOT VERIFIED"
+            }
+        )?;
+
+        // Check for untested objects in isolation
+        let untested_isolation_objects: Vec<_> = self
+            .isolation
+            .objects_assessment
+            .iter()
+            .filter(|assessment| matches!(assessment.result, AssessmentResult::NotEvaluated(_)))
+            .collect();
+        let failed_isolation_objects: Vec<_> = self
+            .isolation
+            .objects_assessment
+            .iter()
+            .filter(|assessment| !assessment.is_valid())
+            .collect();
+
+        if !failed_isolation_objects.is_empty() {
+            writeln!(f, "  • ❌ Objects failing isolation:")?;
+            for assessment in &failed_isolation_objects {
+                writeln!(f, "    - {}", assessment.kind)?;
+                if let AssessmentResult::Unsuccessful(reason) = &assessment.result {
+                    writeln!(f, "      Reason: {}", reason)?;
+                }
+            }
+        }
+
+        if !untested_isolation_objects.is_empty() {
+            writeln!(
+                f,
+                "  • ⚠️ Warning: {} object types could not be tested for isolation",
+                untested_isolation_objects.len()
+            )?;
+            for assessment in &untested_isolation_objects {
+                writeln!(f, "    - {}", assessment.kind)?;
+            }
+        }
+
+        writeln!(f)?; // Empty line
+
+        // Autonomy summary
+        writeln!(f, "🔧 Autonomy Levels:")?;
+        writeln!(
+            f,
+            "  • Namespace: {}",
+            if self.autonomy.autonomy_level.namespace_level {
+                "✅"
+            } else {
+                "❌"
+            }
+        )?;
+        writeln!(
+            f,
+            "  • Node: {}",
+            if self.autonomy.autonomy_level.node_level {
+                "✅"
+            } else {
+                "❌"
+            }
+        )?;
+        writeln!(
+            f,
+            "  • Cluster: {}",
+            if self.autonomy.autonomy_level.cluster_level {
+                "✅"
+            } else {
+                "❌"
+            }
+        )?;
+
+        // Show objects lacking full autonomy
+        let failed_autonomy_objects: Vec<_> = self
+            .autonomy
+            .objects_assessment
+            .iter()
+            .filter(|assessment| !assessment.is_valid())
+            .collect();
+
+        if !failed_autonomy_objects.is_empty() {
+            writeln!(f)?; // Empty line
+            writeln!(f, "❌ Objects lacking full autonomy:")?;
+            for assessment in &failed_autonomy_objects {
+                writeln!(f, "  • {}", assessment.kind)?;
+                if let AssessmentResult::Unsuccessful(reason) = &assessment.result {
+                    writeln!(f, "    Reason: {}", reason)?;
+                }
+            }
+        }
+
+        // Show untested autonomy objects
+        let untested_autonomy_objects: Vec<_> = self
+            .autonomy
+            .objects_assessment
+            .iter()
+            .filter(|assessment| matches!(assessment.result, AssessmentResult::NotEvaluated(_)))
+            .collect();
+
+        if !untested_autonomy_objects.is_empty() {
+            writeln!(f)?; // Empty line
+            writeln!(f, "⚠️  Objects not tested for autonomy:")?;
+            for assessment in &untested_autonomy_objects {
+                writeln!(f, "  • {}", assessment.kind)?;
             }
         }
 
