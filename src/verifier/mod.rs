@@ -191,9 +191,9 @@ impl IsolationTest for ControlPlaneIsolationProperty {
             ControlPlaneIsolationProperty::Fairness => {
                 check_fairness(tenant1, tenant2, FairnessTestConfig::default())
                     .await
-                    .map(|is_fair| TestResult {
-                        success: is_fair,
-                        message: if is_fair {
+                    .map(|fair_report| TestResult {
+                        success: fair_report.test_passed,
+                        message: if fair_report.test_passed {
                             String::from("Fairness test passed")
                         } else {
                             String::from("Fairness test failed")

@@ -275,15 +275,32 @@ async fn main() -> anyhow::Result<()> {
             //     Err(e) => eprintln!("Object isolation could not complete: {}", e),
             // }
 
-            if autonomy_result.is_ok() && obj_isolation_result.is_ok() {
+            let fairness = verifier::check_fairness(
+                Arc::new(tenant1_config),
+                Arc::new(tenant2_config),
+                FairnessTestConfig::default(),
+            )
+            .await;
+
+            if autonomy_result.is_ok() && obj_isolation_result.is_ok() && fairness.is_ok() {
                 println!("Control plane autonomy and object isolation tests passed");
                 let report = ControlPlaneMultitenancyReport {
                     autonomy: autonomy_result.unwrap(),
                     isolation: obj_isolation_result.unwrap(),
+                    fairness: fairness.unwrap(),
                 };
                 println!("Detailed report:\n{}", report);
             } else {
-                println!("Control plane autonomy or object isolation tests failed");
+                println!("Tests failed:");
+                if let Err(e) = autonomy_result {
+                    eprintln!("Control plane autonomy test failed: {}", e);
+                }
+                if let Err(e) = obj_isolation_result {
+                    eprintln!("Object isolation test failed: {}", e);
+                }
+                if let Err(e) = fairness {
+                    eprintln!("Fairness test failed: {}", e);
+                }
             }
             /* This will do the same as above, but formatted in a nice way
             let report = verifier::check_control_plane_isolation(&tenant1_config, &tenant2_config)

@@ -112,6 +112,7 @@ pub struct ControlPlaneAutonomy {
 pub struct ControlPlaneMultitenancyReport {
     pub isolation: ControlPlaneIsolationReport,
     pub autonomy: ControlPlaneAutonomyReport,
+    pub fairness: FairnessTestResults,
 }
 
 impl Display for ControlPlaneAutonomy {
@@ -415,6 +416,30 @@ impl Display for ControlPlaneMultitenancyReport {
                 .collect();
             writeln!(f, "  • Untested: [{}]", untested_kinds.join(", ")).unwrap();
         }
+        // Fairness summary
+        writeln!(f)?; // Empty line
+        writeln!(
+            f,
+            "⚖️   Fairness Test {}",
+            if self.fairness.test_passed {
+                "✅ PASSED"
+            } else {
+                "❌ FAILED"
+            }
+        )?;
+        writeln!(
+            f,
+            "  • Request latency increase with a noisy tenant: {:.2} %",
+            self.fairness
+                .final_results
+                .regular_relative_increase_percent
+        )?;
+        writeln!(
+            f,
+            "  • Error rate with a noisy tenant: {:.2}%",
+            self.fairness.final_results.regular_error_rate
+        )?;
+
         Ok(())
     }
 }

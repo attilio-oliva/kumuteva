@@ -106,7 +106,7 @@ pub async fn check_fairness(
     tenant1: Arc<TenantClusterConfig>,
     tenant2: Arc<TenantClusterConfig>,
     config: FairnessTestConfig,
-) -> Result<bool> {
+) -> Result<FairnessTestResults> {
     // Initialize global start time at the beginning of the test
     GLOBAL_TEST_START.get_or_init(Instant::now);
 
@@ -309,8 +309,8 @@ pub async fn check_fairness(
         }
     );
 
-    cleanup(&tenant1).await?;
-    cleanup(&tenant2).await?;
+    let _ = cleanup(&tenant1).await;
+    let _ = cleanup(&tenant2).await;
 
     // Prepare the final results
     let final_results = FinalResults {
@@ -342,7 +342,7 @@ pub async fn check_fairness(
     // Save the results to CSV files
     save_csv_data(&test_results, timestamp).await?;
 
-    Ok(test_passed)
+    Ok(test_results)
 }
 
 async fn save_baseline_csv_data(
