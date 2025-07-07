@@ -128,7 +128,7 @@ async fn setup_test_object(
     }
 }
 
-async fn find_existing_object(
+pub async fn find_existing_object(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
     creation_error: anyhow::Error,
@@ -491,7 +491,7 @@ async fn cleanup_test_object(
     Ok(())
 }
 
-fn create_minimal_object(
+pub fn create_minimal_object(
     object_kind: &KubernetesObject,
     object_name: &str,
     namespace: &str,

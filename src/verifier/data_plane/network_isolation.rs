@@ -130,7 +130,7 @@ pub async fn check_network_isolation(
 
     tenant2
         .cluster
-        .wait_for_resource_to_be_created::<Service>(
+        .wait_for_resource_creation::<Service>(
             &WEBSERVER_SERVICE.name().unwrap(),
             &tenant2.namespace,
         )

@@ -278,7 +278,10 @@ async fn main() -> anyhow::Result<()> {
             let fairness = verifier::check_fairness(
                 Arc::new(tenant1_config),
                 Arc::new(tenant2_config),
-                FairnessTestConfig::default(),
+                FairnessTestConfig {
+                    test_duration: std::time::Duration::from_secs(5),
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -289,7 +292,8 @@ async fn main() -> anyhow::Result<()> {
                     isolation: obj_isolation_result.unwrap(),
                     fairness: fairness.unwrap(),
                 };
-                println!("Detailed report:\n{}", report);
+                // Use to_string() or format! to get the string representation
+                println!("Detailed report:\n{}", report.detailed_display());
             } else {
                 println!("Tests failed:");
                 if let Err(e) = autonomy_result {

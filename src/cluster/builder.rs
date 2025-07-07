@@ -530,7 +530,7 @@ impl KubernetesClusterBuilder {
         let secret_name = format!("vc-{}", vcluster_name);
 
         cluster
-            .wait_for_resource_to_be_created::<Secret>(&secret_name, namespace)
+            .wait_for_resource_creation::<Secret>(&secret_name, namespace)
             .await?;
 
         let secret = cluster

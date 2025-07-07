@@ -445,7 +445,18 @@ impl Display for ControlPlaneMultitenancyReport {
 }
 
 impl ControlPlaneMultitenancyReport {
-    fn extended_display(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    /// Display detailed report with full information
+    pub fn detailed_display(&self) -> String {
+        format!("{}", DetailedDisplay(self))
+    }
+}
+
+// Wrapper for the current detailed display
+struct DetailedDisplay<'a>(&'a ControlPlaneMultitenancyReport);
+
+impl<'a> Display for DetailedDisplay<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let report = self.0;
         writeln!(f, "Multi-tenancy Control Plane Report")?;
         writeln!(f, "==================================")?;
 
@@ -453,7 +464,7 @@ impl ControlPlaneMultitenancyReport {
         writeln!(
             f,
             "🔒 Isolation: {}",
-            if self.isolation.overall_isolation_success {
+            if report.isolation.overall_isolation_success {
                 "✅ VERIFIED"
             } else {
                 "❌ NOT VERIFIED"
@@ -461,13 +472,13 @@ impl ControlPlaneMultitenancyReport {
         )?;
 
         // Check for untested objects in isolation
-        let untested_isolation_objects: Vec<_> = self
+        let untested_isolation_objects: Vec<_> = report
             .isolation
             .objects_assessment
             .iter()
             .filter(|assessment| matches!(assessment.result, AssessmentResult::NotEvaluated(_)))
             .collect();
-        let failed_isolation_objects: Vec<_> = self
+        let failed_isolation_objects: Vec<_> = report
             .isolation
             .objects_assessment
             .iter()
@@ -502,7 +513,7 @@ impl ControlPlaneMultitenancyReport {
         writeln!(
             f,
             "  • Namespace: {}",
-            if self.autonomy.autonomy_level.namespace_level {
+            if report.autonomy.autonomy_level.namespace_level {
                 "✅"
             } else {
                 "❌"
@@ -511,7 +522,7 @@ impl ControlPlaneMultitenancyReport {
         writeln!(
             f,
             "  • Node: {}",
-            if self.autonomy.autonomy_level.node_level {
+            if report.autonomy.autonomy_level.node_level {
                 "✅"
             } else {
                 "❌"
@@ -520,7 +531,7 @@ impl ControlPlaneMultitenancyReport {
         writeln!(
             f,
             "  • Cluster: {}",
-            if self.autonomy.autonomy_level.cluster_level {
+            if report.autonomy.autonomy_level.cluster_level {
                 "✅"
             } else {
                 "❌"
@@ -528,7 +539,7 @@ impl ControlPlaneMultitenancyReport {
         )?;
 
         // Show objects lacking full autonomy
-        let failed_autonomy_objects: Vec<_> = self
+        let failed_autonomy_objects: Vec<_> = report
             .autonomy
             .objects_assessment
             .iter()
@@ -547,7 +558,7 @@ impl ControlPlaneMultitenancyReport {
         }
 
         // Show untested autonomy objects
-        let untested_autonomy_objects: Vec<_> = self
+        let untested_autonomy_objects: Vec<_> = report
             .autonomy
             .objects_assessment
             .iter()
@@ -560,6 +571,33 @@ impl ControlPlaneMultitenancyReport {
             for assessment in &untested_autonomy_objects {
                 writeln!(f, "  • {}", assessment.kind)?;
             }
+        }
+
+        // Fairness summary
+        writeln!(f)?; // Empty line
+        writeln!(
+            f,
+            "⚖️  Fairness: {}",
+            if report.fairness.test_passed {
+                "✅ PASSED"
+            } else {
+                "❌ FAILED"
+            }
+        )?;
+        if !report.fairness.test_passed {
+            writeln!(
+                f,
+                "  • Error rate: {:.1}%",
+                report.fairness.final_results.regular_error_rate * 100.0
+            )?;
+            writeln!(
+                f,
+                "  • Latency increase: {:.1}%",
+                report
+                    .fairness
+                    .final_results
+                    .regular_relative_increase_percent
+            )?;
         }
 
         Ok(())

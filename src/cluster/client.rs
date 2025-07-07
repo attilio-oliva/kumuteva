@@ -711,7 +711,7 @@ impl KubernetesClient {
     }
     */
 
-    pub async fn wait_for_resource_to_be_created<R>(
+    pub async fn wait_for_resource_creation<R>(
         &self,
         resource_name: &str,
         namespace: &str,
@@ -749,6 +749,76 @@ impl KubernetesClient {
             }
         }
         Err(anyhow!("Resource was not created in time"))
+    }
+
+    pub async fn wait_for_dyn_resource_creation(
+        &self,
+        resource: &KubernetesObject,
+        resource_name: &str,
+        namespace: Option<&str>,
+    ) -> Result<DynamicObject> {
+        let kind = resource.kind();
+        // Common discovery, parameters, and api configuration for a single resource
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+            .with_context(|| format!("resource {resource:?} not found in cluster"))?;
+
+        let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", resource_name))
+            .timeout(10); // upper bound of how long we watch for
+
+        let resource_created = api.get(resource_name).await.is_ok();
+
+        if resource_created {
+            return Ok(api.get(resource_name).await?);
+        }
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(status) = stream.try_next().await? {
+            if let WatchEvent::Added(s) = status {
+                return Ok(s);
+            } else if api.get(resource_name).await.is_ok() {
+                return Ok(api.get(resource_name).await?);
+            }
+        }
+        Err(anyhow!("Resource was not created in time"))
+    }
+
+    pub async fn wait_for_dyn_resource_deletion(
+        &self,
+        resource: &KubernetesObject,
+        resource_name: &str,
+        namespace: Option<&str>,
+    ) -> Result<()> {
+        let kind = resource.kind();
+        // Common discovery, parameters, and api configuration for a single resource
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+            .with_context(|| format!("resource {resource:?} not found in cluster"))?;
+
+        let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", resource_name))
+            .timeout(30); // upper bound of how long we watch for
+
+        let resource_exists = api.get(resource_name).await.is_ok();
+
+        if !resource_exists {
+            return Ok(());
+        }
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(status) = stream.try_next().await? {
+            if let WatchEvent::Deleted(_) = status {
+                return Ok(());
+            } else if api.get(resource_name).await.is_err() {
+                return Ok(());
+            }
+        }
+        Err(anyhow!("Resource was not deleted in time"))
     }
 
     pub async fn watch_namespaced_resource_until_condition<R, F, O>(
@@ -1081,6 +1151,21 @@ impl KubernetesClient {
         let output = get_output(attached_process).await;
 
         Ok(output)
+    }
+
+    pub async fn dyn_object_exists(
+        &self,
+        resource: &KubernetesObject,
+        resource_name: &str,
+        namespace: Option<&str>,
+    ) -> Result<bool> {
+        let res = self
+            .get_resource_dyn(resource, resource_name, namespace)
+            .await;
+        match res {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 
     pub async fn get_pod_ip(&self, pod_name: &str, namespace: &str) -> Result<String> {

@@ -1027,7 +1027,7 @@ impl Request {
                     // Wait for the config map to be created
                     tenant_config
                         .cluster
-                        .wait_for_resource_to_be_created::<ConfigMap>(
+                        .wait_for_resource_creation::<ConfigMap>(
                             &config_map.name().unwrap(),
                             &tenant_config.namespace,
                         )
@@ -1042,7 +1042,7 @@ impl Request {
                     // Wait for the deployment to be created
                     tenant_config
                         .cluster
-                        .wait_for_resource_to_be_created::<Deployment>(
+                        .wait_for_resource_creation::<Deployment>(
                             &deployment.name().unwrap(),
                             &tenant_config.namespace,
                         )
