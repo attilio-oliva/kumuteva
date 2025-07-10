@@ -303,7 +303,7 @@ impl Display for ControlPlaneMultitenancyReport {
             .isolation
             .objects_assessment
             .iter()
-            .filter(|assessment| assessment.is_valid())
+            .filter(|assessment| matches!(assessment.result, AssessmentResult::Success))
             .count();
         let total_isolation_objects = self.isolation.objects_assessment.len();
 
@@ -366,11 +366,11 @@ impl Display for ControlPlaneMultitenancyReport {
         writeln!(f)?; // Empty line
 
         // Autonomy summary
-        writeln!(f, "🔧 Autonomy Levels:")?;
-
+        writeln!(f, "🔧 Autonomy:")?;
+        writeln!(f, "  • Levels:")?;
         writeln!(
             f,
-            "  • Namespace: {}",
+            "    - Namespace: {}",
             if self.autonomy.autonomy_level.namespace_level {
                 "✅"
             } else {
@@ -379,7 +379,7 @@ impl Display for ControlPlaneMultitenancyReport {
         )?;
         writeln!(
             f,
-            "  • Node: {}",
+            "    - Node: {}",
             if self.autonomy.autonomy_level.node_level {
                 "✅"
             } else {
@@ -388,13 +388,14 @@ impl Display for ControlPlaneMultitenancyReport {
         )?;
         writeln!(
             f,
-            "  • Cluster: {}",
+            "    - Cluster: {}",
             if self.autonomy.autonomy_level.cluster_level {
                 "✅"
             } else {
                 "❌"
             }
         )?;
+
         writeln!(
             f,
             "  • Overall full autonomy on {} out of {} objects",
@@ -414,14 +415,17 @@ impl Display for ControlPlaneMultitenancyReport {
             .filter(|assessment| !assessment.is_valid())
             .collect();
         if !failed_autonomy_objects.is_empty() {
-            writeln!(f)?; // Empty line
-            writeln!(f, "❌ Objects lacking full autonomy:")?;
             // Display each failed autonomy object as a single line, without reason
             let failed_kinds: Vec<_> = failed_autonomy_objects
                 .iter()
                 .map(|assessment| assessment.kind.to_string())
                 .collect();
-            writeln!(f, "  • Failed: [{}]", failed_kinds.join(", ")).unwrap();
+            writeln!(
+                f,
+                "    - Objects lacking full autonomy: [{}]",
+                failed_kinds.join(", ")
+            )
+            .unwrap();
         }
         // Show untested autonomy objects
         let untested_autonomy_objects: Vec<_> = self
