@@ -142,7 +142,8 @@ impl From<&[ObjectPropertyAssessment]> for ControlPlaneAutonomy {
         let namespace_level = assessments
             .iter()
             .filter(|assessment| {
-                assessment.kind.is_namespaced() || assessment.kind == KubernetesObject::Namespace
+                assessment.kind.is_namespaced() && assessment.kind != KubernetesObject::Event
+                    || assessment.kind == KubernetesObject::Namespace
             })
             .all(|autonomy| autonomy.is_valid());
 
@@ -298,14 +299,28 @@ impl Display for ControlPlaneMultitenancyReport {
         writeln!(f, "Multi-tenancy Control Plane Report")?;
         writeln!(f, "==================================")?;
 
+        let isolation_success_count = self
+            .isolation
+            .objects_assessment
+            .iter()
+            .filter(|assessment| assessment.is_valid())
+            .count();
+        let total_isolation_objects = self.isolation.objects_assessment.len();
+
         // Isolation summary
         writeln!(
             f,
             "🔒 Isolation: {}",
             if self.isolation.overall_isolation_success {
-                "✅ VERIFIED"
+                format!(
+                    "✅ VERIFIED ({} out of {} objects passed)",
+                    isolation_success_count, total_isolation_objects
+                )
             } else {
-                "❌ NOT VERIFIED"
+                format!(
+                    "❌ NOT VERIFIED ({} out of {} objects passed)",
+                    isolation_success_count, total_isolation_objects
+                )
             }
         )?;
 
@@ -379,6 +394,16 @@ impl Display for ControlPlaneMultitenancyReport {
             } else {
                 "❌"
             }
+        )?;
+        writeln!(
+            f,
+            "  • Overall full autonomy on {} out of {} objects",
+            self.autonomy
+                .objects_assessment
+                .iter()
+                .filter(|assessment| assessment.is_valid())
+                .count(),
+            self.autonomy.objects_assessment.len()
         )?;
 
         // Show objects lacking full autonomy

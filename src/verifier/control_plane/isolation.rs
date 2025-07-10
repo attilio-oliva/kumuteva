@@ -566,6 +566,29 @@ pub fn create_minimal_object(
             });
         }
 
+        KubernetesObject::DaemonSet => {
+            base_object["spec"] = serde_json::json!({
+                "selector": {
+                    "matchLabels": {
+                        "app": object_name
+                    }
+                },
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app": object_name
+                        }
+                    },
+                    "spec": {
+                        "containers": [{
+                            "name": "test-container",
+                            "image": "nginx:latest"
+                        }]
+                    }
+                }
+            });
+        }
+
         KubernetesObject::PersistentVolumeClaim => {
             base_object["spec"] = serde_json::json!({
                 "accessModes": ["ReadWriteOnce"],
@@ -573,9 +596,258 @@ pub fn create_minimal_object(
                     "requests": {
                         "storage": "1Gi"
                     }
+                },
+
+            });
+        }
+
+        KubernetesObject::PersistentVolume => {
+            // Create a folder path for the PV here before creating the object
+
+            // DO a sort of mkdir
+            use std::fs;
+            let pv_path = format!("/tmp/test-pv-{}", object_name);
+            fs::create_dir_all(&pv_path).context(format!(
+                "Failed to create directory for PersistentVolume at {}",
+                pv_path
+            ))?;
+
+            base_object["spec"] = serde_json::json!({
+                "capacity": {
+                    "storage": "1Gi"
+                },
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Retain",
+                "hostPath": {
+                    "path": format!("/tmp/test-pv-{}", object_name)
                 }
             });
         }
+
+        KubernetesObject::VolumeAttachment => {
+            base_object["spec"] = serde_json::json!({
+                "attacher": "kubernetes.io/no-provisioner",
+                "source": {
+                    "persistentVolumeName": object_name
+                },
+                "nodeName": "test-node"
+            });
+        }
+
+        KubernetesObject::ReplicaSet => {
+            base_object["spec"] = serde_json::json!({
+                "replicas": 1,
+                "selector": {
+                    "matchLabels": {
+                        "app": object_name
+                    }
+                },
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app": object_name
+                        }
+                    },
+                    "spec": {
+                        "containers": [{
+                            "name": "test-container",
+                            "image": "nginx:latest"
+                        }]
+                    }
+                }
+            });
+        }
+
+        KubernetesObject::StatefulSet => {
+            base_object["spec"] = serde_json::json!({
+                "serviceName": object_name,
+                "replicas": 1,
+                "selector": {
+                    "matchLabels": {
+                        "app": object_name
+                    }
+                },
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app": object_name
+                        }
+                    },
+                    "spec": {
+                        "containers": [{
+                            "name": "test-container",
+                            "image": "nginx:latest"
+                        }]
+                    }
+                },
+                "volumeClaimTemplates": [{
+                    "metadata": {
+                        "name": object_name
+                    },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": {
+                            "requests": {
+                                "storage": "1Gi"
+                            }
+                        }
+                    }
+                }]
+            });
+        }
+
+        KubernetesObject::Ingress => {
+            base_object["spec"] = serde_json::json!({
+                "rules": [{
+                    "host": format!("{}.example.com", object_name),
+                    "http": {
+                        "paths": [{
+                            "path": "/",
+                            "pathType": "Prefix",
+                            "backend": {
+                                "service": {
+                                    "name": object_name,
+                                    "port": {
+                                        "number": 80
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                }]
+            });
+        }
+
+        KubernetesObject::HorizontalPodAutoscaler => {
+            base_object["spec"] = serde_json::json!({
+                "scaleTargetRef": {
+                    "apiVersion": object_kind.api_version(),
+                    "kind": object_kind.kind(),
+                    "name": object_name
+                },
+                "minReplicas": 1,
+                "maxReplicas": 2,
+                "targetCPUUtilizationPercentage": 50
+            });
+        }
+
+        KubernetesObject::RoleBinding => {
+            base_object["roleRef"] = serde_json::json!({
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": object_name
+            });
+            base_object["subjects"] = serde_json::json!([{
+                "kind": "User",
+                "name": "test-user",
+                "apiGroup": "rbac.authorization.k8s.io"
+            }]);
+        }
+
+        KubernetesObject::ClusterRoleBinding => {
+            base_object["roleRef"] = serde_json::json!({
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": object_name
+            });
+            base_object["subjects"] = serde_json::json!([{
+                "kind": "User",
+                "name": "test-user",
+                "apiGroup": "rbac.authorization.k8s.io"
+            }]);
+        }
+
+        KubernetesObject::Job => {
+            base_object["spec"] = serde_json::json!({
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "job-name": object_name
+                        }
+                    },
+                    "spec": {
+                        "containers": [{
+                            "name": "test-container",
+                            "image": "nginx:latest"
+                        }],
+                        "restartPolicy": "Never"
+                    }
+                }
+            });
+        }
+
+        KubernetesObject::CronJob => {
+            base_object["spec"] = serde_json::json!({
+                "schedule": "*/5 * * * *",
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "metadata": {
+                                "labels": {
+                                    "job-name": object_name
+                                }
+                            },
+                            "spec": {
+                                "containers": [{
+                                    "name": "test-container",
+                                    "image": "nginx:latest"
+                                }],
+                                "restartPolicy": "Never"
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        KubernetesObject::StorageClass => {
+            base_object["provisioner"] =
+                serde_json::Value::String("kubernetes.io/no-provisioner".to_string());
+            base_object["parameters"] = serde_json::json!({
+                "type": "kubernetes.io/no-provisioner"
+            });
+        }
+
+        KubernetesObject::IngressClass => {
+            base_object["spec"] = serde_json::json!({
+                "controller": "k8s.io/ingress-nginx",
+                "parameters": {
+                    "apiVersion": "networking.k8s.io/v1",
+                    "kind": "ConfigMap",
+                    "name": "nginx-configuration"
+                }
+            });
+        }
+
+        KubernetesObject::NetworkPolicy => {
+            base_object["spec"] = serde_json::json!({
+                "podSelector": {
+                    "matchLabels": {
+                        "app": object_name
+                    }
+                },
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [{
+                    "from": [{
+                        "podSelector": {
+                            "matchLabels": {
+                                "app": object_name
+                            }
+                        }
+                    }]
+                }],
+                "egress": [{
+                    "to": [{
+                        "podSelector": {
+                            "matchLabels": {
+                                "app": object_name
+                            }
+                        }
+                    }]
+                }]
+            });
+        }
+
         // Add more specific cases as needed
         _ => {
             // For other resources, the base object should be sufficient

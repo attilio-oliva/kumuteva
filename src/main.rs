@@ -293,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
                     fairness: fairness.unwrap(),
                 };
                 // Use to_string() or format! to get the string representation
-                println!("Detailed report:\n{}", report.detailed_display());
+                println!("Detailed report:\n{}", report);
             } else {
                 println!("Tests failed:");
                 if let Err(e) = autonomy_result {
