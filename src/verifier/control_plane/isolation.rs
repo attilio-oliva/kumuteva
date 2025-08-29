@@ -624,16 +624,6 @@ pub fn create_minimal_object(
             });
         }
 
-        KubernetesObject::VolumeAttachment => {
-            base_object["spec"] = serde_json::json!({
-                "attacher": "kubernetes.io/no-provisioner",
-                "source": {
-                    "persistentVolumeName": object_name
-                },
-                "nodeName": "test-node"
-            });
-        }
-
         KubernetesObject::ReplicaSet => {
             base_object["spec"] = serde_json::json!({
                 "replicas": 1,

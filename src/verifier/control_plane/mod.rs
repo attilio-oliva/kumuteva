@@ -142,8 +142,7 @@ impl From<&[ObjectPropertyAssessment]> for ControlPlaneAutonomy {
         let namespace_level = assessments
             .iter()
             .filter(|assessment| {
-                assessment.kind.is_namespaced() && assessment.kind != KubernetesObject::Event
-                    || assessment.kind == KubernetesObject::Namespace
+                assessment.kind.is_namespaced() || assessment.kind == KubernetesObject::Namespace
             })
             .all(|autonomy| autonomy.is_valid());
 
@@ -291,6 +290,150 @@ impl Display for ControlPlaneIsolationReport {
         }
 
         Ok(())
+    }
+}
+
+// Wrapper for the compact display format
+struct CompactDisplay<'a>(&'a ControlPlaneMultitenancyReport);
+
+impl Display for CompactDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let report = self.0;
+        writeln!(f, "🔍 MULTI-TENANCY COMPACT ASSESSMENT")?;
+        writeln!(f, "═══════════════════════════════════════")?;
+        writeln!(f)?;
+
+        // Status indicators
+        let isolation_indicator = if report.isolation.overall_isolation_success {
+            "🟢"
+        } else {
+            "🔴"
+        };
+        let autonomy_indicator = if report.autonomy.autonomy_level.namespace_level
+            && report.autonomy.autonomy_level.node_level
+            && report.autonomy.autonomy_level.cluster_level
+        {
+            "🟢"
+        } else if report.autonomy.autonomy_level.namespace_level {
+            "🟡"
+        } else {
+            "🔴"
+        };
+        let fairness_indicator = if report.fairness.test_passed {
+            "🟢"
+        } else {
+            "🔴"
+        };
+
+        writeln!(
+            f,
+            "{} ISOLATION      │ {}",
+            isolation_indicator,
+            if report.isolation.overall_isolation_success {
+                "SECURE"
+            } else {
+                "VULNERABLE"
+            }
+        )?;
+        writeln!(
+            f,
+            "  └─ Objects: {}/{} protected",
+            report
+                .isolation
+                .objects_assessment
+                .iter()
+                .filter(|a| matches!(a.result, AssessmentResult::Success))
+                .count(),
+            report.isolation.objects_assessment.len()
+        )?;
+        writeln!(f)?;
+
+        writeln!(
+            f,
+            "{} AUTONOMY       │ Level: {}",
+            autonomy_indicator,
+            if report.autonomy.autonomy_level.cluster_level {
+                "CLUSTER"
+            } else if report.autonomy.autonomy_level.node_level {
+                "NODE"
+            } else if report.autonomy.autonomy_level.namespace_level {
+                "NAMESPACE"
+            } else {
+                "LIMITED"
+            }
+        )?;
+        writeln!(
+            f,
+            "  └─ Namespace: {}",
+            if report.autonomy.autonomy_level.namespace_level {
+                "✅"
+            } else {
+                "❌"
+            },
+        )?;
+        writeln!(
+            f,
+            "  └─ Node: {}",
+            if report.autonomy.autonomy_level.node_level {
+                "✅"
+            } else {
+                "❌"
+            },
+        )?;
+        writeln!(
+            f,
+            "  └─ Cluster: {}",
+            if report.autonomy.autonomy_level.cluster_level {
+                "✅"
+            } else {
+                "❌"
+            }
+        )?;
+        writeln!(f)?;
+
+        writeln!(
+            f,
+            "{} FAIRNESS       │ {}",
+            fairness_indicator,
+            if report.fairness.test_passed {
+                "FAIR"
+            } else {
+                "UNFAIR"
+            }
+        )?;
+        writeln!(
+            f,
+            "  └─ Latency impact: {:+.1}%",
+            report
+                .fairness
+                .final_results
+                .regular_relative_increase_percent
+        )?;
+        writeln!(
+            f,
+            "  └─ Error rate: {:.1}%",
+            report.fairness.final_results.regular_error_rate
+        )?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ReportFormat {
+    Dashboard, // Current default Display implementation
+    Compact,   // Your new format
+    Detailed,  // Existing detailed format
+}
+
+impl ControlPlaneMultitenancyReport {
+    /// Display report in specified format
+    pub fn format_as(&self, format: ReportFormat) -> String {
+        match format {
+            ReportFormat::Dashboard => format!("{}", self),
+            ReportFormat::Compact => format!("{}", CompactDisplay(self)),
+            ReportFormat::Detailed => format!("{}", DetailedDisplay(self)),
+        }
     }
 }
 
@@ -473,17 +616,10 @@ impl Display for ControlPlaneMultitenancyReport {
     }
 }
 
-impl ControlPlaneMultitenancyReport {
-    /// Display detailed report with full information
-    pub fn detailed_display(&self) -> String {
-        format!("{}", DetailedDisplay(self))
-    }
-}
-
 // Wrapper for the current detailed display
 struct DetailedDisplay<'a>(&'a ControlPlaneMultitenancyReport);
 
-impl<'a> Display for DetailedDisplay<'a> {
+impl Display for DetailedDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let report = self.0;
         writeln!(f, "Multi-tenancy Control Plane Report")?;

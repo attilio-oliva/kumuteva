@@ -657,6 +657,11 @@ fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
                         "enabled": true,
                         "syncBackChanges": true
                     },
+                },
+                "toHost": {
+                    "persistentVolumes": {
+                        "enabled": true,
+                    },
                     "storageClasses": {
                         "enabled": true
                     },

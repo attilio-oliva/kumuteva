@@ -17,7 +17,7 @@ use kube::{api::ListParams, Api, Client};
 use verifier::TenantClusterConfig;
 
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
-use crate::verifier::{ControlPlaneMultitenancyReport, FairnessTestConfig};
+use crate::verifier::{ControlPlaneMultitenancyReport, FairnessTestConfig, ReportFormat};
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
@@ -292,8 +292,8 @@ async fn main() -> anyhow::Result<()> {
                     isolation: obj_isolation_result.unwrap(),
                     fairness: fairness.unwrap(),
                 };
-                // Use to_string() or format! to get the string representation
-                println!("Detailed report:\n{}", report);
+
+                println!("{}", report.format_as(ReportFormat::Dashboard));
             } else {
                 println!("Tests failed:");
                 if let Err(e) = autonomy_result {

@@ -131,7 +131,6 @@ define_kubernetes_objects! {
     Namespace => k8s_openapi::api::core::v1::Namespace,
     ServiceAccount => k8s_openapi::api::core::v1::ServiceAccount,
     Endpoints => k8s_openapi::api::core::v1::Endpoints,
-    Event => k8s_openapi::api::core::v1::Event,
     LimitRange => k8s_openapi::api::core::v1::LimitRange,
     ResourceQuota => k8s_openapi::api::core::v1::ResourceQuota,
     Node => k8s_openapi::api::core::v1::Node,
@@ -141,6 +140,7 @@ define_kubernetes_objects! {
     ReplicaSet => k8s_openapi::api::apps::v1::ReplicaSet,
     StatefulSet => k8s_openapi::api::apps::v1::StatefulSet,
     DaemonSet => k8s_openapi::api::apps::v1::DaemonSet,
+
 
     // Batch API (batch/v1)
     Job => k8s_openapi::api::batch::v1::Job,
@@ -165,7 +165,6 @@ define_kubernetes_objects! {
 
     // Storage API (storage.k8s.io/v1)
     StorageClass => k8s_openapi::api::storage::v1::StorageClass,
-    VolumeAttachment => k8s_openapi::api::storage::v1::VolumeAttachment,
 
     // Extensions for custom resources can be added here
 }
