@@ -6,7 +6,7 @@ use k8s_openapi::api::{
 };
 use serde::Serialize;
 
-use crate::verifier::TenantClusterConfig;
+use crate::verifier::{StorageIsolationReport, TenantClusterConfig};
 
 // Constants for resource naming and configuration
 const POD_NAME: &str = "persistent-pod";
@@ -45,7 +45,7 @@ fn tenant2_commands() -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageIsolationCheckStrategy {
+pub enum StorageIsolationCheckStrategy {
     CheckStorageClasses,
     CheckPVReclaimPolicy,
     MountOtherTenantStorage,
@@ -58,7 +58,7 @@ enum StorageIsolationCheckStrategy {
 pub async fn check_storage_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<StorageIsolationReport> {
     let strategy = StorageIsolationCheckStrategy::MountOtherTenantStorage;
     // First attempt to check storage classes
     // As this assumes the tenants have permission to list StorageClass objects,
@@ -70,9 +70,12 @@ pub async fn check_storage_isolation(
     // If we can't check storage classes, we can try by creating  a PVC and checking if it's isolated
     // first attempt to check PV persistentVolumeReclaimPolicy field as it's set by the StorageClass
     // if the tenant doesn't have permission to list PVs, we can't check this
-    attempt_other_tenant_file_access(tenant1, tenant2, strategy).await?;
+    let can_access = attempt_other_tenant_file_access(tenant1, tenant2, strategy).await;
 
-    Ok(())
+    Ok(StorageIsolationReport {
+        check_strategy: strategy,
+        success: can_access.is_err(),
+    })
 }
 
 /// Check if the storage is isolated between two tenants using StorageClass objects.

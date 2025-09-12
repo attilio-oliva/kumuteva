@@ -275,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
             //     Err(e) => eprintln!("Object isolation could not complete: {}", e),
             // }
 
+            /*
             let fairness = verifier::check_fairness(
                 Arc::new(tenant1_config),
                 Arc::new(tenant2_config),
@@ -306,6 +307,8 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Fairness test failed: {}", e);
                 }
             }
+            */
+
             /* This will do the same as above, but formatted in a nice way
             let report = verifier::check_control_plane_isolation(&tenant1_config, &tenant2_config)
                 .await
@@ -314,35 +317,24 @@ async fn main() -> anyhow::Result<()> {
             println!("Control plane isolation test results:\n{}", report);
             */
 
-            // let is_network_isolated =
+            let network_autonomy =
+                verifier::check_network_autonomy(&tenant1_config, &tenant2_config)
+                    .await
+                    .context("Failed to verify network autonomy")?;
+
+            // let network_isolation =
             //     verifier::check_network_isolation(&tenant1_config, &tenant2_config)
             //         .await
             //         .context("Failed to verify network isolation")?;
 
-            // if is_network_isolated {
-            //     println!("Network isolation test passed");
-            // } else {
-            //     println!("Network isolation test failed");
-            // }
+            // let storage_isolation =
+            //     verifier::check_storage_isolation(&tenant1_config, &tenant2_config)
+            //         .await
+            //         .context("Failed to verify storage isolation")?;
 
-            // let is_storage_isolated =
-            //     verifier::check_storage_isolation(&tenant1_config, &tenant2_config).await;
-
-            // match is_storage_isolated {
-            //     Ok(_) => println!("Storage isolation test passed"),
-            //     Err(e) => println!("Storage isolation test failed: {}", e),
-            // }
-
-            // let fairness = verifier::check_fairness(
-            //     Arc::new(tenant1_config),
-            //     Arc::new(tenant2_config),
-            //     FairnessTestConfig::default(),
-            // )
-            // .await;
-            // match fairness {
-            //     Ok(_) => println!("Fairness test passed"),
-            //     Err(e) => println!("Fairness test failed: {}", e),
-            // }
+            // println!("{}", network_isolation);
+            println!("{}", network_autonomy);
+            // println!("{}", storage_isolation);
         }
     }
 

@@ -362,6 +362,7 @@ impl fmt::Display for TestResult {
 }
 
 /// All the configuration needed to test a tenant cluster isolation.
+#[derive(Clone)]
 pub struct TenantClusterConfig {
     pub cluster: KubernetesClient,
     /// The namespace to use for the tenant's resources created during the tests.

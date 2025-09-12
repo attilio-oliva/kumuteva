@@ -6,6 +6,7 @@ use k8s_openapi::api::core::v1::{
     Namespace, Node, Pod, Secret, Service, ServiceAccount, ServicePort, ServiceSpec,
 };
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::{ClusterResourceScope, Metadata, NamespaceResourceScope, Resource};
 use kube::api::{
@@ -36,7 +37,8 @@ use crate::verifier::KubernetesObject;
 use super::DummyCRD;
 
 /// An abstraction over a Kubernetes client.
-/// This struct is used to interact with a Kubernetes cluster using `kube` crate.
+/// This struct is used to interact with a Kubernetes cluster using `kube` crate
+#[derive(Clone)]
 pub struct KubernetesClient {
     client: Client,
     discovery: Arc<Discovery>,
@@ -1151,6 +1153,31 @@ impl KubernetesClient {
         let output = get_output(attached_process).await;
 
         Ok(output)
+    }
+    pub async fn exec_command_in_container_with_status(
+        &self,
+        pod_name: &str,
+        namespace: &str,
+        command: &str,
+    ) -> Result<Status> {
+        let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
+        let mut attached_process = pods_api
+            .exec(
+                pod_name,
+                vec!["sh", "-c", command],
+                &AttachParams::default().stderr(false),
+            )
+            .await?;
+
+        let exit_status = attached_process
+            .take_status()
+            .ok_or(Error::msg(
+                "Failed to get process status. The process might still be running.",
+            ))?
+            .await
+            .ok_or(Error::msg("Failed to wait for process status"))?;
+
+        Ok(exit_status)
     }
 
     pub async fn dyn_object_exists(
