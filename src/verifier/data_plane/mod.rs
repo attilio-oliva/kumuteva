@@ -1,4 +1,4 @@
-mod network_isolation;
+mod network;
 mod storage_isolation;
 
 use std::fmt::Display;
