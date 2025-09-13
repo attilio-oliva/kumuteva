@@ -163,23 +163,3 @@ pub async fn check_network_isolation(
         success: !can_reach_other_pod && !can_reach_service && !can_resolve_dns,
     })
 }
-
-// Comprehensive network multi-tenancy check including both isolation and autonomy
-// pub async fn check_network_multitenancy(
-//     tenant1: &TenantClusterConfig,
-//     tenant2: &TenantClusterConfig,
-// ) -> Result<ExtendedNetworkIsolationReport> {
-//     // First check autonomy (less disruptive)
-//     let autonomy = check_network_autonomy(tenant1, tenant2).await?;
-
-//     // Then check isolation
-//     let isolation = check_network_isolation(tenant1, tenant2).await?;
-
-//     let overall_success = isolation.success && autonomy;
-
-//     Ok(ExtendedNetworkIsolationReport {
-//         isolation,
-//         autonomy,
-//         overall_success,
-//     })
-// }

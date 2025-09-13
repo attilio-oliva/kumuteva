@@ -1,11 +1,31 @@
-mod network_autonomy;
-mod network_isolation;
+mod autonomy;
+mod isolation;
 
-pub use network_autonomy::*;
-pub use network_isolation::*;
+pub use autonomy::*;
+pub use isolation::*;
 
+use anyhow::Result;
 use k8s_openapi::api::core::v1::{Pod, Service};
-use std::sync::LazyLock;
+use std::{fmt::Display, sync::LazyLock};
+
+use crate::verifier::TenantClusterConfig;
+
+pub struct NetworkReport {
+    pub isolation: NetworkIsolationReport,
+    pub autonomy: NetworkAutonomyReport,
+}
+
+pub struct NetworkIsolationReport {
+    pub pod_isolation: bool,
+    pub service_isolation: bool,
+    pub dns_isolation: bool,
+    pub success: bool,
+}
+
+pub struct NetworkAutonomyReport {
+    pub service_exposure: bool,
+    pub success: bool,
+}
 
 const NETWORK_MULTITOOL_IMAGE: &str = "wbitt/network-multitool";
 const NETWORK_MULTITOOL_POD_NAME: &str = "network-multitool";
@@ -60,3 +80,81 @@ static WEBSERVER_SERVICE: LazyLock<Service> = LazyLock::new(|| {
     ))
     .unwrap()
 });
+
+// Comprehensive network multi-tenancy check including both isolation and autonomy
+pub async fn check_network_multitenancy(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> Result<NetworkReport> {
+    let autonomy = check_network_autonomy(tenant1, tenant2).await?;
+    let isolation = check_network_isolation(tenant1, tenant2).await?;
+
+    Ok(NetworkReport {
+        isolation,
+        autonomy,
+    })
+}
+
+impl Display for NetworkReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Multi-tenancy Data Plane - Network Report")?;
+        writeln!(f, "========================================")?;
+
+        // Isolation summary
+        writeln!(
+            f,
+            "🔒 Isolation: {}",
+            if self.isolation.success {
+                "✅ VERIFIED"
+            } else {
+                "❌ NOT VERIFIED"
+            }
+        )?;
+
+        if !self.isolation.success {
+            writeln!(f, "  • ❌ Failing isolation:")?;
+            if !self.isolation.pod_isolation {
+                writeln!(f, "    - Cross-Tenant Pod Communication: Failed")?;
+            }
+            if !self.isolation.service_isolation {
+                writeln!(f, "    - Cross-Tenant Service Communication: Failed")?;
+            }
+            if !self.isolation.dns_isolation {
+                writeln!(f, "    - Cross-Tenant DNS Resolution: Failed")?;
+            }
+        }
+
+        writeln!(f)?; // Empty line
+
+        // Autonomy summary
+        writeln!(
+            f,
+            "🔧 Autonomy: {}",
+            if self.autonomy.success {
+                "✅ VERIFIED"
+            } else {
+                "❌ NOT VERIFIED"
+            }
+        )?;
+
+        writeln!(
+            f,
+            "  • Service Exposure Autonomy: {}",
+            if self.autonomy.service_exposure {
+                "✅"
+            } else {
+                "❌"
+            }
+        )?;
+
+        if !self.autonomy.success {
+            writeln!(f, "  • ❌ Issues:")?;
+            writeln!(
+                f,
+                "    - Tenants cannot independently expose services on same ports (using NodePort)"
+            )?;
+        }
+
+        Ok(())
+    }
+}

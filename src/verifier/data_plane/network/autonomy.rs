@@ -1,7 +1,7 @@
 use anyhow::Result;
 use k8s_openapi::api::core::v1::Service;
 
-use crate::verifier::TenantClusterConfig;
+use crate::verifier::{NetworkAutonomyReport, TenantClusterConfig};
 
 const AUTONOMY_TEST_SERVICE_NAME: &str = "autonomy-test-service";
 const AUTONOMY_TEST_PORT: i32 = 8080;
@@ -13,7 +13,7 @@ const AUTONOMY_TEST_NODE_PORT: i32 = 30080;
 pub async fn check_network_autonomy(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> Result<bool> {
+) -> Result<NetworkAutonomyReport> {
     println!("Testing network autonomy - service exposure independence...");
 
     // Create identical services in both tenant namespaces
@@ -29,14 +29,14 @@ pub async fn check_network_autonomy(
         .await;
 
     if tenant1_service_created.is_err() {
-        println!(
-            "Failed to create service in tenant1: {:?}",
+        return Err(anyhow::anyhow!(
+            "Failed to create a Nodeport service in tenant1 at {}: {:?}",
+            AUTONOMY_TEST_NODE_PORT,
             tenant1_service_created.err()
-        );
-        return Ok(false);
+        ));
     }
 
-    println!("Successfully created service in tenant1 namespace");
+    //println!("Successfully created service in tenant1 namespace");
 
     // Try to create identical service in tenant2 (same port, same name)
     let tenant2_service_created = tenant2
@@ -70,7 +70,10 @@ pub async fn check_network_autonomy(
             .await;
     }
 
-    Ok(autonomy_success)
+    Ok(NetworkAutonomyReport {
+        service_exposure: autonomy_success,
+        success: autonomy_success,
+    })
 }
 
 /// Create a test service for autonomy testing - builds fresh each time
