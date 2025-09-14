@@ -317,16 +317,18 @@ async fn main() -> anyhow::Result<()> {
             println!("Control plane isolation test results:\n{}", report);
             */
 
-            let network_report =
-                verifier::check_network_multitenancy(&tenant1_config, &tenant2_config).await?;
+            // let network_report =
+            //     verifier::check_network_multitenancy(&tenant1_config, &tenant2_config).await?;
 
             // let storage_isolation =
             //     verifier::check_storage_isolation(&tenant1_config, &tenant2_config)
             //         .await
             //         .context("Failed to verify storage isolation")?;
+            let storage_automony =
+                verifier::check_storage_autonomy(&tenant1_config, &tenant2_config).await?;
 
-            // println!("{}", network_isolation);
-            println!("{}", network_report);
+            //println!("{}", network_report);
+            println!("Storage autonomy test passed: {}", storage_automony);
             // println!("{}", storage_isolation);
         }
     }

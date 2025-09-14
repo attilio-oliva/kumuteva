@@ -21,25 +21,25 @@ fn file_path() -> String {
     format!("{}/{}", MOUNT_PATH, FILE_NAME)
 }
 
-fn tenant1_commands() -> Vec<String> {
+fn write_file_commands(path: &str, content: &str) -> Vec<String> {
     vec![
         "sh".to_string(),
         "-c".to_string(),
         // write the file then sleep briefly before exit
-        format!("echo '{}' > {} && sleep 2", FILE_CONTENT, file_path()),
+        format!("echo '{}' > {} && sleep 2", content, path),
     ]
 }
 
-fn tenant2_commands() -> Vec<String> {
+fn read_file_and_compare_commands(path: &str, expected: &str) -> Vec<String> {
     vec![
         "sh".to_string(),
         "-c".to_string(),
         format!(
             "echo 'Reading file content:' && cat {} 2>/dev/null || echo 'File not found/accessible' && \
              if [ \"$(cat {} 2>/dev/null)\" = \"{}\" ]; then exit 1; else exit 0; fi",
-            file_path(),
-            file_path(),
-            FILE_CONTENT
+            path,
+            path,
+            expected
         ),
     ]
 }
@@ -159,8 +159,8 @@ async fn attempt_other_tenant_file_access(
     strategy: StorageIsolationCheckStrategy,
 ) -> anyhow::Result<()> {
     let file_path = format!("{}/{}", MOUNT_PATH, FILE_NAME);
-    let tenant1_commands = tenant1_commands();
-    let tenant2_commands = tenant2_commands();
+    let tenant1_commands = write_file_commands(&file_path, FILE_CONTENT);
+    let tenant2_commands = read_file_and_compare_commands(&file_path, FILE_CONTENT);
 
     // Step 1: Create StatefulSet in tenant1 with PVC
     println!("Creating a StatefulSet in tenant1");
@@ -589,4 +589,496 @@ async fn cleanup(
         .await?;
 
     Ok(())
+}
+
+// Add these constants for autonomy testing
+const AUTONOMY_POD_NAME: &str = "autonomy-test-pod";
+const AUTONOMY_PVC_NAME: &str = "autonomy-pv-claim";
+
+/// Create a long-living StatefulSet for autonomy testing (without init commands)
+fn create_autonomy_statefulset_manifest() -> anyhow::Result<StatefulSet> {
+    let pod_manifest: StatefulSet = serde_json::from_value(serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {
+            "name": AUTONOMY_POD_NAME,
+        },
+        "spec": {
+            "replicas": 1,
+            "selector": {
+                "matchLabels": {
+                    "app": AUTONOMY_POD_NAME
+                },
+            },
+            "template": {
+                "metadata": {
+                    "labels": {
+                        "app": AUTONOMY_POD_NAME
+                    },
+                },
+                "spec": {
+                    "containers": [
+                        {
+                            "name": AUTONOMY_POD_NAME,
+                            "image": "nginx",
+                            // Keep nginx running without any init commands
+                            "command": ["nginx"],
+                            "args": ["-g", "daemon off;"],
+                            "volumeMounts": [
+                                {
+                                    "mountPath": MOUNT_PATH,
+                                    "name": AUTONOMY_PVC_NAME
+                                },
+                            ],
+                            "ports": [
+                                {
+                                    "containerPort": 80,
+                                    "name": "http"
+                                }
+                            ]
+                        },
+                    ],
+                },
+            },
+            "volumeClaimTemplates": [
+                {
+                    "metadata": {
+                        "name": AUTONOMY_PVC_NAME,
+                    },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": {
+                            "requests": {
+                                "storage": STORAGE_SIZE,
+                            },
+                        },
+                    },
+                },
+            ],
+        }
+    }))?;
+
+    Ok(pod_manifest)
+}
+
+/// Create and wait for autonomy StatefulSet to be ready
+async fn create_and_wait_autonomy_statefulset(tenant: &TenantClusterConfig) -> anyhow::Result<()> {
+    println!(
+        "Creating autonomy StatefulSet for tenant: {}",
+        tenant.namespace
+    );
+
+    let statefulset = create_autonomy_statefulset_manifest()?;
+
+    tenant
+        .cluster
+        .create_namespaced_resource::<StatefulSet>(&statefulset, &tenant.namespace)
+        .await?;
+
+    // Wait for StatefulSet to be ready
+    tenant
+        .cluster
+        .watch_namespaced_resource_until_condition::<StatefulSet, _, _>(
+            AUTONOMY_POD_NAME,
+            &tenant.namespace,
+            POD_CREATION_TIMEOUT,
+            |_event| async {
+                let stateful_set = tenant
+                    .cluster
+                    .get_resource_in_namespace::<StatefulSet>(AUTONOMY_POD_NAME, &tenant.namespace)
+                    .await;
+
+                if let Result::Ok(stateful_set) = stateful_set {
+                    let replicas = stateful_set
+                        .status
+                        .as_ref()
+                        .map(|status| status.replicas)
+                        .unwrap_or(0);
+                    let ready_replicas = stateful_set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.ready_replicas)
+                        .unwrap_or(0);
+
+                    println!(
+                        "Autonomy StatefulSet - replicas: {}, ready_replicas: {}",
+                        replicas, ready_replicas
+                    );
+                    replicas > 0 && replicas == ready_replicas
+                } else {
+                    false
+                }
+            },
+        )
+        .await?;
+
+    println!(
+        "Autonomy StatefulSet is ready for tenant: {}",
+        tenant.namespace
+    );
+    Ok(())
+}
+
+/// Execute a command in the autonomy pod with retry logic
+async fn execute_autonomy_command(
+    tenant: &TenantClusterConfig,
+    command: &str,
+) -> anyhow::Result<bool> {
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    for attempt in 1..=MAX_RETRIES {
+        match tenant
+            .cluster
+            .exec_command_in_container_with_status(AUTONOMY_POD_NAME, &tenant.namespace, command)
+            .await
+        {
+            Result::Ok(status) => {
+                return Ok(status.code == Some(0));
+            }
+            Result::Err(e)
+                if e.to_string().contains("404") || e.to_string().contains("WebSocket") =>
+            {
+                if attempt < MAX_RETRIES {
+                    println!(
+                        "⚠️ WebSocket connection failed (attempt {}), retrying... [Error: {}]",
+                        attempt, e
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                } else {
+                    println!(
+                        "❌ Failed to execute command after {} attempts: {}",
+                        MAX_RETRIES, e
+                    );
+                    return Ok(false);
+                }
+            }
+            Err(e) => {
+                println!("❌ Command execution failed: {}", e);
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Test storage autonomy using pod completion status instead of exec
+pub async fn check_storage_autonomy(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<bool> {
+    println!("Testing storage autonomy - comprehensive I/O operations via pod completion...");
+
+    // Test 1: Both tenants can create PVCs and perform basic I/O on files
+    let basic_io_success = test_basic_io_via_pods(tenant1, tenant2).await?;
+
+    if !basic_io_success {
+        cleanup_autonomy_pod_tests(tenant1, tenant2).await;
+        return Ok(false);
+    }
+
+    // Test 2: Both tenants can perform advanced I/O operations (on directory and permissions)
+    let advanced_io_success = test_advanced_io_via_pods(tenant1, tenant2).await?;
+
+    let overall_success = basic_io_success && advanced_io_success;
+
+    if overall_success {
+        println!(
+            "✅ Storage autonomy verified: Both tenants can independently perform I/O operations"
+        );
+    } else {
+        println!("❌ Storage autonomy failed: Issues with I/O operations");
+    }
+
+    cleanup_autonomy_pod_tests(tenant1, tenant2).await;
+    Ok(overall_success)
+}
+
+async fn test_basic_io_via_pods(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<bool> {
+    println!("Testing basic I/O operations via pod completion...");
+
+    // Create pods that perform I/O operations and complete
+    let tenant1_pod = create_io_test_pod(
+        tenant1,
+        "basic-io-test-1",
+        &[
+            "echo 'Tenant1 basic content' > /data/tenant1-file.txt".to_string(),
+            "cat /data/tenant1-file.txt".to_string(),
+            "ls -la /data/".to_string(),
+            "echo 'Basic I/O test completed successfully'".to_string(),
+        ],
+    )
+    .await?;
+
+    let tenant2_pod = create_io_test_pod(
+        tenant2,
+        "basic-io-test-2",
+        &[
+            "echo 'Tenant2 basic content' > /data/tenant2-file.txt".to_string(),
+            "cat /data/tenant2-file.txt".to_string(),
+            "ls -la /data/".to_string(),
+            "echo 'Basic I/O test completed successfully'".to_string(),
+        ],
+    )
+    .await?;
+
+    // Wait for both pods to complete successfully
+    let tenant1_success = wait_for_pod_completion(tenant1, "basic-io-test-1").await?;
+    let tenant2_success = wait_for_pod_completion(tenant2, "basic-io-test-2").await?;
+
+    let success = tenant1_success && tenant2_success;
+
+    if success {
+        println!("✅ Basic I/O operations successful for both tenants");
+    } else {
+        println!(
+            "❌ Basic I/O operations failed - tenant1: {}, tenant2: {}",
+            tenant1_success, tenant2_success
+        );
+    }
+
+    Ok(success)
+}
+
+async fn create_io_test_pod(
+    tenant: &TenantClusterConfig,
+    pod_name: &str,
+    commands: &[String],
+) -> anyhow::Result<()> {
+    let command_script = commands.join(" && ");
+
+    let pod = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "namespace": tenant.namespace,
+            "labels": {
+                "app": "storage-autonomy-test"
+            }
+        },
+        "spec": {
+            "containers": [{
+                "name": "test-container",
+                "image": "busybox",
+                "command": ["/bin/sh"],
+                "args": ["-c", command_script],
+                "volumeMounts": [{
+                    "name": "test-volume",
+                    "mountPath": "/data"
+                }]
+            }],
+            "volumes": [{
+                "name": "test-volume",
+                "persistentVolumeClaim": {
+                    "claimName": format!("{}-pvc", pod_name)
+                }
+            }],
+            "restartPolicy": "Never"
+        }
+    }))
+    .unwrap();
+
+    // Create PVC first
+    let pvc = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": format!("{}-pvc", pod_name),
+            "namespace": tenant.namespace
+        },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {
+                "requests": {
+                    "storage": STORAGE_SIZE
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    tenant
+        .cluster
+        .create_namespaced_resource::<PersistentVolumeClaim>(&pvc, &tenant.namespace)
+        .await?;
+
+    // Wait a bit for PVC to be bound
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Create pod
+    tenant
+        .cluster
+        .create_namespaced_resource::<k8s_openapi::api::core::v1::Pod>(&pod, &tenant.namespace)
+        .await?;
+
+    Ok(())
+}
+
+async fn test_advanced_io_via_pods(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<bool> {
+    println!("Testing advanced I/O operations via pod completion...");
+
+    // Create pods that perform advanced I/O operations and complete
+    create_io_test_pod(
+        tenant1,
+        "advanced-io-test-1",
+        &[
+            "mkdir -p /data/custom-dir".to_string(),
+            "echo 'Tenant1 advanced content' > /data/custom-dir/advanced-file.txt".to_string(),
+            "chmod 600 /data/custom-dir/advanced-file.txt".to_string(),
+            "ls -la /data/custom-dir/".to_string(),
+            "cat /data/custom-dir/advanced-file.txt".to_string(),
+            "echo 'Advanced I/O test completed successfully'".to_string(),
+        ],
+    )
+    .await?;
+
+    create_io_test_pod(
+        tenant2,
+        "advanced-io-test-2",
+        &[
+            "mkdir -p /data/custom-dir".to_string(),
+            "echo 'Tenant2 advanced content' > /data/custom-dir/advanced-file.txt".to_string(),
+            "chmod 600 /data/custom-dir/advanced-file.txt".to_string(),
+            "ls -la /data/custom-dir/".to_string(),
+            "cat /data/custom-dir/advanced-file.txt".to_string(),
+            "echo 'Advanced I/O test completed successfully'".to_string(),
+        ],
+    )
+    .await?;
+
+    // Wait for both pods to complete successfully
+    let tenant1_success = wait_for_pod_completion(tenant1, "advanced-io-test-1").await?;
+    let tenant2_success = wait_for_pod_completion(tenant2, "advanced-io-test-2").await?;
+
+    let success = tenant1_success && tenant2_success;
+
+    if success {
+        println!("✅ Advanced I/O operations successful for both tenants");
+    } else {
+        println!(
+            "❌ Advanced I/O operations failed - tenant1: {}, tenant2: {}",
+            tenant1_success, tenant2_success
+        );
+    }
+
+    Ok(success)
+}
+
+async fn wait_for_pod_completion(
+    tenant: &TenantClusterConfig,
+    pod_name: &str,
+) -> anyhow::Result<bool> {
+    const COMPLETION_TIMEOUT: u32 = 60; // seconds
+
+    tenant
+        .cluster
+        .watch_namespaced_resource_until_condition::<k8s_openapi::api::core::v1::Pod, _, _>(
+            pod_name,
+            &tenant.namespace,
+            COMPLETION_TIMEOUT,
+            |_event| async {
+                if let Result::Ok(pod) = tenant
+                    .cluster
+                    .get_resource_in_namespace::<k8s_openapi::api::core::v1::Pod>(
+                        pod_name,
+                        &tenant.namespace,
+                    )
+                    .await
+                {
+                    if let Some(status) = &pod.status {
+                        if let Some(phase) = &status.phase {
+                            match phase.as_str() {
+                                "Succeeded" => {
+                                    println!("✅ Pod {} completed successfully", pod_name);
+                                    return true;
+                                }
+                                "Failed" => {
+                                    println!("❌ Pod {} failed", pod_name);
+                                    if let Some(container_statuses) = &status.container_statuses {
+                                        for cs in container_statuses {
+                                            if let Some(state) = &cs.state {
+                                                if let Some(terminated) = &state.terminated {
+                                                    println!(
+                                                        "Container exit code: {}, reason: {:?}",
+                                                        terminated.exit_code, terminated.reason
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return true; // Stop waiting, but this indicates failure
+                                }
+                                _ => {
+                                    // Still running or pending
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            },
+        )
+        .await?;
+
+    // Check final status
+    if let Result::Ok(pod) = tenant
+        .cluster
+        .get_resource_in_namespace::<k8s_openapi::api::core::v1::Pod>(pod_name, &tenant.namespace)
+        .await
+    {
+        if let Some(status) = &pod.status {
+            if let Some(phase) = &status.phase {
+                return Ok(phase == "Succeeded");
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+async fn cleanup_autonomy_pod_tests(tenant1: &TenantClusterConfig, tenant2: &TenantClusterConfig) {
+    println!("Cleaning up autonomy pod test resources...");
+
+    for tenant in [tenant1, tenant2] {
+        // Clean up pods with the test label
+        if let Result::Ok(pods) = tenant
+            .cluster
+            .list_pods_with_label_in_namespace("app=storage-autonomy-test", &tenant.namespace)
+            .await
+        {
+            for pod in pods.items {
+                if let Some(name) = &pod.metadata.name {
+                    let _ = tenant
+                        .cluster
+                        .delete_resource_in_namespace::<k8s_openapi::api::core::v1::Pod>(
+                            name,
+                            &tenant.namespace,
+                        )
+                        .await;
+
+                    // Also delete associated PVC
+                    let pvc_name = format!("{}-pvc", name);
+                    let _ = tenant
+                        .cluster
+                        .delete_resource_in_namespace::<PersistentVolumeClaim>(
+                            &pvc_name,
+                            &tenant.namespace,
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 }
