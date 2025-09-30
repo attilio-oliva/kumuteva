@@ -248,8 +248,8 @@ async fn main() -> anyhow::Result<()> {
                 cluster: KubernetesClient::load_with_retry(&tenant2_kubeconfig_path, 5).await?,
                 namespace: tenant2_namespace,
             };
-            let autonomy_result =
-                verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
+            // let autonomy_result =
+            //     verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
 
             // match autonomy_result {
             //     Ok(report) => {
@@ -259,8 +259,8 @@ async fn main() -> anyhow::Result<()> {
             //     Err(e) => eprintln!("Control plane autonomy could not complete: {}", e),
             // }
 
-            let obj_isolation_result =
-                verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
+            // let obj_isolation_result =
+            //     verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
 
             // match obj_isolation_result {
             //     Ok(report) => {
@@ -324,10 +324,18 @@ async fn main() -> anyhow::Result<()> {
             //     verifier::check_storage_isolation(&tenant1_config, &tenant2_config)
             //         .await
             //         .context("Failed to verify storage isolation")?;
+            // let storage_automony =
+            //     verifier::check_storage_autonomy(&tenant1_config, &tenant2_config).await?;
 
-            // println!("{}", network_isolation);
-            println!("{}", network_report);
+            //println!("{}", network_report);
+            // println!("Storage autonomy test passed: {}", storage_automony);
             // println!("{}", storage_isolation);
+
+            let workload_isolation =
+                verifier::check_workload_isolation(&tenant1_config, &tenant2_config)
+                    .await
+                    .context("Failed to verify workload isolation")?;
+            println!("{}", workload_isolation);
         }
     }
 

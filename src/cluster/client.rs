@@ -10,8 +10,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::{ClusterResourceScope, Metadata, NamespaceResourceScope, Resource};
 use kube::api::{
-    ApiResource, AttachParams, AttachedProcess, DynamicObject, ListParams, Object, ObjectList,
-    ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams,
+    ApiResource, AttachParams, AttachedProcess, DynamicObject, ListParams, LogParams, Object,
+    ObjectList, ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams,
 };
 use kube::config::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -1134,6 +1134,16 @@ impl KubernetesClient {
             .ok_or_else(|| anyhow!("No status in SelfSubjectAccessReview"))?;
 
         Ok(status.allowed)
+    }
+
+    pub async fn get_pod_logs(&self, pod_name: &str, namespace: &str) -> Result<String> {
+        let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
+        let log_params = LogParams {
+            follow: false,
+            ..Default::default()
+        };
+        let logs = pods_api.logs(pod_name, &log_params).await?;
+        Ok(logs)
     }
 
     pub async fn exec_command_in_container(
