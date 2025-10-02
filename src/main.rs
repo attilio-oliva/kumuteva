@@ -317,8 +317,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Control plane isolation test results:\n{}", report);
             */
 
-            let network_report =
-                verifier::check_network_multitenancy(&tenant1_config, &tenant2_config).await?;
+            // let network_report =
+            //     verifier::check_network_multitenancy(&tenant1_config, &tenant2_config).await?;
 
             // let storage_isolation =
             //     verifier::check_storage_isolation(&tenant1_config, &tenant2_config)

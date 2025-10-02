@@ -538,16 +538,32 @@ async fn test_ipc_cross_tenant(
             .unwrap_or(());
 
         // Get logs to check if cross-tenant IPC resources were accessible
-        let logs = tenant1
+        let spy_logs = tenant1
             .cluster
             .get_pod_logs(spy_pod_name, &tenant1.namespace)
             .await
             .unwrap_or_default();
 
-        if logs.contains("TENANT2_IPC_FOUND") {
+        let target_logs = tenant2
+            .cluster
+            .get_pod_logs(target_pod_name, &tenant2.namespace)
+            .await
+            .unwrap_or_default();
+
+        // Extract fingerprints from logs
+        let target_fingerprint = target_logs
+            .lines()
+            .find(|line| line.contains("Fingerprint:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("");
+
+        if spy_logs.contains(target_fingerprint) && !target_fingerprint.is_empty() {
             (
                 SafetyLevel::Unsafe,
-                "Cross-tenant IPC access detected - shared memory/semaphores visible".to_string(),
+                format!(
+                    "Cross-tenant IPC access detected - fingerprint {} found",
+                    target_fingerprint
+                ),
             )
         } else {
             (
@@ -558,14 +574,14 @@ async fn test_ipc_cross_tenant(
     };
 
     // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
-        .await;
+    // let _ = tenant1
+    //     .cluster
+    //     .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
+    //     .await;
+    // let _ = tenant2
+    //     .cluster
+    //     .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
+    //     .await;
 
     Ok((safety_level, details))
 }
@@ -683,6 +699,18 @@ fn create_host_ipc_test_pod(pod_name: &str) -> Pod {
 }
 
 fn create_ipc_target_pod(pod_name: &str) -> Pod {
+    let script = [
+        "echo 'Creating IPC resources...'",
+        "ipcmk -M 64",
+        "ipcmk -S 1",
+        "ipcmk -Q",
+        // concat all the ipcs commands and then pass to sha1sum to get a fingerprint
+        "fingerprint=`(ipcs -m; ipcs -s; ipcs -q) | sha1sum | cut -d' ' -f1`",
+        "echo 'Fingerprint: ' $fingerprint",
+        "while true; do sleep 30; done",
+    ]
+    .join(" && ");
+
     serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -694,32 +722,14 @@ fn create_ipc_target_pod(pod_name: &str) -> Pod {
             }
         },
         "spec": {
+            "hostIPC": true,
             "containers": [{
                 "name": "ipc-target",
-                "image": "alpine:latest",
+                "image": "ubuntu:latest",
                 "command": [
                     "sh", "-c",
-                    "echo 'Creating IPC resources with tenant2 marker...' && \
-                     # Install ipc-utils if available \
-                     apk add --no-cache util-linux 2>/dev/null || true && \
-                     # Create shared memory segment with unique key \
-                     echo 'TENANT2_IPC_MARKER' > /tmp/tenant2_ipc_data && \
-                     # Try to create System V shared memory (if available) \
-                     if command -v ipcmk >/dev/null; then \
-                       ipcmk -M 1024 -p 0666 2>/dev/null || true; \
-                     fi && \
-                     # Create POSIX shared memory \
-                     mkdir -p /dev/shm && \
-                     echo 'TENANT2_IPC_SHM_MARKER' > /dev/shm/tenant2_marker 2>/dev/null || true && \
-                     # Keep running to maintain IPC resources \
-                     while true; do \
-                       echo 'Tenant2 IPC resources active...'; \
-                       sleep 30; \
-                     done"
-                ],
-                "securityContext": {
-                    "runAsUser": 1000
-                }
+                    script
+                ]
             }],
             "restartPolicy": "Never",
         }
@@ -739,41 +749,12 @@ fn create_ipc_spy_pod(pod_name: &str, node_name: &str) -> Pod {
             "hostIPC": true,
             "containers": [{
                 "name": "ipc-spy",
-                "image": "alpine:latest",
-                "securityContext": {
-                    "privileged": true
-                },
+                "image": "ubuntu:latest",
                 "command": [
                     "sh", "-c",
-                    "echo 'Checking for cross-tenant IPC resources...' && \
-                     # Install ipc-utils if available \
-                     apk add --no-cache util-linux 2>/dev/null || true && \
-                     found_ipc=false && \
-                     # Check System V IPC resources \
-                     if command -v ipcs >/dev/null; then \
-                       echo 'Checking System V IPC resources:' && \
-                       ipcs -m 2>/dev/null && \
-                       ipcs -s 2>/dev/null && \
-                       ipcs -q 2>/dev/null; \
-                     fi && \
-                     # Check POSIX shared memory \
-                     echo 'Checking POSIX shared memory:' && \
-                     if [ -d /dev/shm ]; then \
-                       ls -la /dev/shm/ 2>/dev/null && \
-                       if grep -r 'TENANT2_IPC' /dev/shm/ 2>/dev/null; then \
-                         echo 'TENANT2_IPC_FOUND: Cross-tenant shared memory access detected!'; \
-                         found_ipc=true; \
-                       fi; \
-                     fi && \
-                     # Check for any tenant2 IPC markers \
-                     if find /tmp -name '*tenant2*' 2>/dev/null | grep -q .; then \
-                       echo 'TENANT2_IPC_FOUND: Cross-tenant IPC files detected!'; \
-                       found_ipc=true; \
-                     fi && \
-                     if [ \"$found_ipc\" = \"false\" ]; then \
-                       echo 'No cross-tenant IPC resources detected'; \
-                     fi && \
-                     echo 'IPC isolation check completed'"
+                    "sleep 10 && \
+                     fingerprint=`(ipcs -m; ipcs -s; ipcs -q) | sha1sum | cut -d' ' -f1` && \
+                     echo 'Fingerprint: ' $fingerprint",
                 ],
             }],
             "restartPolicy": "Never",
