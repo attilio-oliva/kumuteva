@@ -33,7 +33,6 @@ pub enum WorkloadResource {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkloadOperation {
     ViewProcesses,     // Can view processes
-    KillProcesses,     // Can kill processes
     CreateNetworkConn, // Can create network connections
     ModifyHostname,    // Can modify hostname
     AccessIPC,         // Can access IPC resources
@@ -66,10 +65,7 @@ impl WorkloadResource {
 
     fn applicable_operations(&self) -> Vec<WorkloadOperation> {
         match self {
-            WorkloadResource::ProcessNamespace => vec![
-                WorkloadOperation::ViewProcesses,
-                WorkloadOperation::KillProcesses,
-            ],
+            WorkloadResource::ProcessNamespace => vec![WorkloadOperation::ViewProcesses],
             WorkloadResource::NetworkNamespace => vec![WorkloadOperation::CreateNetworkConn],
             WorkloadResource::UserNamespace => vec![
                 // User namespace operations are typically handled at creation time
@@ -180,10 +176,6 @@ async fn is_authorized_to(
             // Test if tenant can create a pod with hostPID: true
             test_host_pid_authorization(tenant).await
         }
-        (WorkloadResource::ProcessNamespace, WorkloadOperation::KillProcesses) => {
-            // Test if tenant can create privileged pods
-            test_privileged_authorization(tenant).await
-        }
         (WorkloadResource::NetworkNamespace, WorkloadOperation::CreateNetworkConn) => {
             // Test if tenant can use hostNetwork
             test_host_network_authorization(tenant).await
@@ -209,9 +201,6 @@ async fn does_affect_other_tenant(
     match (resource, operation) {
         (WorkloadResource::ProcessNamespace, WorkloadOperation::ViewProcesses) => {
             test_process_visibility_cross_tenant(tenant1, tenant2).await
-        }
-        (WorkloadResource::ProcessNamespace, WorkloadOperation::KillProcesses) => {
-            test_process_kill_cross_tenant(tenant1, tenant2).await
         }
         (WorkloadResource::NetworkNamespace, WorkloadOperation::CreateNetworkConn) => {
             test_network_cross_tenant(tenant1, tenant2).await
@@ -261,29 +250,6 @@ async fn test_privileged_authorization(tenant: &TenantClusterConfig) -> anyhow::
         .await;
 
     Ok(result.is_ok())
-}
-
-async fn test_host_path_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
-    let test_pod_name = "hostpath-auth-test";
-    let test_pod = create_host_path_test_pod(test_pod_name);
-
-    let result = tenant
-        .cluster
-        .create_pod_in_namespace(&test_pod, &tenant.namespace)
-        .await;
-
-    // Cleanup
-    let _ = tenant
-        .cluster
-        .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
-        .await;
-
-    Ok(result.is_ok())
-}
-
-async fn test_host_path_write_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
-    // Similar to host_path_authorization but with write permissions
-    test_host_path_authorization(tenant).await
 }
 
 async fn test_host_network_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
@@ -421,45 +387,96 @@ async fn test_process_visibility_cross_tenant(
     Ok((safety_level, details))
 }
 
-async fn test_process_kill_cross_tenant(
-    _tenant1: &TenantClusterConfig,
-    _tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
-    // This would be similar to process visibility but testing actual process termination
-    Ok((
-        SafetyLevel::Unknown,
-        "Process kill cross-tenant test not implemented".to_string(),
-    ))
-}
-
-async fn test_filesystem_access_cross_tenant(
-    _tenant1: &TenantClusterConfig,
-    _tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
-    Ok((
-        SafetyLevel::Unknown,
-        "Filesystem access cross-tenant test not implemented".to_string(),
-    ))
-}
-
-async fn test_filesystem_modify_cross_tenant(
-    _tenant1: &TenantClusterConfig,
-    _tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
-    Ok((
-        SafetyLevel::Unknown,
-        "Filesystem modify cross-tenant test not implemented".to_string(),
-    ))
-}
-
 async fn test_network_cross_tenant(
-    _tenant1: &TenantClusterConfig,
-    _tenant2: &TenantClusterConfig,
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
 ) -> anyhow::Result<(SafetyLevel, String)> {
-    Ok((
-        SafetyLevel::Unknown,
-        "Network cross-tenant test not implemented".to_string(),
-    ))
+    // Create a target pod in tenant2 that listens on a specific port
+    let target_pod_name = "network-target";
+    let target_pod = create_network_target_pod(target_pod_name);
+
+    tenant2
+        .cluster
+        .create_pod_in_namespace(&target_pod, &tenant2.namespace)
+        .await?;
+
+    // Wait for target pod to be ready
+    tenant2
+        .cluster
+        .wait_for_pod_to_be_ready(target_pod_name, &tenant2.namespace)
+        .await?;
+
+    // Get the target pod's IP address
+    let target_pod_ip = tenant2
+        .cluster
+        .get_pod_ip(target_pod_name, &tenant2.namespace)
+        .await?;
+
+    // Create a network test pod in tenant1 with hostNetwork to test cross-tenant network access
+    let spy_pod_name = "network-spy";
+    let spy_pod = create_network_spy_pod(spy_pod_name, &target_pod_ip);
+
+    let spy_result = tenant1
+        .cluster
+        .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
+        .await;
+
+    let (safety_level, details) = if spy_result.is_err() {
+        (
+            SafetyLevel::Safe,
+            "Cannot create hostNetwork pod - network isolated".to_string(),
+        )
+    } else {
+        // Wait for spy pod to complete
+        tenant1
+            .cluster
+            .watch_pod_until_condition(spy_pod_name, &tenant1.namespace, |watch_event| async move {
+                match watch_event {
+                    kube::core::WatchEvent::Modified(pod) => {
+                        if let Some(status) = &pod.status {
+                            if let Some(phase) = &status.phase {
+                                return phase == "Succeeded" || phase == "Failed";
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
+                }
+            })
+            .await
+            .unwrap_or(());
+
+        // Get logs to check if cross-tenant network access was successful
+        let logs = tenant1
+            .cluster
+            .get_pod_logs(spy_pod_name, &tenant1.namespace)
+            .await
+            .unwrap_or_default();
+
+        if logs.contains("NETWORK_ACCESS_SUCCESS") {
+            (
+                SafetyLevel::Unsafe,
+                "Cross-tenant network access detected - hostNetwork bypass".to_string(),
+            )
+        } else {
+            (
+                SafetyLevel::Safe,
+                "No cross-tenant network access detected".to_string(),
+            )
+        }
+    };
+
+    // Cleanup
+    let _ = tenant1
+        .cluster
+        .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
+        .await;
+    let _ = tenant2
+        .cluster
+        .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
+        .await;
+
+    Ok((safety_level, details))
 }
 
 async fn test_hostname_cross_tenant(
@@ -574,14 +591,14 @@ async fn test_ipc_cross_tenant(
     };
 
     // Cleanup
-    // let _ = tenant1
-    //     .cluster
-    //     .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
-    //     .await;
-    // let _ = tenant2
-    //     .cluster
-    //     .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
-    //     .await;
+    let _ = tenant1
+        .cluster
+        .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
+        .await;
+    let _ = tenant2
+        .cluster
+        .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
+        .await;
 
     Ok((safety_level, details))
 }
@@ -833,6 +850,72 @@ fn create_process_spy_pod(pod_name: &str, node_name: &str, target_pod_name: &str
     .unwrap()
 }
 
+fn create_network_target_pod(pod_name: &str) -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "labels": {
+                "app": "network-target",
+                "workload-test": "target"
+            }
+        },
+        "spec": {
+            "containers": [{
+                "name": "network-target",
+                "image": "nginx:alpine",
+                "ports": [{
+                    "containerPort": 80
+                }],
+                "command": [
+                    "sh", "-c",
+                    "echo 'Starting network target server...' && \
+                     echo '<h1>TENANT2_NETWORK_TARGET</h1>' > /usr/share/nginx/html/index.html && \
+                     nginx -g 'daemon off;'"
+                ]
+            }],
+            "restartPolicy": "Never",
+        }
+    }))
+    .unwrap()
+}
+
+fn create_network_spy_pod(pod_name: &str, target_ip: &str) -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+        },
+        "spec": {
+            "hostNetwork": true,
+            "containers": [{
+                "name": "network-spy",
+                "image": "alpine/curl:latest",
+                "command": [
+                    "sh", "-c",
+                    format!(
+                        "echo 'Testing cross-tenant network access...' && \
+                         for i in $(seq 1 10); do \
+                           echo \"Attempt $i: Trying to connect to {}:80\" && \
+                           if curl -s --connect-timeout 5 {}:80 | grep -q 'TENANT2_NETWORK_TARGET'; then \
+                             echo 'NETWORK_ACCESS_SUCCESS: Cross-tenant network access detected!'; \
+                             break; \
+                           fi; \
+                           sleep 2; \
+                         done; \
+                         echo 'Network access test completed'",
+                        target_ip, target_ip
+                    )
+                ],
+            }],
+            "restartPolicy": "Never",
+        }
+    }))
+    .unwrap()
+}
+
 impl Display for WorkloadResource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -849,7 +932,6 @@ impl Display for WorkloadOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WorkloadOperation::ViewProcesses => write!(f, "View Processes"),
-            WorkloadOperation::KillProcesses => write!(f, "Kill Processes"),
             WorkloadOperation::CreateNetworkConn => write!(f, "Create Network Connections"),
             WorkloadOperation::ModifyHostname => write!(f, "Modify Hostname"),
             WorkloadOperation::AccessIPC => write!(f, "Access IPC Resources"),
