@@ -27,14 +27,13 @@ pub enum WorkloadResource {
     NetworkNamespace, // Network namespace isolation
     UserNamespace,    // User namespace isolation
     IPCNamespace,     // Inter-process communication
-    UTSNamespace,     // Hostname/domain isolation
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkloadOperation {
     ViewProcesses,     // Can view processes
     CreateNetworkConn, // Can create network connections
-    ModifyHostname,    // Can modify hostname
+    AccessHostUser,    // Can access host user namespace (e.g. root user)
     AccessIPC,         // Can access IPC resources
 }
 
@@ -59,7 +58,6 @@ impl WorkloadResource {
             WorkloadResource::NetworkNamespace,
             WorkloadResource::UserNamespace,
             WorkloadResource::IPCNamespace,
-            WorkloadResource::UTSNamespace,
         ]
     }
 
@@ -67,11 +65,8 @@ impl WorkloadResource {
         match self {
             WorkloadResource::ProcessNamespace => vec![WorkloadOperation::ViewProcesses],
             WorkloadResource::NetworkNamespace => vec![WorkloadOperation::CreateNetworkConn],
-            WorkloadResource::UserNamespace => vec![
-                // User namespace operations are typically handled at creation time
-            ],
+            WorkloadResource::UserNamespace => vec![WorkloadOperation::AccessHostUser],
             WorkloadResource::IPCNamespace => vec![WorkloadOperation::AccessIPC],
-            WorkloadResource::UTSNamespace => vec![WorkloadOperation::ModifyHostname],
         }
     }
 }
@@ -180,9 +175,8 @@ async fn is_authorized_to(
             // Test if tenant can use hostNetwork
             test_host_network_authorization(tenant).await
         }
-        (WorkloadResource::UTSNamespace, WorkloadOperation::ModifyHostname) => {
-            // Test if tenant can create pods with hostNetwork (which includes UTS)
-            test_host_network_authorization(tenant).await
+        (WorkloadResource::UserNamespace, WorkloadOperation::AccessHostUser) => {
+            test_host_user_authorization(tenant).await
         }
         (WorkloadResource::IPCNamespace, WorkloadOperation::AccessIPC) => {
             // Test if tenant can use hostIPC
@@ -205,8 +199,8 @@ async fn does_affect_other_tenant(
         (WorkloadResource::NetworkNamespace, WorkloadOperation::CreateNetworkConn) => {
             test_network_cross_tenant(tenant1, tenant2).await
         }
-        (WorkloadResource::UTSNamespace, WorkloadOperation::ModifyHostname) => {
-            test_hostname_cross_tenant(tenant1, tenant2).await
+        (WorkloadResource::UserNamespace, WorkloadOperation::AccessHostUser) => {
+            test_user_namespace_cross_tenant(tenant1, tenant2).await
         }
         (WorkloadResource::IPCNamespace, WorkloadOperation::AccessIPC) => {
             test_ipc_cross_tenant(tenant1, tenant2).await
@@ -603,6 +597,190 @@ async fn test_ipc_cross_tenant(
     Ok((safety_level, details))
 }
 
+async fn test_host_user_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+    let test_pod_name = "hostuser-auth-test";
+    let test_pod = create_host_user_test_pod(test_pod_name);
+
+    let result = tenant
+        .cluster
+        .create_pod_in_namespace(&test_pod, &tenant.namespace)
+        .await;
+
+    // Cleanup
+    let _ = tenant
+        .cluster
+        .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
+        .await;
+
+    Ok(result.is_ok())
+}
+
+async fn test_user_namespace_cross_tenant(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<(SafetyLevel, String)> {
+    // Create target pod in tenant2 with specific user
+    let target_pod_name = "user-target";
+    let target_pod = create_user_target_pod(target_pod_name);
+
+    tenant2
+        .cluster
+        .create_pod_in_namespace(&target_pod, &tenant2.namespace)
+        .await?;
+
+    tenant2
+        .cluster
+        .wait_for_pod_to_be_ready(target_pod_name, &tenant2.namespace)
+        .await?;
+
+    // Create spy pod in tenant1 with hostUser to test cross-tenant user access
+    let spy_pod_name = "user-spy";
+    let spy_pod = create_user_spy_pod(spy_pod_name);
+
+    let spy_result = tenant1
+        .cluster
+        .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
+        .await;
+
+    let (safety_level, details) = if spy_result.is_err() {
+        (
+            SafetyLevel::Safe,
+            "Cannot create hostUser pod - user namespace isolated".to_string(),
+        )
+    } else {
+        // Wait for spy pod to complete and analyze results
+        tenant1
+            .cluster
+            .watch_pod_until_condition(spy_pod_name, &tenant1.namespace, |watch_event| async move {
+                match watch_event {
+                    kube::core::WatchEvent::Modified(pod) => {
+                        if let Some(status) = &pod.status {
+                            if let Some(phase) = &status.phase {
+                                return phase == "Succeeded" || phase == "Failed";
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
+                }
+            })
+            .await
+            .unwrap_or(());
+
+        let logs = tenant1
+            .cluster
+            .get_pod_logs(spy_pod_name, &tenant1.namespace)
+            .await
+            .unwrap_or_default();
+
+        if logs.contains("USER_NAMESPACE_BREACH") {
+            (
+                SafetyLevel::Unsafe,
+                "Cross-tenant user namespace access detected".to_string(),
+            )
+        } else {
+            (
+                SafetyLevel::Safe,
+                "No cross-tenant user namespace access detected".to_string(),
+            )
+        }
+    };
+
+    // Cleanup
+    let _ = tenant1
+        .cluster
+        .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
+        .await;
+    let _ = tenant2
+        .cluster
+        .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
+        .await;
+
+    Ok((safety_level, details))
+}
+
+fn create_host_user_test_pod(pod_name: &str) -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+        },
+        "spec": {
+            "hostUsers": true,
+            "containers": [{
+                "name": "test",
+                "image": "alpine:latest",
+                "command": ["sleep", "1"],
+            }],
+            "restartPolicy": "Never",
+        }
+    }))
+    .unwrap()
+}
+
+fn create_user_target_pod(pod_name: &str) -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "labels": {
+                "app": "user-target",
+                "workload-test": "target"
+            }
+        },
+        "spec": {
+            "containers": [{
+                "name": "user-target",
+                "image": "alpine:latest",
+                "command": [
+                    "sleep", "3600"
+                ],
+            }],
+            "restartPolicy": "Never",
+        }
+    }))
+    .unwrap()
+}
+
+fn create_user_spy_pod(pod_name: &str) -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+        },
+        "spec": {
+            "hostUsers": true,
+            "securityContext": {
+                "runAsUser": 0
+            },
+            "containers": [{
+                "name": "user-spy",
+                "image": "alpine:latest",
+                "command": [
+                    "sh", "-c",
+                    "echo 'Testing user namespace isolation...' && \
+                     echo 'Current UID mapping:' && \
+                     cat /proc/self/uid_map && \
+                     uid_map=$(cat /proc/self/uid_map | head -1) && \
+                     first_uid=$(echo $uid_map | awk '{print $1}') && \
+                     second_uid=$(echo $uid_map | awk '{print $2}') && \
+                     echo \"First UID: $first_uid, Second UID: $second_uid\" && \
+                     if [ \"$first_uid\" = \"0\" ] && [ \"$second_uid\" = \"0\" ]; then \
+                       echo 'USER_NAMESPACE_BREACH: Using host user namespace (0->0 mapping)'; \
+                     else \
+                       echo 'User namespace properly isolated (non-host mapping)'; \
+                     fi"
+                ],
+            }],
+            "restartPolicy": "Never",
+        }
+    }))
+    .unwrap()
+}
+
 // Pod creation helper functions
 fn create_host_pid_test_pod(pod_name: &str) -> Pod {
     serde_json::from_value(serde_json::json!({
@@ -923,7 +1101,6 @@ impl Display for WorkloadResource {
             WorkloadResource::NetworkNamespace => write!(f, "Network Namespace"),
             WorkloadResource::UserNamespace => write!(f, "User Namespace"),
             WorkloadResource::IPCNamespace => write!(f, "IPC Namespace"),
-            WorkloadResource::UTSNamespace => write!(f, "UTS Namespace"),
         }
     }
 }
@@ -933,7 +1110,7 @@ impl Display for WorkloadOperation {
         match self {
             WorkloadOperation::ViewProcesses => write!(f, "View Processes"),
             WorkloadOperation::CreateNetworkConn => write!(f, "Create Network Connections"),
-            WorkloadOperation::ModifyHostname => write!(f, "Modify Hostname"),
+            WorkloadOperation::AccessHostUser => write!(f, "Access Host User Namespace"),
             WorkloadOperation::AccessIPC => write!(f, "Access IPC Resources"),
         }
     }
