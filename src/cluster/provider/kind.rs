@@ -25,6 +25,7 @@ impl ClusterProvider for KindProvider {
             "name": name,
             "nodes": [{
                 "role": "control-plane",
+                "image": "kindest/node:v1.33.4@sha256:25a6018e48dfcaee478f4a59af81157a437f15e6e140bf103f85a2e7cd0cbbf2",
                 "extraPortMappings": [
                     {
                         "containerPort": tenant1_mapping.container_port,
