@@ -320,22 +320,21 @@ async fn main() -> anyhow::Result<()> {
             // let network_report =
             //     verifier::check_network_multitenancy(&tenant1_config, &tenant2_config).await?;
 
-            // let storage_isolation =
-            //     verifier::check_storage_isolation(&tenant1_config, &tenant2_config)
-            //         .await
-            //         .context("Failed to verify storage isolation")?;
-            // let storage_automony =
-            //     verifier::check_storage_autonomy(&tenant1_config, &tenant2_config).await?;
+            let storage_isolation =
+                verifier::check_storage_isolation(&tenant1_config, &tenant2_config)
+                    .await
+                    .context("Failed to verify storage isolation")?;
+            println!("{}", storage_isolation);
 
             //println!("{}", network_report);
             // println!("Storage autonomy test passed: {}", storage_automony);
             // println!("{}", storage_isolation);
 
-            let workload_isolation =
-                verifier::check_workload_isolation(&tenant1_config, &tenant2_config)
-                    .await
-                    .context("Failed to verify workload isolation")?;
-            println!("{}", workload_isolation);
+            // let workload_isolation =
+            //     verifier::check_workload_isolation(&tenant1_config, &tenant2_config)
+            //         .await
+            //         .context("Failed to verify workload isolation")?;
+            // println!("{}", workload_isolation);
         }
     }
 
