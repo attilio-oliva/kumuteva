@@ -179,10 +179,9 @@ async fn is_authorized_to(
             Ok(can_create_pv.unwrap_or(false) && can_mount_pv.unwrap_or(false))
         }
         (StorageResource::Volume, StorageOperation::UseHostPath) => {
-            // let can_create_hostpath = test_hostpath_creation_authorization(tenant).await;
-            // let can_mount_hostpath = test_hostpath_mount_authorization(tenant).await;
-            // Ok(can_create_hostpath.unwrap_or(false) && can_mount_hostpath.unwrap_or(false))
-            Ok(false) // Assume hostPath usage is always authorized for testing purposes
+            let can_create_hostpath = test_hostpath_creation_authorization(tenant).await;
+            let can_mount_hostpath = test_hostpath_mount_authorization(tenant).await;
+            Ok(can_create_hostpath.unwrap_or(false) && can_mount_hostpath.unwrap_or(false))
         }
     }
 }
@@ -773,9 +772,12 @@ async fn test_hostpath_data_isolation(
     // Create hostPath volume and write data in tenant1
     create_stateful_set(tenant1, &tenant1_commands, None, true).await?;
     wait_for_statefulset_ready(tenant1).await?;
+    println!("Tenant1 has written data to hostPath volume.");
 
     // Try to read data from tenant2
     create_stateful_set(tenant2, &tenant2_commands, None, true).await?;
+    wait_for_statefulset_ready(tenant2).await?;
+    println!("Tenant2 has attempted to read data from hostPath volume.");
 
     let can_access_data = check_cross_tenant_mount(tenant2).await?;
 
@@ -870,8 +872,15 @@ fn hostpath_read_commands() -> Vec<String> {
         "sh".to_string(),
         "-c".to_string(),
         format!(
-            "cat {}/hostpath-test.txt 2>/dev/null && \
-             if [ \"$(cat {}/hostpath-test.txt 2>/dev/null)\" = \"{}\" ]; then exit 1; else exit 0; fi",
+            "if cat {}/hostpath-test.txt 2>/dev/null; then \
+               if [ \"$(cat {}/hostpath-test.txt 2>/dev/null)\" = \"{}\" ]; then \
+                 echo 'HOSTPATH_ACCESS_SUCCESS: Found tenant1 hostpath data'; \
+               else \
+                 echo 'HOSTPATH_ACCESS_FAILED: File exists but content differs'; \
+               fi; \
+             else \
+               echo 'HOSTPATH_ACCESS_FAILED: File not found/accessible'; \
+             fi && sleep 10",
             HOSTPATH_MOUNT_PATH, HOSTPATH_MOUNT_PATH, FILE_CONTENT
         ),
     ]
@@ -895,8 +904,16 @@ fn tenant2_commands() -> Vec<String> {
         "sh".to_string(),
         "-c".to_string(),
         format!(
-            "echo 'Reading file content:' && cat {} 2>/dev/null || echo 'File not found/accessible' && \
-             if [ \"$(cat {} 2>/dev/null)\" = \"{}\" ]; then exit 1; else exit 0; fi",
+            "echo 'Reading file content:' && \
+             if cat {} 2>/dev/null; then \
+               if [ \"$(cat {} 2>/dev/null)\" = \"{}\" ]; then \
+                 echo 'CROSS_TENANT_ACCESS_SUCCESS: Found tenant1 file content'; \
+               else \
+                 echo 'CROSS_TENANT_ACCESS_FAILED: File exists but content differs'; \
+               fi; \
+             else \
+               echo 'CROSS_TENANT_ACCESS_FAILED: File not found/accessible'; \
+             fi && sleep 10",
             file_path(),
             file_path(),
             FILE_CONTENT
@@ -1267,15 +1284,71 @@ async fn check_cross_tenant_mount(tenant: &TenantClusterConfig) -> anyhow::Resul
         .unwrap()
         .to_owned();
 
-    let exit_code = pod.status.unwrap().container_statuses.unwrap()[0]
-        .state
-        .as_ref()
-        .and_then(|state| state.terminated.as_ref())
-        .map(|terminated| terminated.exit_code)
-        .unwrap_or(0);
+    //wait for 30 seconds for the pod to either log success or failure message
+    tenant
+        .cluster
+        .watch_pod_until_condition(
+            &pod.metadata.name.as_deref().unwrap_or_default(),
+            &tenant.namespace,
+            |pod_event| async {
+                match pod_event {
+                    kube::api::WatchEvent::Modified(pod) => {
+                        if let Some(status) = &pod.status {
+                            if let Some(container_statuses) = &status.container_statuses {
+                                for container_status in container_statuses {
+                                    if let Some(state) = &container_status.state {
+                                        if let Some(terminated) = &state.terminated {
+                                            if let Ok(logs) = tenant
+                                                .cluster
+                                                .get_pod_logs(
+                                                    &pod.metadata
+                                                        .name
+                                                        .as_deref()
+                                                        .unwrap_or_default(),
+                                                    &tenant.namespace,
+                                                )
+                                                .await
+                                            {
+                                                if logs.contains("CROSS_TENANT_ACCESS_SUCCESS")
+                                                    || logs.contains("HOSTPATH_ACCESS_SUCCESS")
+                                                {
+                                                    return true;
+                                                } else if logs
+                                                    .contains("CROSS_TENANT_ACCESS_FAILED")
+                                                    || logs.contains("HOSTPATH_ACCESS_FAILED")
+                                                {
+                                                    return true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
+                }
+            },
+        )
+        .await?;
 
-    if exit_code == 1 {
+    let logs = tenant
+        .cluster
+        .get_pod_logs(
+            &pod.metadata.name.as_deref().unwrap_or_default(),
+            &tenant.namespace,
+        )
+        .await?;
+
+    if logs.contains("CROSS_TENANT_ACCESS_SUCCESS") || logs.contains("HOSTPATH_ACCESS_SUCCESS") {
+        println!("Cross-tenant access detected in logs:\n{}", logs);
         return Ok(true);
+    }
+
+    if logs.contains("CROSS_TENANT_ACCESS_FAILED") || logs.contains("HOSTPATH_ACCESS_FAILED") {
+        println!("No cross-tenant access detected in logs:\n{}", logs);
+        return Ok(false);
     }
 
     Ok(false)
