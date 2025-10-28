@@ -558,7 +558,7 @@ fn create_test_hostpath_pv_manifest(name: &str) -> PersistentVolume {
             "accessModes": ["ReadWriteOnce"],
             "persistentVolumeReclaimPolicy": "Delete",
             "hostPath": {
-                "path": "/tmp/kumuteva",
+                "path": HOSTPATH_MOUNT_PATH,
                 "type": "DirectoryOrCreate"
             }
         },
@@ -667,7 +667,7 @@ fn create_tenant_statefulset_manifest<T: AsRef<str> + Serialize>(
             pod_spec.volumes = Some(vec![serde_json::from_value(serde_json::json!({
                 "name": pvc_name,
                 "hostPath": {
-                    "path": "/tmp/kumuteva",
+                    "path": HOSTPATH_MOUNT_PATH,
                     "type": "DirectoryOrCreate"
                 }
             }))
