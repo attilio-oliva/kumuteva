@@ -4,6 +4,7 @@ use std::{fmt, sync::Arc};
 mod control_plane;
 mod data_plane;
 
+use control_plane::FairnessTestConfig;
 pub use control_plane::*;
 pub use data_plane::*;
 

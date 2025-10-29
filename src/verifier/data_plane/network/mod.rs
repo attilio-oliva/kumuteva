@@ -1,7 +1,9 @@
 mod autonomy;
+mod fairness;
 mod isolation;
 
 pub use autonomy::*;
+pub use fairness::*;
 pub use isolation::*;
 
 use anyhow::Result;

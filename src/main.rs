@@ -17,7 +17,10 @@ use kube::{api::ListParams, Api, Client};
 use verifier::TenantClusterConfig;
 
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
-use crate::verifier::{ControlPlaneMultitenancyReport, FairnessTestConfig, ReportFormat};
+use crate::verifier::{
+    ControlPlaneMultitenancyReport, NetworkFairnessTestConfig, NetworkFairnessTestResults,
+    ReportFormat,
+};
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
@@ -317,14 +320,48 @@ async fn main() -> anyhow::Result<()> {
             println!("Control plane isolation test results:\n{}", report);
             */
 
+            let network_fairness = verifier::check_network_fairness(
+                Arc::new(tenant1_config),
+                Arc::new(tenant2_config),
+                NetworkFairnessTestConfig::default(),
+            )
+            .await;
+
+            match network_fairness {
+                Ok(results) => {
+                    println!("Network fairness test results:");
+                    println!(
+                        "  - Regular bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
+                        results.regular_bandwidths.0, results.regular_bandwidths.1
+                    );
+                    println!(
+                        "  - Unequal bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
+                        results.unequal_bandwidths.0, results.unequal_bandwidths.1
+                    );
+                    println!(
+                        "  - Acceptable deviation: {:.2}%",
+                        results.acceptable_deviation_percent
+                    );
+                    println!(
+                        "  - Fairness test passed: {}",
+                        if results.fairness_passed {
+                            "✅ YES"
+                        } else {
+                            "❌ NO"
+                        }
+                    );
+                }
+                Err(e) => eprintln!("Network fairness test failed: {}", e),
+            }
+
             // let network_report =
             //     verifier::check_network_multitenancy(&tenant1_config, &tenant2_config).await?;
 
-            let storage_isolation =
-                verifier::check_storage_isolation(&tenant1_config, &tenant2_config)
-                    .await
-                    .context("Failed to verify storage isolation")?;
-            println!("{}", storage_isolation);
+            // let storage_isolation =
+            //     verifier::check_storage_isolation(&tenant1_config, &tenant2_config)
+            //         .await
+            //         .context("Failed to verify storage isolation")?;
+            // println!("{}", storage_isolation);
 
             //println!("{}", network_report);
             // println!("Storage autonomy test passed: {}", storage_automony);
