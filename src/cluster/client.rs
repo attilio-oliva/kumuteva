@@ -949,6 +949,37 @@ impl KubernetesClient {
         Err(Error::msg("Pod did not become ready in time"))
     }
 
+    pub async fn wait_for_pod_deletion(&self, pod_name: &str, namespace: &str) -> Result<()> {
+        let api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+
+        let pod_exists = api.get(pod_name).await.is_ok();
+
+        if !pod_exists {
+            return Ok(());
+        }
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", pod_name))
+            .timeout(290); // upper bound of how long we watch for
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(event) = stream.try_next().await? {
+            match event {
+                WatchEvent::Deleted(_) => {
+                    return Ok(());
+                }
+                _ => {
+                    // Fallback, check pod existence by fetching the latest version.
+                    if api.get(pod_name).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(Error::msg("Pod was not deleted in time"))
+    }
+
     pub async fn publish_crd<C>(&self) -> Result<()>
     where
         C: CustomResourceExt,

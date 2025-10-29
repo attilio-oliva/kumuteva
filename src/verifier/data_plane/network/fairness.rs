@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::verifier::{FairnessTestResults, TenantClusterConfig};
 use anyhow::Result;
@@ -25,9 +25,9 @@ pub struct NetworkFairnessTestConfig {
 impl Default for NetworkFairnessTestConfig {
     fn default() -> Self {
         NetworkFairnessTestConfig {
-            test_duration_secs: 30,
-            regular_bandwidth_limit_mbps: 10,
-            boosted_bandwidth_limit_mbps: 100,
+            test_duration_secs: 60,
+            regular_bandwidth_limit_mbps: 10_000,
+            boosted_bandwidth_limit_mbps: 100_000_000,
             acceptable_deviation_percent: 20.0,
         }
     }
@@ -71,43 +71,52 @@ pub fn benchmark_pod_manifest(
 ) -> Pod {
     let is_server = server_ip.is_none();
 
-    serde_json::from_value(serde_json::json!(
-    {
+    let pod_name = if is_server {
+        "net-bench-pod-srv"
+    } else {
+        "net-bench-pod-cli"
+    };
+
+    let server_ip = server_ip.unwrap_or_default();
+    let duration_secs = duration_secs.to_string();
+    let bandwidth_limit = format!("{}M", bandwidth_limit_mbps);
+
+    let args = if is_server {
+        vec!["iperf3", "-s", "--one-off"]
+    } else {
+        vec![
+            "iperf3",
+            "-c",
+            &server_ip,
+            "-t",
+            &duration_secs,
+            "--bandwidth",
+            &bandwidth_limit,
+        ]
+    };
+
+    serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
-            "name": "net-bench-pod-srv",
+            "name": pod_name
         },
         "spec": {
+            "restartPolicy": "OnFailure",
             "containers": [
                 {
-                    "name": "net-bench-pod-srv",
+                    "name": "iperf3",
                     "image": "networkstatic/iperf3",
                     "ports": [
                         {
-                            "containerPort": 5201,
+                            "containerPort": 5201
                         }
                     ],
-                    "args": [
-                        "iperf3",
-                        if let Some(server_ip) = &server_ip {
-                            format!("-c {}", server_ip)
-                        } else {
-                            "-s".to_string()
-                        },
-                        "-t", duration_secs.to_string(),
-                        "--bandwidth", format!("{}M", bandwidth_limit_mbps),
-                        if is_server {
-                            "--one-off".to_string()
-                        } else {
-                            "".to_string()
-                        },
-                    ],
+                    "args": args
                 }
             ]
         }
-    }
-    ))
+    }))
     .unwrap()
 }
 
@@ -127,6 +136,10 @@ pub async fn check_network_fairness(
 
     let regular_results = collect_fairness_test_results(&tenant1, &tenant2).await?;
 
+    // clean up pods before collecting results
+    cleanup_pods(&tenant1).await?;
+    cleanup_pods(&tenant2).await?;
+
     create_pods_for_fairness_test(
         (tenant1.clone(), config.boosted_bandwidth_limit_mbps),
         (tenant2.clone(), config.regular_bandwidth_limit_mbps),
@@ -134,7 +147,14 @@ pub async fn check_network_fairness(
     )
     .await?;
 
+    wait_for_pods_completion(&tenant1, &tenant2).await?;
+
     let boosted_results = collect_fairness_test_results(&tenant1, &tenant2).await?;
+
+    // clean up pods before collecting results
+    cleanup_pods(&tenant1).await?;
+    cleanup_pods(&tenant2).await?;
+
     Ok(NetworkFairnessTestResults::analyze(
         regular_results,
         boosted_results,
@@ -169,6 +189,69 @@ async fn create_benchmark_pod_pair(
         .create_pod_in_namespace(&server_pod, &tenant.namespace)
         .await?;
 
+    tenant
+        .cluster
+        .wait_for_pod_to_be_ready(&server_pod_name, &tenant.namespace)
+        .await?;
+
+    // Ensure we obtain a non-empty pod IP (some CNI setups assign IP slightly after Ready).
+    // Retry a few times with a short delay, and error out if still empty.
+    let mut server_ip = tenant
+        .cluster
+        .get_pod_ip(&server_pod_name, &tenant.namespace)
+        .await
+        .unwrap_or_default();
+
+    let mut attempts = 0;
+    while server_ip.is_empty() && attempts < 8 {
+        attempts += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        server_ip = tenant
+            .cluster
+            .get_pod_ip(&server_pod_name, &tenant.namespace)
+            .await
+            .unwrap_or_default();
+    }
+
+    if server_ip.is_empty() {
+        return Err(anyhow::anyhow!(
+            "server pod has no IP after waiting; avoid client falling back to loopback"
+        ));
+    }
+
+    let client_pod = benchmark_pod_manifest(bandwidth, duration_secs, Some(server_ip));
+    tenant
+        .cluster
+        .create_pod_in_namespace(&client_pod, &tenant.namespace)
+        .await?;
+
+    tenant
+        .cluster
+        .wait_for_pod_to_be_ready("net-bench-pod-cli", &tenant.namespace)
+        .await?;
+
+    Ok((server_pod, client_pod))
+}
+
+/*
+async fn create_benchmark_pod_pair(
+    tenant: &TenantClusterConfig,
+    bandwidth: u32,
+    duration_secs: u64,
+) -> Result<(Pod, Pod)> {
+    let server_pod = benchmark_pod_manifest(bandwidth, duration_secs, None);
+    let server_pod_name = server_pod.metadata.name.clone().unwrap();
+
+    tenant
+        .cluster
+        .create_pod_in_namespace(&server_pod, &tenant.namespace)
+        .await?;
+
+    tenant
+        .cluster
+        .wait_for_pod_to_be_ready(&server_pod_name, &tenant.namespace)
+        .await?;
+
     let server_ip = tenant
         .cluster
         .get_pod_ip(&server_pod_name, &tenant.namespace)
@@ -180,8 +263,14 @@ async fn create_benchmark_pod_pair(
         .create_pod_in_namespace(&client_pod, &tenant.namespace)
         .await?;
 
+    tenant
+        .cluster
+        .wait_for_pod_to_be_ready("net-bench-pod-cli", &tenant.namespace)
+        .await?;
+
     Ok((server_pod, client_pod))
 }
+*/
 async fn wait_for_pods_completion(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
@@ -189,7 +278,7 @@ async fn wait_for_pods_completion(
     tenant1
         .cluster
         .watch_pod_until_condition(
-            "net-bench-pod-srv",
+            "net-bench-pod-cli",
             &tenant1.namespace,
             |status_event| async move {
                 if let kube::api::WatchEvent::Modified(status) = status_event {
@@ -200,7 +289,9 @@ async fn wait_for_pods_completion(
                         .and_then(|statuses| statuses.first())
                         .and_then(|cs| cs.state.as_ref())
                         .and_then(|state| state.terminated.as_ref())
-                        .is_some()
+                        // check if is terminated with success
+                        .map(|term| term.exit_code == 0)
+                        .unwrap_or(false)
                 } else {
                     false
                 }
@@ -238,12 +329,12 @@ async fn collect_fairness_test_results(
 ) -> Result<(f64, f64)> {
     let tenant1_client_logs = tenant1
         .cluster
-        .get_pod_logs("net-bench-pod-srv", &tenant1.namespace)
+        .get_pod_logs("net-bench-pod-cli", &tenant1.namespace)
         .await?;
 
     let tenant2_client_logs = tenant2
         .cluster
-        .get_pod_logs("net-bench-pod-srv", &tenant2.namespace)
+        .get_pod_logs("net-bench-pod-cli", &tenant2.namespace)
         .await?;
 
     let tenant1_bandwidth = parse_iperf3_bandwidth(&tenant1_client_logs)?;
@@ -274,4 +365,28 @@ fn parse_iperf3_bandwidth(logs: &str) -> Result<f64> {
     Err(anyhow::anyhow!(
         "Could not find bandwidth information in logs"
     ))
+}
+
+async fn cleanup_pods(tenant: &TenantClusterConfig) -> Result<()> {
+    tenant
+        .cluster
+        .delete_pod_in_namespace("net-bench-pod-srv", &tenant.namespace)
+        .await?;
+    tenant
+        .cluster
+        .delete_pod_in_namespace("net-bench-pod-cli", &tenant.namespace)
+        .await?;
+
+    // Wait for pods to be deleted
+    tenant
+        .cluster
+        .wait_for_pod_deletion("net-bench-pod-srv", &tenant.namespace)
+        .await?;
+
+    tenant
+        .cluster
+        .wait_for_pod_deletion("net-bench-pod-cli", &tenant.namespace)
+        .await?;
+
+    Ok(())
 }
