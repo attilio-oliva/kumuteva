@@ -323,7 +323,14 @@ async fn main() -> anyhow::Result<()> {
             let network_fairness = verifier::check_network_fairness(
                 Arc::new(tenant1_config),
                 Arc::new(tenant2_config),
-                NetworkFairnessTestConfig::default(),
+                NetworkFairnessTestConfig::remote_iperf3_test(
+                    "iperf3.moji.fr",
+                    (5201, 5209),
+                    1,
+                    2,
+                    30,
+                    20.0,
+                ),
             )
             .await;
 
@@ -332,11 +339,13 @@ async fn main() -> anyhow::Result<()> {
                     println!("Network fairness test results:");
                     println!(
                         "  - Regular bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
-                        results.regular_bandwidths.0, results.regular_bandwidths.1
+                        results.regular_bandwidths.0.iter().sum::<f64>(),
+                        results.regular_bandwidths.1.iter().sum::<f64>()
                     );
                     println!(
                         "  - Unequal bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
-                        results.unequal_bandwidths.0, results.unequal_bandwidths.1
+                        results.unequal_bandwidths.0.iter().sum::<f64>(),
+                        results.unequal_bandwidths.1.iter().sum::<f64>()
                     );
                     println!(
                         "  - Acceptable deviation: {:.2}%",
