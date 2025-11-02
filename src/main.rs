@@ -19,7 +19,7 @@ use verifier::TenantClusterConfig;
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
 use crate::verifier::{
     ControlPlaneMultitenancyReport, NetworkFairnessTestConfig, NetworkFairnessTestResults,
-    ReportFormat,
+    ReportFormat, StorageFairnessTestConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -320,48 +320,48 @@ async fn main() -> anyhow::Result<()> {
             println!("Control plane isolation test results:\n{}", report);
             */
 
-            let network_fairness = verifier::check_network_fairness(
-                Arc::new(tenant1_config),
-                Arc::new(tenant2_config),
-                NetworkFairnessTestConfig::remote_iperf3_test(
-                    "iperf3.moji.fr",
-                    (5201, 5209),
-                    1,
-                    2,
-                    30,
-                    20.0,
-                ),
-            )
-            .await;
+            // let network_fairness = verifier::check_network_fairness(
+            //     Arc::new(tenant1_config),
+            //     Arc::new(tenant2_config),
+            //     NetworkFairnessTestConfig::remote_iperf3_test(
+            //         "iperf3.moji.fr",
+            //         (5201, 5209),
+            //         1,
+            //         2,
+            //         30,
+            //         20.0,
+            //     ),
+            // )
+            // .await;
 
-            match network_fairness {
-                Ok(results) => {
-                    println!("Network fairness test results:");
-                    println!(
-                        "  - Regular bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
-                        results.regular_bandwidths.0.iter().sum::<f64>(),
-                        results.regular_bandwidths.1.iter().sum::<f64>()
-                    );
-                    println!(
-                        "  - Unequal bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
-                        results.unequal_bandwidths.0.iter().sum::<f64>(),
-                        results.unequal_bandwidths.1.iter().sum::<f64>()
-                    );
-                    println!(
-                        "  - Acceptable deviation: {:.2}%",
-                        results.acceptable_deviation_percent
-                    );
-                    println!(
-                        "  - Fairness test passed: {}",
-                        if results.fairness_passed {
-                            "✅ YES"
-                        } else {
-                            "❌ NO"
-                        }
-                    );
-                }
-                Err(e) => eprintln!("Network fairness test failed: {}", e),
-            }
+            // match network_fairness {
+            //     Ok(results) => {
+            //         println!("Network fairness test results:");
+            //         println!(
+            //             "  - Regular bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
+            //             results.regular_bandwidths.0.iter().sum::<f64>(),
+            //             results.regular_bandwidths.1.iter().sum::<f64>()
+            //         );
+            //         println!(
+            //             "  - Unequal bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
+            //             results.unequal_bandwidths.0.iter().sum::<f64>(),
+            //             results.unequal_bandwidths.1.iter().sum::<f64>()
+            //         );
+            //         println!(
+            //             "  - Acceptable deviation: {:.2}%",
+            //             results.acceptable_deviation_percent
+            //         );
+            //         println!(
+            //             "  - Fairness test passed: {}",
+            //             if results.fairness_passed {
+            //                 "✅ YES"
+            //             } else {
+            //                 "❌ NO"
+            //             }
+            //         );
+            //     }
+            //     Err(e) => eprintln!("Network fairness test failed: {}", e),
+            // }
 
             // let network_report =
             //     verifier::check_network_multitenancy(&tenant1_config, &tenant2_config).await?;
@@ -371,6 +371,15 @@ async fn main() -> anyhow::Result<()> {
             //         .await
             //         .context("Failed to verify storage isolation")?;
             // println!("{}", storage_isolation);
+
+            let storage_fairness = verifier::check_storage_fairness(
+                Arc::new(tenant1_config),
+                Arc::new(tenant2_config),
+                StorageFairnessTestConfig::default(),
+            )
+            .await
+            .context("Failed to verify storage fairness")?;
+            println!("{}", storage_fairness);
 
             //println!("{}", network_report);
             // println!("Storage autonomy test passed: {}", storage_automony);

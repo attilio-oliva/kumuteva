@@ -1,10 +1,12 @@
 mod network;
+mod storage_fairness;
 mod storage_isolation;
 mod workload;
 
 use std::fmt::Display;
 
 pub use network::*;
+pub use storage_fairness::*;
 pub use storage_isolation::*;
 pub use workload::*;
 
