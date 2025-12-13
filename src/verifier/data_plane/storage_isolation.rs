@@ -7,7 +7,7 @@ use k8s_openapi::api::{
 };
 use serde::Serialize;
 
-use crate::verifier::TenantClusterConfig;
+use crate::{assessment::SafetyLevel, verifier::TenantClusterConfig};
 
 // Constants for resource naming and configuration
 const POD_NAME: &str = "persistent-pod";
@@ -52,13 +52,6 @@ pub struct OperationAssessment {
     pub authorized: bool,
     pub safe: SafetyLevel,
     pub test_details: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum SafetyLevel {
-    Safe,    // Operation doesn't affect other tenants
-    Unsafe,  // Operation affects other tenants
-    Unknown, // Cannot determine if operation affects other tenants
 }
 
 impl StorageResource {
@@ -1288,7 +1281,7 @@ async fn check_cross_tenant_mount(tenant: &TenantClusterConfig) -> anyhow::Resul
     tenant
         .cluster
         .watch_pod_until_condition(
-            &pod.metadata.name.as_deref().unwrap_or_default(),
+            pod.metadata.name.as_deref().unwrap_or_default(),
             &tenant.namespace,
             |pod_event| async {
                 match pod_event {
@@ -1301,7 +1294,7 @@ async fn check_cross_tenant_mount(tenant: &TenantClusterConfig) -> anyhow::Resul
                                             if let Ok(logs) = tenant
                                                 .cluster
                                                 .get_pod_logs(
-                                                    &pod.metadata
+                                                    pod.metadata
                                                         .name
                                                         .as_deref()
                                                         .unwrap_or_default(),
@@ -1409,16 +1402,6 @@ impl Display for StorageOperation {
         match self {
             StorageOperation::CreateAndMountVolume => write!(f, "Create And Mount Volume"),
             StorageOperation::UseHostPath => write!(f, "Use HostPath in a Volume"),
-        }
-    }
-}
-
-impl Display for SafetyLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SafetyLevel::Safe => write!(f, "Safe"),
-            SafetyLevel::Unsafe => write!(f, "Unsafe"),
-            SafetyLevel::Unknown => write!(f, "Unknown"),
         }
     }
 }
