@@ -1,3 +1,4 @@
+mod assessment;
 mod cluster;
 mod external_crds;
 mod verifier;
@@ -14,6 +15,7 @@ use cluster::{
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
+use tracing::Level;
 use verifier::TenantClusterConfig;
 
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
@@ -79,6 +81,10 @@ impl ChosenClusterProvider {
 enum Commands {
     /// Setup test environment with two tenants given a cluster environment type
     Setup {
+        /// Enable verbose output
+        #[clap(long, default_value = "false")]
+        verbose: bool,
+        /// Use an existing cluster instead of creating a new one
         #[clap(long, short, default_value = "false")]
         existing_cluster: bool,
         /// Name of the cluster to use or create.
@@ -97,6 +103,8 @@ enum Commands {
     },
     /// Verify isolation between two clusters
     Verify {
+        #[clap(long, default_value = "false")]
+        verbose: bool,
         #[clap(short = 'f', long = "tenant1-kubeconfig")]
         tenant1_kubeconfig_path: PathBuf,
         #[clap(short = 's', long = "tenant2-kubeconfig")]
@@ -216,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Commands::Setup {
+            verbose,
             existing_cluster,
             cluster_name,
             kind,
@@ -223,6 +232,8 @@ async fn main() -> anyhow::Result<()> {
             tenant1,
             tenant2,
         } => {
+            setup_logging(verbose)?;
+
             println!("Setting up test environment...");
             let cluster_name = format!("{}-{}", cluster_name, kind.as_str());
             setup_test_environment(
@@ -237,11 +248,13 @@ async fn main() -> anyhow::Result<()> {
             println!("Test environment setup complete");
         }
         Commands::Verify {
+            verbose,
             tenant1_kubeconfig_path,
             tenant2_kubeconfig_path,
             tenant1_namespace,
             tenant2_namespace,
         } => {
+            setup_logging(verbose)?;
             println!("Verifying cluster isolation...");
             let tenant1_config = TenantClusterConfig {
                 cluster: KubernetesClient::load_with_retry(&tenant1_kubeconfig_path, 5).await?,
@@ -251,6 +264,17 @@ async fn main() -> anyhow::Result<()> {
                 cluster: KubernetesClient::load_with_retry(&tenant2_kubeconfig_path, 5).await?,
                 namespace: tenant2_namespace,
             };
+            // let assessment = assessment::WorkloadAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run workload assessment")?;
+            // println!("Workload isolation assessment report:\n{}", report);
+            let assessment = assessment::StorageAssessor {};
+            let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+                .await
+                .context("Failed to run storage assessment")?;
+            println!("Storage isolation assessment report:\n{}", report);
+
             // let autonomy_result =
             //     verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
 
@@ -372,14 +396,14 @@ async fn main() -> anyhow::Result<()> {
             //         .context("Failed to verify storage isolation")?;
             // println!("{}", storage_isolation);
 
-            let storage_fairness = verifier::check_storage_fairness(
-                Arc::new(tenant1_config),
-                Arc::new(tenant2_config),
-                StorageFairnessTestConfig::default(),
-            )
-            .await
-            .context("Failed to verify storage fairness")?;
-            println!("{}", storage_fairness);
+            // let storage_fairness = verifier::check_storage_fairness(
+            //     Arc::new(tenant1_config),
+            //     Arc::new(tenant2_config),
+            //     StorageFairnessTestConfig::default(),
+            // )
+            // .await
+            // .context("Failed to verify storage fairness")?;
+            // println!("{}", storage_fairness);
 
             //println!("{}", network_report);
             // println!("Storage autonomy test passed: {}", storage_automony);
@@ -575,4 +599,14 @@ fn parse_mapping(s: &str) -> anyhow::Result<(u16, u16)> {
     let container = parts[0].parse().context("Invalid container port")?;
     let host = parts[1].parse().context("Invalid host port")?;
     Ok((container, host))
+}
+
+fn setup_logging(verbose: bool) -> anyhow::Result<()> {
+    let filter_level = if verbose { Level::INFO } else { Level::WARN };
+
+    tracing_subscriber::fmt()
+        .with_max_level(filter_level)
+        .init();
+
+    Ok(())
 }
