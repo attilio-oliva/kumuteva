@@ -1,6 +1,9 @@
+mod network;
 mod storage;
 mod workload;
 
+use colored::Colorize;
+pub use network::*;
 pub use storage::*;
 pub use workload::*;
 
@@ -172,24 +175,159 @@ impl Display for OperationAssessment {
             SafetyLevel::Unsafe => "⚠️",
             SafetyLevel::Unknown => "❓",
         };
-        write!(f, "Auth: {} | Safety: {}", auth_emoji, safe_emoji)
+        write!(
+            f,
+            "{} {}  {} {}",
+            safe_emoji,
+            "Safe".dimmed(),
+            auth_emoji,
+            "Authorization".dimmed()
+        )
     }
+}
+
+/// Wraps text to fit within a maximum width, adding a prefix to continuation lines.
+/// Also breaks on special separators (e.g., " - ") to improve readability.
+/// Returns a vector of (prefix, content) pairs for each line.
+fn wrap_text_lines(
+    text: &str,
+    max_width: usize,
+    first_prefix: &str,
+    continuation_prefix: &str,
+) -> Vec<(String, String)> {
+    const SEPARATOR: &str = " - ";
+    const BULLET: &str = "• ";
+
+    // First, split by the special separator
+    let segments: Vec<&str> = text.split(SEPARATOR).collect();
+
+    let mut lines: Vec<(String, String)> = Vec::new();
+    let mut is_first_line = true;
+
+    for (seg_idx, segment) in segments.iter().enumerate() {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+
+        // Add bullet for non-first segments
+        let segment_text = if seg_idx > 0 {
+            format!("{}{}", BULLET, segment)
+        } else {
+            segment.to_string()
+        };
+
+        // Now wrap this segment by words if needed
+        let prefix = if is_first_line {
+            first_prefix.to_string()
+        } else {
+            continuation_prefix.to_string()
+        };
+        let available_width = max_width.saturating_sub(prefix.chars().count());
+
+        // If segment fits in one line, just add it
+        if segment_text.len() <= available_width {
+            lines.push((prefix, segment_text));
+            is_first_line = false;
+        } else {
+            // Word-wrap this segment
+            let mut current_line = String::new();
+
+            for word in segment_text.split_whitespace() {
+                let line_prefix = if is_first_line {
+                    first_prefix.to_string()
+                } else {
+                    continuation_prefix.to_string()
+                };
+                let width = max_width.saturating_sub(line_prefix.chars().count());
+
+                if current_line.is_empty() {
+                    current_line = word.to_string();
+                } else if current_line.len() + 1 + word.len() <= width {
+                    current_line.push(' ');
+                    current_line.push_str(word);
+                } else {
+                    // Flush current line
+                    lines.push((line_prefix, current_line));
+                    current_line = word.to_string();
+                    is_first_line = false;
+                }
+            }
+
+            // Flush remaining words
+            if !current_line.is_empty() {
+                let line_prefix = if is_first_line {
+                    first_prefix.to_string()
+                } else {
+                    continuation_prefix.to_string()
+                };
+                lines.push((line_prefix, current_line));
+                is_first_line = false;
+            }
+        }
+    }
+
+    lines
+}
+
+/// Get terminal width, defaulting to 80 if unavailable.
+/// Leaves some margin (2 characters), hence does not return the full width.
+fn get_terminal_width() -> usize {
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize - 2) // Leave some margin
+        .unwrap_or(80)
 }
 
 impl<R: AssessableResource> Display for SubsystemReport<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let term_width = get_terminal_width();
+
         let iso_emoji = if self.overall_isolation { "✅" } else { "❌" };
         let auto_emoji = if self.overall_autonomy { "✅" } else { "❌" };
 
         writeln!(
             f,
-            "⚙️  {} (Isolation: {} | Autonomy: {})",
-            self.name, iso_emoji, auto_emoji
+            "⚙️  {} → {}{}  {}{}",
+            self.name.bold(),
+            iso_emoji,
+            "Isolation".dimmed(),
+            auto_emoji,
+            "Autonomy".dimmed()
         )?;
 
-        if !self.warnings.is_empty() {
-            for warning in &self.warnings {
-                writeln!(f, "   ⚠️  {}", warning)?;
+        let has_warnings = !self.warnings.is_empty();
+        let has_assessments = !self.assessments.is_empty();
+
+        // Print warnings as part of the tree under "Findings"
+        if has_warnings {
+            let findings_prefix = if has_assessments {
+                "├──"
+            } else {
+                "└──"
+            };
+            let findings_child_prefix = if has_assessments { "│   " } else { "    " };
+
+            writeln!(
+                f,
+                "{} 📌 {}",
+                findings_prefix.dimmed(),
+                "Findings".yellow().bold()
+            )?;
+
+            let warnings_total = self.warnings.len();
+            for (i, warning) in self.warnings.iter().enumerate() {
+                let is_last_warning = i == warnings_total - 1;
+                let warning_prefix = if is_last_warning {
+                    "└──"
+                } else {
+                    "├──"
+                };
+                let first = format!("{}{} ⚠️  ", findings_child_prefix, warning_prefix);
+                let cont = format!("{}       ", findings_child_prefix);
+                let lines = wrap_text_lines(warning, term_width, &first, &cont);
+                for (prefix, content) in lines {
+                    writeln!(f, "{}{}", prefix.dimmed(), content.yellow())?;
+                }
             }
         }
 
@@ -212,8 +350,13 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
 
             writeln!(
                 f,
-                "{} 📦 {} (Isolation: {} | Autonomy: {})",
-                res_prefix, assessment.resource, res_iso, res_auto
+                "{} 📦 {} → {}{}  {}{}",
+                res_prefix.dimmed(),
+                assessment.resource.to_string().bold(),
+                res_iso,
+                "Isolation".dimmed(),
+                res_auto,
+                "Autonomy".dimmed()
             )?;
 
             let ops: Vec<_> = assessment.operations.iter().collect();
@@ -226,18 +369,30 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
                 writeln!(
                     f,
                     "{}{} {} → {}",
-                    child_prefix, op_prefix, operation, op_assessment
+                    child_prefix.dimmed(),
+                    op_prefix.dimmed(),
+                    operation.to_string().cyan(),
+                    op_assessment
                 )?;
 
                 if let Some(details) = &op_assessment.details {
-                    writeln!(f, "{}{}    💬 {}", child_prefix, detail_prefix, details)?;
+                    let first = format!("{}{}└── 💬 ", child_prefix, detail_prefix);
+                    let cont = format!("{}{}       ", child_prefix, detail_prefix);
+                    let lines = wrap_text_lines(details, term_width, &first, &cont);
+                    for (prefix, content) in lines {
+                        let colored_content = match op_assessment.safe {
+                            SafetyLevel::Safe => content.green(),
+                            SafetyLevel::Unsafe => content.red(),
+                            SafetyLevel::Unknown => content.yellow(),
+                        };
+                        writeln!(f, "{}{}", prefix.dimmed(), colored_content)?;
+                    }
                 }
             }
         }
         Ok(())
     }
 }
-
 /* TODO: use when the refactor is complete
 
 pub struct MultitenancyReport {

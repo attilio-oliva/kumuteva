@@ -294,7 +294,7 @@ async fn test_pod_network_isolation(
     if can_reach_other_pod {
         Ok((
             SafetyLevel::Unsafe,
-            "Tenant1 can directly connect to tenant2's pod - network not isolated".to_string(),
+            "Tenant1 can directly connect to tenant2's pod - Network not isolated".to_string(),
         ))
     } else {
         Ok((
@@ -392,7 +392,7 @@ async fn test_service_network_isolation(
     if can_reach_service {
         Ok((
             SafetyLevel::Unsafe,
-            "Tenant1 can access tenant2's services - service network not isolated".to_string(),
+            "Tenant1 can access tenant2's services - Service network not isolated".to_string(),
         ))
     } else {
         Ok((
@@ -461,7 +461,7 @@ async fn test_nodeport_autonomy(
         Ok((
             SafetyLevel::Safe,
             format!(
-                "Both tenants can independently expose services on NodePort {} - network autonomy verified",
+                "Both tenants can independently expose services on NodePort {} - Network autonomy verified",
                 AUTONOMY_TEST_NODE_PORT
             ),
         ))
@@ -471,7 +471,7 @@ async fn test_nodeport_autonomy(
         Ok((
             SafetyLevel::Safe,
             format!(
-                "NodePort {} conflict detected - tenants share NodePort space (expected in shared-node setups)",
+                "NodePort {} conflict detected - Tenants share NodePort space (expected in shared-node setups)",
                 AUTONOMY_TEST_NODE_PORT
             ),
         ))
