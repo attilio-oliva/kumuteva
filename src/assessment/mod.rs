@@ -177,7 +177,7 @@ impl Display for OperationAssessment {
         };
         write!(
             f,
-            "{} {}  {} {}",
+            "{} {}  {}{}",
             safe_emoji,
             "Safe".dimmed(),
             auth_emoji,
