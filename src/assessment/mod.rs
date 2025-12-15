@@ -1,8 +1,9 @@
+mod control_plane;
 mod network;
 mod storage;
 mod workload;
 
-use colored::Colorize;
+pub use control_plane::*;
 pub use network::*;
 pub use storage::*;
 pub use workload::*;
@@ -12,6 +13,7 @@ use std::fmt::Display;
 use std::hash::Hash;
 
 use async_trait::async_trait;
+use colored::Colorize;
 
 use crate::verifier::TenantClusterConfig;
 
