@@ -213,6 +213,12 @@ async fn test_nodeport_authorization(tenant: &TenantClusterConfig) -> anyhow::Re
         .delete_resource_in_namespace::<Service>("auth-test-nodeport", &tenant.namespace)
         .await;
 
+    // Wait for service deletion to complete
+    let _ = tenant
+        .cluster
+        .wait_for_namespaced_resource_deletion::<Service>("auth-test-nodeport", &tenant.namespace)
+        .await;
+
     Ok(result.is_ok())
 }
 

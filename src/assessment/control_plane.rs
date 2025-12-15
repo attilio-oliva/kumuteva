@@ -16,6 +16,19 @@ use crate::verifier::{create_minimal_object, KubernetesObject};
 
 pub type ControlPlaneIsolationReport = SubsystemReport<ControlPlaneResource>;
 
+/// Autonomy category for control plane resources
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneAutonomyCategory {
+    /// Workload resources (Pods, Deployments, Jobs, etc.) - resources running inside namespace
+    Workload,
+    /// Scope resources (Namespace, ResourceQuota, LimitRange) - namespace-level configuration
+    Scope,
+    /// Infrastructure resources (Node, DaemonSet) - node-level access
+    Infrastructure,
+    /// Cluster-wide resources (ClusterRole, StorageClass, PersistentVolume, etc.)
+    Cluster,
+}
+
 /// Control plane resources map to Kubernetes object kinds
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ControlPlaneResource {
@@ -65,6 +78,45 @@ pub enum ControlPlaneResource {
 }
 
 impl ControlPlaneResource {
+    /// Returns the autonomy category for this resource
+    pub fn autonomy_category(&self) -> ControlPlaneAutonomyCategory {
+        match self {
+            // Workload resources - run inside namespace
+            Self::Pod
+            | Self::Deployment
+            | Self::ReplicaSet
+            | Self::StatefulSet
+            | Self::Job
+            | Self::CronJob
+            | Self::Service
+            | Self::ConfigMap
+            | Self::Secret
+            | Self::ServiceAccount
+            | Self::Endpoints
+            | Self::NetworkPolicy
+            | Self::Ingress
+            | Self::Role
+            | Self::RoleBinding
+            | Self::PodDisruptionBudget
+            | Self::HorizontalPodAutoscaler
+            | Self::PersistentVolumeClaim => ControlPlaneAutonomyCategory::Workload,
+
+            // Scope resources - namespace-level configuration
+            Self::Namespace | Self::LimitRange | Self::ResourceQuota => {
+                ControlPlaneAutonomyCategory::Scope
+            }
+
+            // Infrastructure resources - node-level
+            Self::Node | Self::DaemonSet => ControlPlaneAutonomyCategory::Infrastructure,
+
+            // Cluster-wide resources
+            Self::PersistentVolume
+            | Self::IngressClass
+            | Self::ClusterRole
+            | Self::ClusterRoleBinding
+            | Self::StorageClass => ControlPlaneAutonomyCategory::Cluster,
+        }
+    }
     /// Convert to the existing KubernetesObject for reusing existing logic
     pub fn to_kubernetes_object(&self) -> KubernetesObject {
         match self {
@@ -205,12 +257,10 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
         };
 
         let resource_name = k8s_obj.plural_kind();
-        let result = tenant
+        tenant
             .cluster
             .is_authorized_to(verb, &resource_name, namespace)
-            .await;
-
-        Ok(result.is_ok())
+            .await
     }
 
     async fn check_cross_tenant_effect(

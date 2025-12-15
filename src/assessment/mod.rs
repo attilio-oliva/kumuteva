@@ -6,12 +6,17 @@ mod workload;
 pub use control_plane::*;
 pub use network::*;
 pub use storage::*;
+use tabled::settings::object::{Columns, Rows};
+use tabled::settings::{Alignment, Border, Modify, Span, Style};
+use tabled::{Table, Tabled};
 pub use workload::*;
 
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
+use std::sync::Arc;
 
+use anyhow::Result;
 use async_trait::async_trait;
 use colored::Colorize;
 
@@ -42,6 +47,65 @@ pub struct ResourceAssessment<R: AssessableResource> {
     pub is_isolated: bool,
 }
 
+/// Autonomy level categories for control plane resources
+#[derive(Debug, Clone, Default)]
+pub struct ControlPlaneAutonomyLevels {
+    /// Workload resources (Pods, Deployments, etc.) - inside namespace
+    pub workload: AutonomyRatio,
+    /// Scope resources (Namespace itself, ResourceQuota, LimitRange)
+    pub scope: AutonomyRatio,
+    /// Infrastructure resources (Node, DaemonSet)
+    pub infrastructure: AutonomyRatio,
+    /// Cluster-wide resources (ClusterRole, StorageClass, etc.)
+    pub cluster: AutonomyRatio,
+}
+
+/// Represents an autonomy ratio with allowed/total counts
+#[derive(Debug, Clone, Default)]
+pub struct AutonomyRatio {
+    pub allowed: usize,
+    pub total: usize,
+}
+
+impl AutonomyRatio {
+    pub fn new(allowed: usize, total: usize) -> Self {
+        Self { allowed, total }
+    }
+
+    pub fn ratio(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.allowed as f64 / self.total as f64
+        }
+    }
+
+    pub fn percentage(&self) -> f64 {
+        self.ratio() * 100.0
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.total > 0 && self.allowed == self.total
+    }
+
+    pub fn add(&mut self, other: &AutonomyRatio) {
+        self.allowed += other.allowed;
+        self.total += other.total;
+    }
+}
+
+impl Display for AutonomyRatio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{} ({:.0}%)",
+            self.allowed,
+            self.total,
+            self.percentage()
+        )
+    }
+}
+
 /// Final report for a subsystem
 #[derive(Debug, Clone)]
 pub struct SubsystemReport<R: AssessableResource> {
@@ -49,7 +113,27 @@ pub struct SubsystemReport<R: AssessableResource> {
     pub assessments: Vec<ResourceAssessment<R>>,
     pub overall_autonomy: bool,
     pub overall_isolation: bool,
+    pub autonomy_ratio: AutonomyRatio,
     pub warnings: Vec<String>,
+}
+
+impl<R: AssessableResource> SubsystemReport<R> {
+    /// Calculate the autonomy ratio from assessments
+    pub fn calculate_autonomy_ratio(assessments: &[ResourceAssessment<R>]) -> AutonomyRatio {
+        let mut total = 0;
+        let mut allowed = 0;
+
+        for assessment in assessments {
+            for op_assessment in assessment.operations.values() {
+                total += 1;
+                if op_assessment.authorized {
+                    allowed += 1;
+                }
+            }
+        }
+
+        AutonomyRatio::new(allowed, total)
+    }
 }
 
 /// A resource that can be assessed for multi-tenancy properties
@@ -149,12 +233,14 @@ pub async fn run_assessment<A: MultitenancyAssessor>(
 
     let overall_autonomy = assessments.iter().all(|a| a.is_autonomous);
     let overall_isolation = assessments.iter().all(|a| a.is_isolated);
+    let autonomy_ratio = SubsystemReport::calculate_autonomy_ratio(&assessments);
 
     Ok(SubsystemReport {
         name: assessor.name().to_string(),
         assessments,
         overall_autonomy,
         overall_isolation,
+        autonomy_ratio,
         warnings,
     })
 }
@@ -395,14 +481,13 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
         Ok(())
     }
 }
-/* TODO: use when the refactor is complete
 
 pub struct MultitenancyReport {
     pub control_plane: SubsystemReport<ControlPlaneResource>,
+    pub control_plane_autonomy_levels: ControlPlaneAutonomyLevels,
     pub storage: SubsystemReport<StorageResource>,
     pub network: SubsystemReport<NetworkResource>,
     pub workload: SubsystemReport<WorkloadResource>,
-    pub fairness: FairnessReport, // Separate since it's different
 }
 
 impl MultitenancyReport {
@@ -412,29 +497,213 @@ impl MultitenancyReport {
             && self.network.overall_isolation
             && self.workload.overall_isolation
     }
-}
-*/
 
-/*  TODO: use in main
+    pub fn overall_autonomy_ratio(&self) -> AutonomyRatio {
+        let mut total = AutonomyRatio::default();
+        total.add(&self.control_plane.autonomy_ratio);
+        total.add(&self.storage.autonomy_ratio);
+        total.add(&self.network.autonomy_ratio);
+        total.add(&self.workload.autonomy_ratio);
+        total
+    }
+}
+
+/// Calculate control plane autonomy levels from assessments
+fn calculate_control_plane_autonomy_levels(
+    assessments: &[ResourceAssessment<ControlPlaneResource>],
+) -> ControlPlaneAutonomyLevels {
+    let mut levels = ControlPlaneAutonomyLevels::default();
+
+    for assessment in assessments {
+        let category = assessment.resource.autonomy_category();
+        let ratio = match category {
+            ControlPlaneAutonomyCategory::Workload => &mut levels.workload,
+            ControlPlaneAutonomyCategory::Scope => &mut levels.scope,
+            ControlPlaneAutonomyCategory::Infrastructure => &mut levels.infrastructure,
+            ControlPlaneAutonomyCategory::Cluster => &mut levels.cluster,
+        };
+
+        for op_assessment in assessment.operations.values() {
+            ratio.total += 1;
+            if op_assessment.authorized {
+                ratio.allowed += 1;
+            }
+        }
+    }
+
+    levels
+}
+
 pub async fn assess_multitenancy(
     tenant1: Arc<TenantClusterConfig>,
     tenant2: Arc<TenantClusterConfig>,
 ) -> Result<MultitenancyReport> {
     let control_plane = run_assessment(&ControlPlaneAssessor, &tenant1, &tenant2).await?;
+    let control_plane_autonomy_levels =
+        calculate_control_plane_autonomy_levels(&control_plane.assessments);
+    // sleep after every major assessment to allow resources to settle
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let storage = run_assessment(&StorageAssessor, &tenant1, &tenant2).await?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let network = run_assessment(&NetworkAssessor, &tenant1, &tenant2).await?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let workload = run_assessment(&WorkloadAssessor, &tenant1, &tenant2).await?;
-
-    // Fairness is special - run separately
-    let fairness = check_fairness(tenant1, tenant2, FairnessTestConfig::default()).await?;
 
     Ok(MultitenancyReport {
         control_plane,
+        control_plane_autonomy_levels,
         storage,
         network,
         workload,
-        fairness,
     })
 }
 
-*/
+#[derive(Tabled)]
+struct ReportRow {
+    #[tabled(rename = "System")]
+    system: String,
+    #[tabled(rename = "Property")]
+    property: String,
+    #[tabled(rename = "Value")]
+    value: String,
+}
+
+fn format_ratio_with_icon(ratio: &AutonomyRatio) -> String {
+    let icon = if ratio.is_full() {
+        "✅"
+    } else if ratio.ratio() >= 0.5 {
+        "🟡"
+    } else if ratio.allowed > 0 {
+        "🟠"
+    } else {
+        "❌"
+    };
+    format!("{} {}", icon, ratio)
+}
+
+fn format_isolation(isolated: bool) -> String {
+    if isolated {
+        "✅".to_string()
+    } else {
+        "❌".to_string()
+    }
+}
+
+impl Display for MultitenancyReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut rows = Vec::new();
+
+        // Control Plane section
+        rows.push(ReportRow {
+            system: "Control Plane".to_string(),
+            property: "Isolation".to_string(),
+            value: format_isolation(self.control_plane.overall_isolation),
+        });
+        rows.push(ReportRow {
+            system: "".to_string(),
+            property: "Autonomy".to_string(),
+            value: format_ratio_with_icon(&self.control_plane.autonomy_ratio),
+        });
+        rows.push(ReportRow {
+            system: "".to_string(),
+            property: "  ├─ Workload".to_string(),
+            value: format_ratio_with_icon(&self.control_plane_autonomy_levels.workload),
+        });
+        rows.push(ReportRow {
+            system: "".to_string(),
+            property: "  ├─ Scope".to_string(),
+            value: format_ratio_with_icon(&self.control_plane_autonomy_levels.scope),
+        });
+        rows.push(ReportRow {
+            system: "".to_string(),
+            property: "  ├─ Infrastructure".to_string(),
+            value: format_ratio_with_icon(&self.control_plane_autonomy_levels.infrastructure),
+        });
+        rows.push(ReportRow {
+            system: "".to_string(),
+            property: "  └─ Cluster".to_string(),
+            value: format_ratio_with_icon(&self.control_plane_autonomy_levels.cluster),
+        });
+
+        // Separator row
+        rows.push(ReportRow {
+            system: "─────────────".to_string(),
+            property: "─────────────────".to_string(),
+            value: "─────────────────".to_string(),
+        });
+
+        // Storage section
+        rows.push(ReportRow {
+            system: "Storage".to_string(),
+            property: "Isolation".to_string(),
+            value: format_isolation(self.storage.overall_isolation),
+        });
+        rows.push(ReportRow {
+            system: "".to_string(),
+            property: "Autonomy".to_string(),
+            value: format_ratio_with_icon(&self.storage.autonomy_ratio),
+        });
+
+        // Separator row
+        rows.push(ReportRow {
+            system: "─────────────".to_string(),
+            property: "─────────────────".to_string(),
+            value: "─────────────────".to_string(),
+        });
+
+        // Network section
+        rows.push(ReportRow {
+            system: "Network".to_string(),
+            property: "Isolation".to_string(),
+            value: format_isolation(self.network.overall_isolation),
+        });
+        rows.push(ReportRow {
+            system: "".to_string(),
+            property: "Autonomy".to_string(),
+            value: format_ratio_with_icon(&self.network.autonomy_ratio),
+        });
+
+        // Separator row
+        rows.push(ReportRow {
+            system: "─────────────".to_string(),
+            property: "─────────────────".to_string(),
+            value: "─────────────────".to_string(),
+        });
+
+        // Workload section
+        rows.push(ReportRow {
+            system: "Workload".to_string(),
+            property: "Isolation".to_string(),
+            value: format_isolation(self.workload.overall_isolation),
+        });
+        rows.push(ReportRow {
+            system: "".to_string(),
+            property: "Autonomy".to_string(),
+            value: format_ratio_with_icon(&self.workload.autonomy_ratio),
+        });
+
+        let table = Table::new(rows)
+            .with(Style::rounded())
+            .with(Modify::new(Rows::first()).with(Alignment::center()))
+            .with(Modify::new(Rows::new(1..)).with(Alignment::left()))
+            .to_string();
+
+        writeln!(f, "\n📊 Multi-Tenancy Assessment Report")?;
+        writeln!(f, "══════════════════════════════════\n")?;
+        write!(f, "{}", table)?;
+
+        // Overall summary
+        let overall_iso = self.overall_isolation();
+        let overall_auto = self.overall_autonomy_ratio();
+
+        writeln!(f, "\n📋 Summary:")?;
+        writeln!(f, "   Overall Isolation: {}", format_isolation(overall_iso))?;
+        writeln!(
+            f,
+            "   Overall Autonomy:  {}",
+            format_ratio_with_icon(&overall_auto)
+        )?;
+
+        Ok(())
+    }
+}

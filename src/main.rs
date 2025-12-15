@@ -264,16 +264,43 @@ async fn main() -> anyhow::Result<()> {
                 cluster: KubernetesClient::load_with_retry(&tenant2_kubeconfig_path, 5).await?,
                 namespace: tenant2_namespace,
             };
+
+            let tenant1_config = Arc::new(tenant1_config);
+            let tenant2_config = Arc::new(tenant2_config);
+
+            let report =
+                assessment::assess_multitenancy(tenant1_config.clone(), tenant2_config.clone())
+                    .await
+                    .context("Failed to run multitenancy assessment")?;
+            println!("{}", report.control_plane);
+            println!("{}", report.storage);
+            println!("{}", report.network);
+            println!("{}", report.workload);
+            println!("Multitenancy assessment report:\n{}", report);
+
             // let assessment = assessment::WorkloadAssessor {};
             // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
             //     .await
             //     .context("Failed to run workload assessment")?;
             // println!("Workload isolation assessment report:\n{}", report);
-            let assessment = assessment::StorageAssessor {};
-            let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
-                .await
-                .context("Failed to run storage assessment")?;
-            println!("Storage isolation assessment report:\n{}", report);
+
+            // let assessment = assessment::StorageAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run storage assessment")?;
+            // println!("Storage isolation assessment report:\n{}", report);
+
+            // let assessment = assessment::NetworkAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run network assessment")?;
+            // println!("Network isolation assessment report:\n{}", report);
+
+            // let assessment = assessment::ControlPlaneAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run control plane assessment")?;
+            // println!("Control plane isolation assessment report:\n{}", report);
 
             // let autonomy_result =
             //     verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;

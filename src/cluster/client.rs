@@ -661,6 +661,44 @@ impl KubernetesClient {
         }
     }
 
+    pub async fn wait_for_namespaced_resource_deletion<R>(
+        &self,
+        resource_name: &str,
+        namespace: &str,
+    ) -> Result<()>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Metadata<Ty = ObjectMeta>
+            + Clone
+            + std::fmt::Debug
+            + serde::de::DeserializeOwned,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", resource_name))
+            .timeout(290); // upper bound of how long we watch for
+
+        let resource_exists = api.get(resource_name).await.is_ok();
+
+        if !resource_exists {
+            return Ok(());
+        }
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(status) = stream.try_next().await? {
+            if let WatchEvent::Deleted(_) = status {
+                return Ok(());
+            } else {
+                if api.get(resource_name).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow!("Resource was not deleted in time"))
+    }
+
     /*
     pub async fn wait_for_resource_to_be_ready<R>(
         &self,

@@ -16,6 +16,7 @@ schemars = "0.8.21"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.137"
 serde_yaml = "0.9.34"
+tabled = "0.20.0"
 terminal_size = "0.4.3"
 tokio = { version = "1.43.0", features = ["full"] }
 tokio-util = { version = "0.7.13", features = ["io"] }
