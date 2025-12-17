@@ -46,8 +46,7 @@ for i in $(seq 1 "$1"); do
 
     create_users $i
 
-    #../load/generate_load.sh "$i" "tenant"
-    sleep 3600
+    ../load/generate_load.sh "$i" "tenant"
 
     delete_users_namespace $i
 
