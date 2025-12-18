@@ -30,10 +30,49 @@ pub enum SafetyLevel {
     Unknown,
 }
 
+/// Authorization level for operations
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthorizationLevel {
+    /// Fully authorized - can always perform the operation
+    Full,
+    /// Partially authorized - can perform only if no collision with other tenants
+    /// Contains description of what causes the collision
+    Partial(String),
+    /// Not authorized - operation is denied
+    Denied,
+}
+
+impl AuthorizationLevel {
+    pub fn is_authorized(&self) -> bool {
+        matches!(
+            self,
+            AuthorizationLevel::Full | AuthorizationLevel::Partial(_)
+        )
+    }
+
+    pub fn is_full(&self) -> bool {
+        matches!(self, AuthorizationLevel::Full)
+    }
+
+    pub fn is_partial(&self) -> bool {
+        matches!(self, AuthorizationLevel::Partial(_))
+    }
+}
+
+impl Display for AuthorizationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthorizationLevel::Full => write!(f, "✅ Full"),
+            AuthorizationLevel::Partial(reason) => write!(f, "⚠️ Partial ({})", reason),
+            AuthorizationLevel::Denied => write!(f, "❌ Denied"),
+        }
+    }
+}
+
 /// Result of assessing a single operation
 #[derive(Debug, Clone)]
 pub struct OperationAssessment {
-    pub authorized: bool,
+    pub authorization: AuthorizationLevel,
     pub safe: SafetyLevel,
     pub details: Option<String>,
 }
@@ -60,37 +99,57 @@ pub struct ControlPlaneAutonomyLevels {
     pub cluster: AutonomyRatio,
 }
 
-/// Represents an autonomy ratio with allowed/total counts
+/// Represents an autonomy ratio with full/partial/denied counts
 #[derive(Debug, Clone, Default)]
 pub struct AutonomyRatio {
-    pub allowed: usize,
-    pub total: usize,
+    pub full: usize,
+    pub partial: usize,
+    pub denied: usize,
 }
 
 impl AutonomyRatio {
-    pub fn new(allowed: usize, total: usize) -> Self {
-        Self { allowed, total }
-    }
-
-    pub fn ratio(&self) -> f64 {
-        if self.total == 0 {
-            0.0
-        } else {
-            self.allowed as f64 / self.total as f64
+    pub fn new(full: usize, partial: usize, denied: usize) -> Self {
+        Self {
+            full,
+            partial,
+            denied,
         }
     }
 
-    pub fn percentage(&self) -> f64 {
-        self.ratio() * 100.0
+    pub fn total(&self) -> usize {
+        self.full + self.partial + self.denied
     }
 
-    pub fn is_full(&self) -> bool {
-        self.total > 0 && self.allowed == self.total
+    /// Ratio of fully authorized operations
+    pub fn full_ratio(&self) -> f64 {
+        if self.total() == 0 {
+            0.0
+        } else {
+            self.full as f64 / self.total() as f64
+        }
+    }
+
+    /// Ratio of at least partially authorized operations
+    pub fn authorized_ratio(&self) -> f64 {
+        if self.total() == 0 {
+            0.0
+        } else {
+            (self.full + self.partial) as f64 / self.total() as f64
+        }
+    }
+
+    pub fn is_full_autonomy(&self) -> bool {
+        self.total() > 0 && self.denied == 0 && self.partial == 0
+    }
+
+    pub fn has_any_autonomy(&self) -> bool {
+        self.full > 0 || self.partial > 0
     }
 
     pub fn add(&mut self, other: &AutonomyRatio) {
-        self.allowed += other.allowed;
-        self.total += other.total;
+        self.full += other.full;
+        self.partial += other.partial;
+        self.denied += other.denied;
     }
 }
 
@@ -98,10 +157,8 @@ impl Display for AutonomyRatio {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}/{} ({:.0}%)",
-            self.allowed,
-            self.total,
-            self.percentage()
+            "{}/{}/{} (full/partial/denied)",
+            self.full, self.partial, self.denied
         )
     }
 }
@@ -120,19 +177,19 @@ pub struct SubsystemReport<R: AssessableResource> {
 impl<R: AssessableResource> SubsystemReport<R> {
     /// Calculate the autonomy ratio from assessments
     pub fn calculate_autonomy_ratio(assessments: &[ResourceAssessment<R>]) -> AutonomyRatio {
-        let mut total = 0;
-        let mut allowed = 0;
+        let mut ratio = AutonomyRatio::default();
 
         for assessment in assessments {
             for op_assessment in assessment.operations.values() {
-                total += 1;
-                if op_assessment.authorized {
-                    allowed += 1;
+                match &op_assessment.authorization {
+                    AuthorizationLevel::Full => ratio.full += 1,
+                    AuthorizationLevel::Partial(_) => ratio.partial += 1,
+                    AuthorizationLevel::Denied => ratio.denied += 1,
                 }
             }
         }
 
-        AutonomyRatio::new(allowed, total)
+        ratio
     }
 }
 
@@ -151,12 +208,14 @@ pub trait MultitenancyAssessor: Send + Sync {
 
     fn name(&self) -> &'static str;
 
-    async fn is_authorized(
+    /// Check authorization level - now returns Full, Partial, or Denied
+    async fn check_authorization(
         &self,
-        tenant: &TenantClusterConfig,
+        tenant1: &TenantClusterConfig,
+        tenant2: &TenantClusterConfig,
         resource: &Self::Resource,
         operation: &<Self::Resource as AssessableResource>::Operation,
-    ) -> anyhow::Result<bool>;
+    ) -> anyhow::Result<AuthorizationLevel>;
 
     async fn check_cross_tenant_effect(
         &self,
@@ -188,35 +247,50 @@ pub async fn run_assessment<A: MultitenancyAssessor>(
         let mut ops_map = HashMap::new();
 
         for operation in operations {
-            let authorized = assessor
-                .is_authorized(tenant1, &resource, &operation)
+            let authorization = assessor
+                .check_authorization(tenant1, tenant2, &resource, &operation)
                 .await?;
 
-            let assessment = if !authorized {
-                OperationAssessment {
-                    authorized: false,
+            let assessment = match &authorization {
+                AuthorizationLevel::Denied => OperationAssessment {
+                    authorization,
                     safe: SafetyLevel::Safe,
                     details: Some("Operation not authorized - access denied".to_string()),
-                }
-            } else {
-                let (safe, details) = assessor
-                    .check_cross_tenant_effect(tenant1, tenant2, &resource, &operation)
-                    .await?;
+                },
+                AuthorizationLevel::Full | AuthorizationLevel::Partial(_) => {
+                    let (safe, details) = assessor
+                        .check_cross_tenant_effect(tenant1, tenant2, &resource, &operation)
+                        .await?;
 
-                OperationAssessment {
-                    authorized: true,
-                    safe,
-                    details: Some(details),
+                    OperationAssessment {
+                        authorization,
+                        safe,
+                        details: Some(details),
+                    }
                 }
             };
 
             ops_map.insert(operation, assessment);
         }
 
-        let is_autonomous = ops_map.values().all(|a| a.authorized);
+        let is_fully_autonomous = ops_map.values().all(|a| a.authorization.is_full());
+        let is_partially_autonomous = ops_map.values().all(|a| a.authorization.is_authorized());
         let is_isolated = !ops_map.values().any(|a| a.safe == SafetyLevel::Unsafe);
 
-        if is_autonomous && !is_isolated {
+        if is_partially_autonomous && !is_fully_autonomous {
+            let partial_ops: Vec<_> = ops_map
+                .iter()
+                .filter(|(_, a)| a.authorization.is_partial())
+                .map(|(op, _)| op.to_string())
+                .collect();
+            warnings.push(format!(
+                "⚠️ {} has partial autonomy for: {}",
+                resource,
+                partial_ops.join(", ")
+            ));
+        }
+
+        if is_partially_autonomous && !is_isolated {
             warnings.push(format!(
                 "Warning: {} is usable but not isolated - potential security risk",
                 resource
@@ -226,7 +300,7 @@ pub async fn run_assessment<A: MultitenancyAssessor>(
         assessments.push(ResourceAssessment {
             resource,
             operations: ops_map,
-            is_autonomous,
+            is_autonomous: is_fully_autonomous,
             is_isolated,
         });
     }
@@ -257,7 +331,11 @@ impl Display for SafetyLevel {
 
 impl Display for OperationAssessment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let auth_emoji = if self.authorized { "✅" } else { "❌" };
+        let auth_emoji = match self.authorization {
+            AuthorizationLevel::Full => "✅",
+            AuthorizationLevel::Partial(_) => "⚠️",
+            AuthorizationLevel::Denied => "❌",
+        };
         let safe_emoji = match self.safe {
             SafetyLevel::Safe => "🛡️",
             SafetyLevel::Unsafe => "⚠️",
@@ -524,9 +602,12 @@ fn calculate_control_plane_autonomy_levels(
         };
 
         for op_assessment in assessment.operations.values() {
-            ratio.total += 1;
-            if op_assessment.authorized {
-                ratio.allowed += 1;
+            if op_assessment.authorization.is_full() {
+                ratio.full += 1;
+            } else if op_assessment.authorization.is_partial() {
+                ratio.partial += 1;
+            } else {
+                ratio.denied += 1;
             }
         }
     }
@@ -569,11 +650,11 @@ struct ReportRow {
 }
 
 fn format_ratio_with_icon(ratio: &AutonomyRatio) -> String {
-    let icon = if ratio.is_full() {
+    let icon = if ratio.is_full_autonomy() {
         "✅"
-    } else if ratio.ratio() >= 0.5 {
+    } else if ratio.authorized_ratio() >= 0.5 {
         "🟡"
-    } else if ratio.allowed > 0 {
+    } else if ratio.has_any_autonomy() {
         "🟠"
     } else {
         "❌"
@@ -703,6 +784,10 @@ impl Display for MultitenancyReport {
             "   Overall Autonomy:  {}",
             format_ratio_with_icon(&overall_auto)
         )?;
+
+        if self.overall_autonomy_ratio().partial > 0 {
+            writeln!(f, "\n⚠️  Partial autonomy detected - some operations may be forbidden when another tenant is active")?;
+        }
 
         Ok(())
     }

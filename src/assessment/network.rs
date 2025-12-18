@@ -6,7 +6,8 @@ use kube::runtime::reflector::Lookup;
 use tracing::info;
 
 use crate::assessment::{
-    run_assessment, AssessableResource, MultitenancyAssessor, SafetyLevel, SubsystemReport,
+    run_assessment, AssessableResource, AuthorizationLevel, MultitenancyAssessor, SafetyLevel,
+    SubsystemReport,
 };
 use crate::verifier::TenantClusterConfig;
 
@@ -86,34 +87,28 @@ impl MultitenancyAssessor for NetworkAssessor {
         "Network"
     }
 
-    async fn is_authorized(
+    async fn check_authorization(
         &self,
-        tenant: &TenantClusterConfig,
+        tenant1: &TenantClusterConfig,
+        tenant2: &TenantClusterConfig,
         resource: &NetworkResource,
         operation: &NetworkOperation,
-    ) -> anyhow::Result<bool> {
-        info!(
-            "Checking authorization for {:?} - {:?}",
-            resource, operation
-        );
+    ) -> anyhow::Result<AuthorizationLevel> {
         match (resource, operation) {
             (NetworkResource::PodNetwork, NetworkOperation::ConnectToPod) => {
-                // Tenants can always create pods that make network connections
-                test_pod_network_authorization(tenant).await
+                check_pod_network_authorization(tenant1).await
             }
             (NetworkResource::ServiceNetwork, NetworkOperation::ConnectToService) => {
-                // Tenants can create services
-                test_service_creation_authorization(tenant).await
+                check_service_authorization(tenant1).await
             }
             (NetworkResource::ServiceNetwork, NetworkOperation::ExposeNodePort) => {
-                // Test if tenant can create NodePort services
-                test_nodeport_authorization(tenant).await
+                // This is where we check for collision!
+                check_nodeport_authorization_with_collision(tenant1, tenant2).await
             }
             (NetworkResource::DnsResolution, NetworkOperation::ResolveDns) => {
-                // DNS resolution is typically always available
-                Ok(true)
+                Ok(AuthorizationLevel::Full)
             }
-            _ => Ok(false),
+            _ => Ok(AuthorizationLevel::Denied),
         }
     }
 
@@ -157,69 +152,115 @@ pub async fn check_network_isolation(
 // =============================================================================
 // AUTHORIZATION TESTS
 // =============================================================================
-
-async fn test_pod_network_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
-    let test_pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
-    let result = tenant
+async fn check_pod_network_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<AuthorizationLevel> {
+    let authorized = tenant
         .cluster
-        .create_pod_in_namespace(&test_pod, &tenant.namespace)
-        .await;
+        .is_authorized_to("create", "pods", Some(&tenant.namespace))
+        .await?;
 
-    // Cleanup
-    let _ = tenant
-        .cluster
-        .delete_pod_in_namespace(NETWORK_MULTITOOL_POD_NAME, &tenant.namespace)
-        .await;
-
-    // wait for pod deletion to complete
-    let _ = tenant
-        .cluster
-        .wait_for_pod_deletion(NETWORK_MULTITOOL_POD_NAME, &tenant.namespace)
-        .await;
-
-    Ok(result.is_ok())
+    if authorized {
+        Ok(AuthorizationLevel::Full)
+    } else {
+        Ok(AuthorizationLevel::Denied)
+    }
 }
 
-async fn test_service_creation_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
-    let test_service = create_clusterip_service(&tenant.namespace, "auth-test-service");
-    let result = tenant
+async fn check_service_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<AuthorizationLevel> {
+    let authorized = tenant
         .cluster
-        .create_namespaced_resource::<Service>(&test_service, &tenant.namespace)
-        .await;
+        .is_authorized_to("create", "services", Some(&tenant.namespace))
+        .await?;
 
-    // Cleanup
-    let _ = tenant
-        .cluster
-        .delete_resource_in_namespace::<Service>("auth-test-service", &tenant.namespace)
-        .await;
-
-    Ok(result.is_ok())
+    if authorized {
+        Ok(AuthorizationLevel::Full)
+    } else {
+        Ok(AuthorizationLevel::Denied)
+    }
 }
 
-async fn test_nodeport_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+/// Check NodePort authorization AND detect if there's a collision with other tenant
+async fn check_nodeport_authorization_with_collision(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<AuthorizationLevel> {
+    // First check if tenant1 can create NodePort services
     let test_service = create_nodeport_service(
-        &tenant.namespace,
+        &tenant1.namespace,
         "auth-test-nodeport",
         AUTONOMY_TEST_NODE_PORT,
     );
-    let result = tenant
+
+    let tenant1_result = tenant1
         .cluster
-        .create_namespaced_resource::<Service>(&test_service, &tenant.namespace)
+        .create_namespaced_resource::<Service>(&test_service, &tenant1.namespace)
         .await;
 
-    // Cleanup
-    let _ = tenant
+    if tenant1_result.is_err() {
+        // Cleanup attempt
+        let _ = tenant1
+            .cluster
+            .delete_resource_in_namespace::<Service>("auth-test-nodeport", &tenant1.namespace)
+            .await;
+        return Ok(AuthorizationLevel::Denied);
+    }
+
+    // Now try to create same NodePort in tenant2 to detect collision
+    let tenant2_service = create_nodeport_service(
+        &tenant2.namespace,
+        "collision-test-nodeport",
+        AUTONOMY_TEST_NODE_PORT,
+    );
+
+    let tenant2_result = tenant2
         .cluster
-        .delete_resource_in_namespace::<Service>("auth-test-nodeport", &tenant.namespace)
+        .create_namespaced_resource::<Service>(&tenant2_service, &tenant2.namespace)
         .await;
 
-    // Wait for service deletion to complete
-    let _ = tenant
+    // Cleanup tenant1's service
+    let _ = tenant1
         .cluster
-        .wait_for_namespaced_resource_deletion::<Service>("auth-test-nodeport", &tenant.namespace)
+        .delete_resource_in_namespace::<Service>("auth-test-nodeport", &tenant1.namespace)
         .await;
 
-    Ok(result.is_ok())
+    let authorization = if tenant2_result.is_ok() {
+        // Cleanup tenant2's service
+        let _ = tenant2
+            .cluster
+            .delete_resource_in_namespace::<Service>("collision-test-nodeport", &tenant2.namespace)
+            .await;
+
+        // Both can use the same NodePort - full autonomy (isolated network namespaces)
+        AuthorizationLevel::Full
+    } else {
+        let error = tenant2_result.err().unwrap();
+        if error.to_string().contains("already allocated")
+            || error.to_string().contains("port is already allocated")
+            || error.to_string().contains("nodePort")
+        {
+            // NodePort collision detected - partial autonomy
+            AuthorizationLevel::Partial(format!(
+                "NodePort {} shared across tenants - collision possible",
+                AUTONOMY_TEST_NODE_PORT
+            ))
+        } else {
+            // Some other error - tenant2 might just not be authorized
+            AuthorizationLevel::Partial(
+                "NodePort creation may conflict with other tenants".to_string(),
+            )
+        }
+    };
+
+    // Wait for cleanup
+    let _ = tenant1
+        .cluster
+        .wait_for_namespaced_resource_deletion::<Service>("auth-test-nodeport", &tenant1.namespace)
+        .await;
+
+    Ok(authorization)
 }
 
 // =============================================================================

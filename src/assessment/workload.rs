@@ -3,7 +3,8 @@ use k8s_openapi::api::core::v1::Pod;
 use std::fmt::Display;
 
 use crate::assessment::{
-    run_assessment, AssessableResource, MultitenancyAssessor, SafetyLevel, SubsystemReport,
+    run_assessment, AssessableResource, AuthorizationLevel, MultitenancyAssessor, SafetyLevel,
+    SubsystemReport,
 };
 use crate::verifier::TenantClusterConfig;
 
@@ -62,29 +63,30 @@ impl MultitenancyAssessor for WorkloadAssessor {
         "Workload"
     }
 
-    async fn is_authorized(
+    async fn check_authorization(
         &self,
-        tenant: &TenantClusterConfig,
+        tenant1: &TenantClusterConfig,
+        tenant2: &TenantClusterConfig,
         resource: &WorkloadResource,
         operation: &WorkloadOperation,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<AuthorizationLevel> {
         match (resource, operation) {
             (WorkloadResource::ProcessNamespace, WorkloadOperation::ViewProcesses) => {
-                test_host_pid_authorization(tenant).await
+                test_host_pid_authorization(tenant1).await
             }
             (WorkloadResource::NetworkNamespace, WorkloadOperation::CreateNetworkConn) => {
-                test_host_network_authorization(tenant).await
+                test_host_network_authorization(tenant1).await
             }
             (WorkloadResource::UserNamespace, WorkloadOperation::AccessHostUser) => {
-                test_host_user_authorization(tenant).await
+                test_host_user_authorization(tenant1).await
             }
             (WorkloadResource::IPCNamespace, WorkloadOperation::AccessIPC) => {
-                test_host_ipc_authorization(tenant).await
+                test_host_ipc_authorization(tenant1).await
             }
             (WorkloadResource::PrivilegedSyscalls, WorkloadOperation::UsePrivilegedSyscalls) => {
-                test_privileged_authorization(tenant).await
+                test_privileged_authorization(tenant1).await
             }
-            _ => Ok(false),
+            _ => Ok(AuthorizationLevel::Denied),
         }
     }
 
@@ -124,7 +126,9 @@ pub async fn check_workload_isolation(
     run_assessment(&WorkloadAssessor, tenant1, tenant2).await
 }
 
-async fn test_host_pid_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_host_pid_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<AuthorizationLevel> {
     let test_pod_name = "hostpid-auth-test";
     let test_pod = create_host_pid_test_pod(test_pod_name);
 
@@ -139,10 +143,14 @@ async fn test_host_pid_authorization(tenant: &TenantClusterConfig) -> anyhow::Re
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    result
+        .map(|_| AuthorizationLevel::Full)
+        .or_else(|_| Ok(AuthorizationLevel::Denied))
 }
 
-async fn test_privileged_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_privileged_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<AuthorizationLevel> {
     let test_pod_name = "privileged-auth-test";
     let test_pod = create_privileged_test_pod(test_pod_name);
 
@@ -157,10 +165,14 @@ async fn test_privileged_authorization(tenant: &TenantClusterConfig) -> anyhow::
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    result
+        .map(|_| AuthorizationLevel::Full)
+        .or_else(|_| Ok(AuthorizationLevel::Denied))
 }
 
-async fn test_host_network_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_host_network_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<AuthorizationLevel> {
     let test_pod_name = "hostnet-auth-test";
     let test_pod = create_host_network_test_pod(test_pod_name);
 
@@ -175,10 +187,14 @@ async fn test_host_network_authorization(tenant: &TenantClusterConfig) -> anyhow
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    result
+        .map(|_| AuthorizationLevel::Full)
+        .or_else(|_| Ok(AuthorizationLevel::Denied))
 }
 
-async fn test_host_ipc_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_host_ipc_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<AuthorizationLevel> {
     let test_pod_name = "hostipc-auth-test";
     let test_pod = create_host_ipc_test_pod(test_pod_name);
 
@@ -193,7 +209,9 @@ async fn test_host_ipc_authorization(tenant: &TenantClusterConfig) -> anyhow::Re
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    result
+        .map(|_| AuthorizationLevel::Full)
+        .or_else(|_| Ok(AuthorizationLevel::Denied))
 }
 
 // Cross-tenant effect test functions
@@ -511,7 +529,9 @@ async fn test_ipc_cross_tenant(
     Ok((safety_level, details))
 }
 
-async fn test_host_user_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_host_user_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<AuthorizationLevel> {
     let test_pod_name = "hostuser-auth-test";
     let test_pod = create_host_user_test_pod(test_pod_name);
 
@@ -526,7 +546,9 @@ async fn test_host_user_authorization(tenant: &TenantClusterConfig) -> anyhow::R
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    result
+        .map(|_| AuthorizationLevel::Full)
+        .or_else(|_| Ok(AuthorizationLevel::Denied))
 }
 
 async fn test_user_namespace_cross_tenant(

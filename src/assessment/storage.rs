@@ -10,7 +10,8 @@ use serde::Serialize;
 use tracing::info;
 
 use crate::assessment::{
-    run_assessment, AssessableResource, MultitenancyAssessor, SafetyLevel, SubsystemReport,
+    run_assessment, AssessableResource, AuthorizationLevel, MultitenancyAssessor, SafetyLevel,
+    SubsystemReport,
 };
 use crate::verifier::TenantClusterConfig;
 
@@ -79,22 +80,35 @@ impl MultitenancyAssessor for StorageAssessor {
         "Storage"
     }
 
-    async fn is_authorized(
+    async fn check_authorization(
         &self,
-        tenant: &TenantClusterConfig,
+        tenant1: &TenantClusterConfig,
+        tenant2: &TenantClusterConfig,
         resource: &StorageResource,
         operation: &StorageOperation,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<AuthorizationLevel> {
         match (resource, operation) {
             (StorageResource::Volume, StorageOperation::CreateAndMountVolume) => {
-                let can_create_pv = test_pv_creation_authorization(tenant).await;
-                let can_mount_pv = test_pv_mount_authorization(tenant).await;
-                Ok(can_create_pv.unwrap_or(false) && can_mount_pv.unwrap_or(false))
+                let can_create_pv = test_pv_creation_authorization(tenant1).await;
+                let can_mount_pv = test_pv_mount_authorization(tenant1).await;
+                let auth = can_create_pv.unwrap_or(false) && can_mount_pv.unwrap_or(false);
+                if auth {
+                    Ok(AuthorizationLevel::Full)
+                } else {
+                    Ok(AuthorizationLevel::Denied)
+                }
             }
+
             (StorageResource::Volume, StorageOperation::UseHostPath) => {
-                let can_create_hostpath = test_hostpath_creation_authorization(tenant).await;
-                let can_mount_hostpath = test_hostpath_mount_authorization(tenant).await;
-                Ok(can_create_hostpath.unwrap_or(false) && can_mount_hostpath.unwrap_or(false))
+                let can_create_hostpath = test_hostpath_creation_authorization(tenant1).await;
+                let can_mount_hostpath = test_hostpath_mount_authorization(tenant1).await;
+                let auth =
+                    can_create_hostpath.unwrap_or(false) && can_mount_hostpath.unwrap_or(false);
+                if auth {
+                    Ok(AuthorizationLevel::Full)
+                } else {
+                    Ok(AuthorizationLevel::Denied)
+                }
             }
         }
     }

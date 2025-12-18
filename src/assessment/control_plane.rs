@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
 
 use crate::assessment::{
-    run_assessment, AssessableResource, MultitenancyAssessor, SafetyLevel, SubsystemReport,
+    run_assessment, AssessableResource, AuthorizationLevel, MultitenancyAssessor, SafetyLevel,
+    SubsystemReport,
 };
+use crate::cluster;
 use crate::verifier::TenantClusterConfig;
 use crate::verifier::{create_minimal_object, KubernetesObject};
 
@@ -214,6 +216,8 @@ impl AssessableResource for ControlPlaneResource {
             Self::HorizontalPodAutoscaler,
             // Storage API
             Self::StorageClass,
+            // API Extensions
+            Self::CustomResourceDefinition,
         ]
     }
 
@@ -241,12 +245,13 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
         "Control Plane"
     }
 
-    async fn is_authorized(
+    async fn check_authorization(
         &self,
-        tenant: &TenantClusterConfig,
+        tenant1: &TenantClusterConfig,
+        tenant2: &TenantClusterConfig,
         resource: &ControlPlaneResource,
         operation: &ControlPlaneOperation,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<AuthorizationLevel> {
         let k8s_obj = resource.to_kubernetes_object();
         let verb = match operation {
             ControlPlaneOperation::Get => "get",
@@ -256,16 +261,34 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
         };
 
         let namespace = if k8s_obj.is_namespaced() {
-            Some(tenant.namespace.as_str())
+            Some(tenant1.namespace.as_str())
         } else {
             None
         };
 
         let resource_name = k8s_obj.plural_kind();
-        tenant
+        let is_authorized = tenant1
             .cluster
             .is_authorized_to(verb, &resource_name, namespace)
-            .await
+            .await?;
+
+        if !is_authorized {
+            return Ok(AuthorizationLevel::Denied);
+        }
+
+        // For cluster-scoped resources, check for potential collisions
+        if !k8s_obj.is_namespaced()
+            && matches!(
+                operation,
+                ControlPlaneOperation::Get | ControlPlaneOperation::List
+            )
+        {
+            // For read operations on cluster-scoped resources, check if tenants see the same objects
+            return check_cluster_scoped_collision(tenant1, tenant2, &k8s_obj, operation).await;
+        }
+
+        // For namespaced resources or write operations that passed auth check
+        Ok(AuthorizationLevel::Full)
     }
 
     async fn check_cross_tenant_effect(
@@ -316,6 +339,125 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
     }
 }
 
+/// Check if cluster-scoped resources have collision potential
+async fn check_cluster_scoped_collision(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+    _operation: &ControlPlaneOperation,
+) -> anyhow::Result<AuthorizationLevel> {
+    // check if you can create two resources with the same name
+    // one from each tenant
+
+    match object_kind {
+        KubernetesObject::CustomResourceDefinition => check_crd_collision(tenant1, tenant2).await,
+        _ => {
+            let obj = create_random_object(tenant1, object_kind, "test-collision").await?;
+            let res = tenant1
+                .cluster
+                .create_resource_dyn(object_kind, &obj, None)
+                .await;
+            if res.is_err() {
+                return Ok(AuthorizationLevel::Denied);
+            }
+
+            let res = tenant2
+                .cluster
+                .create_resource_dyn(object_kind, &obj, None)
+                .await;
+
+            if res.is_err() {
+                Ok(AuthorizationLevel::Partial(
+                    "Cluster-scoped resource name collisions possible".to_string(),
+                ))
+            } else {
+                Ok(AuthorizationLevel::Full)
+            }
+        }
+    }
+}
+
+/// Special check for CRD collisions - can both tenants create CRDs with the same group?
+async fn check_crd_collision(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<AuthorizationLevel> {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+
+    // Check if tenant1 can create CRDs
+    let is_authorized = tenant1
+        .cluster
+        .is_authorized_to("create", "customresourcedefinitions", None)
+        .await?;
+
+    if !is_authorized {
+        return Ok(AuthorizationLevel::Denied);
+    }
+
+    // Create a test CRD with a unique group based on tenant
+    let test_crd_name = format!("collisiontest.tenant1.example.com");
+    let test_crd: CustomResourceDefinition = serde_json::from_value(serde_json::json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {
+            "name": test_crd_name
+        },
+        "spec": {
+            "group": "tenant1.example.com",
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {
+                                "type": "object"
+                            }
+                        }
+                    }
+                }
+            }],
+            "scope": "Namespaced",
+            "names": {
+                "plural": "collisiontests",
+                "singular": "collisiontest",
+                "kind": "CollisionTest"
+            }
+        }
+    }))?;
+
+    // Try to create CRD in tenant1
+    let tenant1_result = tenant1.cluster.create_cluster_resource(&test_crd).await;
+
+    if tenant1_result.is_err() {
+        return Ok(AuthorizationLevel::Denied);
+    }
+
+    // Check if tenant2 can see this CRD
+    let tenant2_can_see = tenant2
+        .cluster
+        .get_cluster_resource::<CustomResourceDefinition>(&test_crd_name)
+        .await
+        .is_ok();
+
+    // Cleanup
+    let _ = tenant1
+        .cluster
+        .delete_cluster_resource::<CustomResourceDefinition>(&test_crd_name)
+        .await;
+
+    if tenant2_can_see {
+        Ok(AuthorizationLevel::Partial(
+            "CRDs are cluster-scoped and visible to all tenants - name collisions possible"
+                .to_string(),
+        ))
+    } else {
+        Ok(AuthorizationLevel::Full)
+    }
+}
+
 /// Public API - entry point for control plane isolation assessment
 pub async fn check_control_plane_isolation(
     tenant1: &TenantClusterConfig,
@@ -348,11 +490,27 @@ async fn setup_test_object(
     }
 }
 
+async fn create_random_object(
+    tenant: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+    prefix: &str,
+) -> anyhow::Result<DynamicObject> {
+    let random_object_name = format!(
+        "{}-{}-{}",
+        prefix,
+        object_kind.kind().to_lowercase(),
+        uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
+    );
+
+    // Try to create a new test object
+    create_test_object(tenant, object_kind, &random_object_name).await
+}
+
 async fn create_test_object(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
     object_name: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DynamicObject> {
     let test_object = create_minimal_object(object_kind, object_name, &tenant.namespace)?;
     let dynamic_object = DynamicObject {
         types: Some(TypeMeta {
@@ -377,7 +535,7 @@ async fn create_test_object(
         .create_resource_dyn(object_kind, &dynamic_object, namespace)
         .await?;
 
-    Ok(())
+    Ok(dynamic_object)
 }
 
 async fn find_existing_object(
