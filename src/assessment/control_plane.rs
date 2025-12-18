@@ -75,6 +75,9 @@ pub enum ControlPlaneResource {
 
     // Storage API (storage.k8s.io/v1)
     StorageClass,
+
+    // API Extensions (apiextensions.k8s.io/v1)
+    CustomResourceDefinition,
 }
 
 impl ControlPlaneResource {
@@ -114,7 +117,8 @@ impl ControlPlaneResource {
             | Self::IngressClass
             | Self::ClusterRole
             | Self::ClusterRoleBinding
-            | Self::StorageClass => ControlPlaneAutonomyCategory::Cluster,
+            | Self::StorageClass
+            | Self::CustomResourceDefinition => ControlPlaneAutonomyCategory::Cluster,
         }
     }
     /// Convert to the existing KubernetesObject for reusing existing logic
@@ -148,6 +152,7 @@ impl ControlPlaneResource {
             Self::PodDisruptionBudget => KubernetesObject::PodDisruptionBudget,
             Self::HorizontalPodAutoscaler => KubernetesObject::HorizontalPodAutoscaler,
             Self::StorageClass => KubernetesObject::StorageClass,
+            Self::CustomResourceDefinition => KubernetesObject::CustomResourceDefinition,
         }
     }
 

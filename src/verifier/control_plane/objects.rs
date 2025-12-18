@@ -166,6 +166,9 @@ define_kubernetes_objects! {
     // Storage API (storage.k8s.io/v1)
     StorageClass => k8s_openapi::api::storage::v1::StorageClass,
 
+    // API Extensions (apiextensions.k8s.io/v1)
+    CustomResourceDefinition => k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+
     // Extensions for custom resources can be added here
 }
 

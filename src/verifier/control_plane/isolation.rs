@@ -1,10 +1,14 @@
-use crate::verifier::{
-    control_plane::autonomy, AssessmentResult, ControlPlaneIsolationReport, KubernetesObject,
-    KubernetesVerb, ObjectPropertyAssessment, OperationResult, TenantClusterConfig,
+use crate::{
+    cluster::{DummyCRD, DummyCRDSpec},
+    verifier::{
+        control_plane::autonomy, AssessmentResult, ControlPlaneIsolationReport, KubernetesObject,
+        KubernetesVerb, ObjectPropertyAssessment, OperationResult, TenantClusterConfig,
+    },
 };
 
 use anyhow::{Context, Result};
 use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
+use serde::Serialize;
 
 /// Verifies that object isolation works between two tenant clusters
 /// Tests that one tenant cannot access other tenant's objects
@@ -835,6 +839,39 @@ pub fn create_minimal_object(
                         }
                     }]
                 }]
+            });
+        }
+
+        KubernetesObject::CustomResourceDefinition => {
+            base_object["spec"] = serde_json::json!({
+                "group": "example.com",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "properties": {
+                                        "foo": {
+                                            "type": "string"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }],
+                "scope": "Namespaced",
+                "names": {
+                    "plural": format!("{}s", object_name.to_lowercase()),
+                    "singular": object_name.to_lowercase(),
+                    "kind": object_name,
+                    "shortNames": [object_name.to_lowercase()]
+                }
             });
         }
 
