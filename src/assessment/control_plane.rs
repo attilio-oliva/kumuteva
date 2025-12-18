@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 
 use async_trait::async_trait;
 use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
+use kube::ResourceExt;
 
 use crate::assessment::{
     run_assessment, AssessableResource, MultitenancyAssessor, SafetyLevel, SubsystemReport,
@@ -158,6 +159,8 @@ impl ControlPlaneResource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ControlPlaneOperation {
+    /// Kubernetes CREATE verb
+    Create,
     /// Kubernetes GET verb
     Get,
     /// Kubernetes LIST verb
@@ -214,6 +217,7 @@ impl AssessableResource for ControlPlaneResource {
 
     fn applicable_operations(&self) -> Vec<Self::Operation> {
         vec![
+            ControlPlaneOperation::Create,
             ControlPlaneOperation::Get,
             ControlPlaneOperation::List,
             ControlPlaneOperation::Update,
@@ -244,6 +248,7 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
     ) -> anyhow::Result<bool> {
         let k8s_obj = resource.to_kubernetes_object();
         let verb = match operation {
+            ControlPlaneOperation::Create => "create",
             ControlPlaneOperation::Get => "get",
             ControlPlaneOperation::List => "list",
             ControlPlaneOperation::Update => "update",
@@ -271,6 +276,102 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
         operation: &ControlPlaneOperation,
     ) -> anyhow::Result<(SafetyLevel, String)> {
         let k8s_obj = resource.to_kubernetes_object();
+
+        if operation == &ControlPlaneOperation::Create {
+            // Creation is not tested for cross-tenant effects
+            let obj = create_minimal_object(&k8s_obj, "test-create", &tenant1.namespace)?;
+            let t1_create_result = tenant1
+                .cluster
+                .create_resource_dyn(
+                    &k8s_obj,
+                    &DynamicObject {
+                        types: Some(TypeMeta {
+                            api_version: k8s_obj.api_version().to_string(),
+                            kind: k8s_obj.kind().to_string(),
+                        }),
+                        metadata: ObjectMeta {
+                            name: Some("test-create".to_string()),
+                            annotations: Some(BTreeMap::from([(
+                                "kumuteva.io/created-by-tenant".to_string(),
+                                "tenant1".to_string(),
+                            )])),
+                            ..Default::default()
+                        },
+                        data: obj.clone(),
+                    },
+                    if k8s_obj.is_namespaced() {
+                        Some(tenant1.namespace.as_str())
+                    } else {
+                        None
+                    },
+                )
+                .await?;
+
+            let t2_create_result = tenant2
+                .cluster
+                .create_resource_dyn(
+                    &k8s_obj,
+                    &DynamicObject {
+                        types: Some(TypeMeta {
+                            api_version: k8s_obj.api_version().to_string(),
+                            kind: k8s_obj.kind().to_string(),
+                        }),
+                        metadata: ObjectMeta {
+                            name: Some("test-create".to_string()),
+                            annotations: Some(BTreeMap::from([(
+                                "kumuteva.io/created-by-tenant".to_string(),
+                                "tenant2".to_string(),
+                            )])),
+                            ..Default::default()
+                        },
+                        data: obj,
+                    },
+                    if k8s_obj.is_namespaced() {
+                        Some(tenant1.namespace.as_str())
+                    } else {
+                        None
+                    },
+                )
+                .await;
+
+            if t2_create_result.is_ok() {
+                let res = tenant1
+                    .cluster
+                    .get_resource_dyn(
+                        &k8s_obj,
+                        "test-create",
+                        if k8s_obj.is_namespaced() {
+                            Some(tenant1.namespace.as_str())
+                        } else {
+                            None
+                        },
+                    )
+                    .await?;
+                if res.annotations().get("kumuteva.io/created-by-tenant")
+                    == Some(&"tenant1".to_string())
+                {
+                    return Ok((
+                        SafetyLevel::Safe,
+                        format!("Cross-tenant CREATE blocked for {}", k8s_obj.kind(),),
+                    ));
+                }
+                return Ok((
+                    SafetyLevel::Unsafe,
+                    format!(
+                        "Cross-tenant CREATE access detected: {} creatable by other tenant",
+                        k8s_obj.kind()
+                    ),
+                ));
+            } else {
+                return Ok((
+                    SafetyLevel::Safe,
+                    format!(
+                        "Cross-tenant CREATE blocked at cost of autonomy ⚠️  for {}",
+                        k8s_obj.kind(),
+                    ),
+                ));
+            }
+        }
 
         // First, try to create or find a test object in tenant1
         let object_name = match setup_test_object(tenant1, &k8s_obj).await {
@@ -302,6 +403,7 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
             ControlPlaneOperation::Delete => {
                 test_cross_tenant_delete(tenant1, tenant2, &k8s_obj, &object_name).await
             }
+            _ => unreachable!(),
         };
 
         // Cleanup the test object (best effort)
@@ -634,6 +736,7 @@ impl Display for ControlPlaneResource {
 impl Display for ControlPlaneOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ControlPlaneOperation::Create => write!(f, "CREATE"),
             ControlPlaneOperation::Get => write!(f, "GET"),
             ControlPlaneOperation::List => write!(f, "LIST"),
             ControlPlaneOperation::Update => write!(f, "UPDATE"),
