@@ -1,15 +1,16 @@
 mod control_plane;
-mod network;
-mod storage;
-mod workload;
+// mod network;
+// mod storage;
+// mod workload;
 
 pub use control_plane::*;
-pub use network::*;
-pub use storage::*;
+// pub use network::*;
+// pub use storage::*;
+// pub use workload::*;
+
 use tabled::settings::object::{Columns, Rows};
 use tabled::settings::{Alignment, Border, Modify, Span, Style};
 use tabled::{Table, Tabled};
-pub use workload::*;
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -33,8 +34,8 @@ pub enum SafetyLevel {
 /// Result of assessing a single operation
 #[derive(Debug, Clone)]
 pub struct OperationAssessment {
-    pub authorized: bool,
-    pub safe: SafetyLevel,
+    pub isolation: IsolationLevel,
+    pub autonomy: bool,
     pub details: Option<String>,
 }
 
@@ -72,25 +73,21 @@ impl AutonomyRatio {
         Self { allowed, total }
     }
 
-    pub fn ratio(&self) -> f64 {
-        if self.total == 0 {
-            0.0
-        } else {
-            self.allowed as f64 / self.total as f64
-        }
+    pub fn add(&mut self, other: &Self) {
+        self.allowed += other.allowed;
+        self.total += other.total;
     }
 
     pub fn percentage(&self) -> f64 {
-        self.ratio() * 100.0
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.allowed as f64 / self.total as f64) * 100.0
+        }
     }
 
     pub fn is_full(&self) -> bool {
         self.total > 0 && self.allowed == self.total
-    }
-
-    pub fn add(&mut self, other: &AutonomyRatio) {
-        self.allowed += other.allowed;
-        self.total += other.total;
     }
 }
 
@@ -98,10 +95,10 @@ impl Display for AutonomyRatio {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}/{} ({:.0}%)",
+            "{}/{} ({:.1}%)",
             self.allowed,
             self.total,
-            self.percentage()
+            self.percentage(),
         )
     }
 }
@@ -120,19 +117,18 @@ pub struct SubsystemReport<R: AssessableResource> {
 impl<R: AssessableResource> SubsystemReport<R> {
     /// Calculate the autonomy ratio from assessments
     pub fn calculate_autonomy_ratio(assessments: &[ResourceAssessment<R>]) -> AutonomyRatio {
-        let mut total = 0;
-        let mut allowed = 0;
+        let mut ratio = AutonomyRatio::default();
 
         for assessment in assessments {
             for op_assessment in assessment.operations.values() {
-                total += 1;
-                if op_assessment.authorized {
-                    allowed += 1;
+                ratio.total += 1;
+                if op_assessment.autonomy {
+                    ratio.allowed += 1;
                 }
             }
         }
 
-        AutonomyRatio::new(allowed, total)
+        ratio
     }
 }
 
@@ -144,6 +140,17 @@ pub trait AssessableResource: Clone + Display + std::fmt::Debug + Send + Sync + 
     fn applicable_operations(&self) -> Vec<Self::Operation>;
 }
 
+/// Result from a cross-tenant operation attempt
+#[derive(Debug, Clone)]
+pub struct CrossTenantResult {
+    /// The isolation level determined from the operation
+    pub isolation: IsolationLevel,
+    /// Whether the operation had autonomy (i.e., was permitted)
+    pub autonomy: bool,
+    /// Detailed description of what happened
+    pub details: String,
+}
+
 /// The core assessment logic each subsystem implements
 #[async_trait]
 pub trait MultitenancyAssessor: Send + Sync {
@@ -151,6 +158,9 @@ pub trait MultitenancyAssessor: Send + Sync {
 
     fn name(&self) -> &'static str;
 
+    /// Check if the tenant has basic authorization to perform the operation.
+    /// This is used only to determine if there's ZERO autonomy.
+    /// Returns true if the operation is permitted at all.
     async fn is_authorized(
         &self,
         tenant: &TenantClusterConfig,
@@ -158,13 +168,26 @@ pub trait MultitenancyAssessor: Send + Sync {
         operation: &<Self::Resource as AssessableResource>::Operation,
     ) -> anyhow::Result<bool>;
 
+    /// Perform the cross-tenant effect check by actually attempting the operation.
+    /// This returns both isolation AND autonomy levels based on the actual results.
+    ///
+    /// The function should:
+    /// 1. Have tenant1 create/setup a resource
+    /// 2. Have tenant2 attempt to operate on it (or create with same name for CREATE)
+    /// 3. Infer isolation from whether tenant2 affected tenant1's resource
+    /// 4. Infer autonomy from the operation result:
+    ///    - Unauthorized -> Partial (tenant2 can't do what tenant1 can)
+    ///    - Error (expected) -> Full (isolation working as expected)
+    ///    - Error (unexpected, e.g., AlreadyExists) -> Partial (name collision)
+    ///    - Success + isolated -> Full
+    ///    - Success + not isolated -> Unsafe
     async fn check_cross_tenant_effect(
         &self,
         tenant1: &TenantClusterConfig,
         tenant2: &TenantClusterConfig,
         resource: &Self::Resource,
         operation: &<Self::Resource as AssessableResource>::Operation,
-    ) -> anyhow::Result<(SafetyLevel, String)>;
+    ) -> anyhow::Result<CrossTenantResult>;
 }
 
 /// Generic runner that works with any assessor
@@ -188,37 +211,57 @@ pub async fn run_assessment<A: MultitenancyAssessor>(
         let mut ops_map = HashMap::new();
 
         for operation in operations {
+            // First, check if tenant1 has basic authorization
             let authorized = assessor
                 .is_authorized(tenant1, &resource, &operation)
                 .await?;
 
             let assessment = if !authorized {
+                // Zero autonomy - operation not permitted at all
                 OperationAssessment {
-                    authorized: false,
-                    safe: SafetyLevel::Safe,
-                    details: Some("Operation not authorized - access denied".to_string()),
+                    autonomy: false,
+                    isolation: IsolationLevel::Hard, // If not authorized, it's safe by definition
+                    details: Some("Operation not authorized - no autonomy".to_string()),
                 }
             } else {
-                let (safe, details) = assessor
+                // Authorized - proceed with cross-tenant effect check
+                // This will determine both isolation AND autonomy
+                let result = assessor
                     .check_cross_tenant_effect(tenant1, tenant2, &resource, &operation)
                     .await?;
 
                 OperationAssessment {
-                    authorized: true,
-                    safe,
-                    details: Some(details),
+                    autonomy: result.autonomy,
+                    isolation: result.isolation,
+                    details: Some(result.details),
                 }
             };
 
             ops_map.insert(operation, assessment);
         }
 
-        let is_autonomous = ops_map.values().all(|a| a.authorized);
-        let is_isolated = !ops_map.values().any(|a| a.safe == SafetyLevel::Unsafe);
+        // Determine overall autonomy for resource: all operations have Full autonomy
+        let is_autonomous = ops_map.values().all(|a| a.autonomy);
 
-        if is_autonomous && !is_isolated {
+        // Determine isolation: no operation is unsafe
+        let is_isolated = !ops_map
+            .values()
+            .any(|a| a.isolation == IsolationLevel::None);
+
+        // Generate warnings for partial isolation
+        if !is_isolated {
             warnings.push(format!(
-                "Warning: {} is usable but not isolated - potential security risk",
+                "Resource {} has unsafe cross-tenant operations",
+                resource
+            ));
+
+        // Generate warnings for unknown isolation
+        } else if ops_map
+            .values()
+            .any(|a| a.isolation == IsolationLevel::Unknown)
+        {
+            warnings.push(format!(
+                "Resource {} has unknown isolation for some operations",
                 resource
             ));
         }
@@ -257,17 +300,21 @@ impl Display for SafetyLevel {
 
 impl Display for OperationAssessment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let auth_emoji = if self.authorized { "✅" } else { "❌" };
-        let safe_emoji = match self.safe {
-            SafetyLevel::Safe => "🛡️",
-            SafetyLevel::Unsafe => "⚠️",
-            SafetyLevel::Unknown => "❓",
+        let auth_emoji = match self.autonomy {
+            true => "🟢",
+            false => "🔴",
+        };
+        let safe_emoji = match self.isolation {
+            IsolationLevel::Hard => "🟢",
+            IsolationLevel::Soft(_) => "🟠",
+            IsolationLevel::None => "⚠️",
+            IsolationLevel::Unknown => "❓",
         };
         write!(
             f,
             "{} {}  {}{}",
             safe_emoji,
-            "Safe".dimmed(),
+            "Isolation".dimmed(),
             auth_emoji,
             "Authorization".dimmed()
         )
@@ -468,10 +515,11 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
                     let cont = format!("{}{}       ", child_prefix, detail_prefix);
                     let lines = wrap_text_lines(details, term_width, &first, &cont);
                     for (prefix, content) in lines {
-                        let colored_content = match op_assessment.safe {
-                            SafetyLevel::Safe => content.green(),
-                            SafetyLevel::Unsafe => content.red(),
-                            SafetyLevel::Unknown => content.yellow(),
+                        let colored_content = match op_assessment.isolation {
+                            IsolationLevel::Hard => content.green(),
+                            IsolationLevel::Soft(_) => content.yellow(),
+                            IsolationLevel::None => content.red(),
+                            IsolationLevel::Unknown => content.dimmed(),
                         };
                         writeln!(f, "{}{}", prefix.dimmed(), colored_content)?;
                     }
@@ -481,7 +529,7 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
         Ok(())
     }
 }
-
+/*
 pub struct MultitenancyReport {
     pub control_plane: SubsystemReport<ControlPlaneResource>,
     pub control_plane_autonomy_levels: ControlPlaneAutonomyLevels,
@@ -525,7 +573,7 @@ fn calculate_control_plane_autonomy_levels(
 
         for op_assessment in assessment.operations.values() {
             ratio.total += 1;
-            if op_assessment.authorized {
+            if op_assessment.autonomy == AutonomyLevel::Full {
                 ratio.allowed += 1;
             }
         }
@@ -569,9 +617,9 @@ struct ReportRow {
 }
 
 fn format_ratio_with_icon(ratio: &AutonomyRatio) -> String {
-    let icon = if ratio.is_full() {
+    let icon = if ratio.is_perfect() {
         "✅"
-    } else if ratio.ratio() >= 0.5 {
+    } else if ratio.percentage() >= 50.0 {
         "🟡"
     } else if ratio.allowed > 0 {
         "🟠"
@@ -707,3 +755,5 @@ impl Display for MultitenancyReport {
         Ok(())
     }
 }
+
+*/
