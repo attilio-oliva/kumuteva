@@ -16,20 +16,31 @@ fi
 KUBECONFIG_PATH="$2"
 N_TENANT="$1"
 
+# Check if overhead file exists, if not create and add header
+if [ ! -f ../results/overhead_kubevirt.csv ]; then
+    touch ../results/overhead_kubevirt.csv
+else
+    rm ../results/overhead_kubevirt.csv
+fi
+
+echo "Start,End,Num_Tenants" > ../results/overhead_kubevirt.csv
+
 echo "Installing KubeVirt..."
 ./deploy-kubevirt.sh "install" $KUBECONFIG_PATH &> /dev/null
 ./deploy-capi-provider.sh "install" $KUBECONFIG_PATH &> /dev/null
 
-for i in $(seq 1 "$N_TENANT"); do
+for i in $(seq 5 5 "$N_TENANT"); do
     echo "Running test with $i tenants"
     for j in $(seq 1 "$i"); do
-        ./create-kubevirt-cluster.sh $KUBECONFIG_PATH "/tmp/kubeconfig-tenant$i" "tenant$i" "install" &> /dev/null
+        ./create-kubevirt-cluster.sh $KUBECONFIG_PATH "/tmp/kubeconfig-tenant$j" "tenant$j" "install" &> /dev/null
     done
 
-    ../load/generate_load.sh "$i" "tenant"
+    sleep 300
+
+    ../load/generate_load.sh "$i" "tenant" "../results/overhead_kubevirt.csv"
 
     for j in $(seq 1 "$i"); do
-        ./create-kubevirt-cluster.sh $KUBECONFIG_PATH "/tmp/kubeconfig-tenant$i" "tenant$i" "uninstall" &> /dev/null
+        ./create-kubevirt-cluster.sh $KUBECONFIG_PATH "/tmp/kubeconfig-tenant$j" "tenant$j" "uninstall" &> /dev/null
     done
 done
 
