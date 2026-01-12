@@ -2,7 +2,7 @@
 
 usage() {
     echo "Usage: $0 <tools> <n_tenant> <kubeconfig_path>"
-    echo "  tools: Comma separated list of tools to install [vcluster,capsule,kubevirt]"
+    echo "  tools: Comma separated list of tools to install [vcluster,capsule,kubevirt,reference]"
     echo "  n_tenant: Number of tenats to generate"
     echo "  kubeconfig_path: Path to kubeconfig file"
     exit 1
@@ -26,6 +26,7 @@ N_TENANT="$2"
 
 IFS=',' read -ra TOOL_ARRAY <<< "$TOOLS"
 for TOOL in "${TOOL_ARRAY[@]}"; do
+    sleep 300
     case $TOOL in
         vcluster)
             echo "Provisioning vCluster tenants"
@@ -42,6 +43,12 @@ for TOOL in "${TOOL_ARRAY[@]}"; do
         kubevirt)
             echo "Provisioning KubeVirt tenants"
             cd kubevirt
+            ./run_test.sh "$N_TENANT" "$KUBECONFIG_PATH"
+            cd ..
+            ;;
+        reference)
+            echo "Provisioning reference tenants"
+            cd reference
             ./run_test.sh "$N_TENANT" "$KUBECONFIG_PATH"
             cd ..
             ;;

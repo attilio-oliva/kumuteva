@@ -58,15 +58,24 @@ N_TENANT="$2"
 
 export KUBECONFIG="$3"
 
+# Check if overhead file exists, if not create and add header
+if [ ! -f ../results/overhead_vcluster.csv ]; then
+    touch ../results/overhead_vcluster.csv
+else
+    rm ../results/overhead_vcluster.csv
+fi
+
+echo "Start,End,Num_Tenants" > ../results/overhead_vcluster.csv
+
 if [ "$ACTION" == "create" ]; then
-    for i in $(seq 1 "$N_TENANT"); do
+    for i in $(seq 5 5 "$N_TENANT"); do
         echo "Running tests with $i tenants"
 
         create_tenants "$i"
-        ../load/generate_load.sh "$i" "default"
-        teardown_tenants "$i"
 
-        sleep 10
+        sleep 300
+        ../load/generate_load.sh "$i" "default" "../results/overhead_vcluster.csv"
+        teardown_tenants "$i"
     done
     
 elif [ "$ACTION" == "teardown" ]; then
