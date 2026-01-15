@@ -455,7 +455,7 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
 
         let iso_emoji = match self.isolation_level {
             IsolationLevel::Hard => "✅",
-            IsolationLevel::Soft(_) => "🟡",
+            IsolationLevel::Soft(_) => "🟠",
             IsolationLevel::None => "❌",
             IsolationLevel::Unknown => "❓",
         };
@@ -527,7 +527,7 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
 
             let res_iso = match assessment.overall_isolation {
                 IsolationLevel::Hard => "✅",
-                IsolationLevel::Soft(_) => "🟡",
+                IsolationLevel::Soft(_) => "🟠",
                 IsolationLevel::None => "❌",
                 IsolationLevel::Unknown => "❓",
             };
@@ -550,7 +550,8 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
                 "Autonomy".dimmed()
             )?;
 
-            let ops: Vec<_> = assessment.operations.iter().collect();
+            let mut ops: Vec<_> = assessment.operations.iter().collect::<Vec<_>>();
+            ops.sort_by_key(|(op, _)| op.to_string());
             let ops_total = ops.len();
             for (j, (operation, op_assessment)) in ops.iter().enumerate() {
                 let is_last_op = j == ops_total - 1;
@@ -690,7 +691,7 @@ fn format_ratio_with_icon(ratio: &AutonomyRatio) -> String {
 fn format_isolation(level: &IsolationLevel) -> String {
     match level {
         IsolationLevel::Hard => "✅ Hard".to_string(),
-        IsolationLevel::Soft(_reason) => format!("🟡 Soft"),
+        IsolationLevel::Soft(_reason) => format!("🟠 Soft"),
         IsolationLevel::None => "❌ None".to_string(),
         IsolationLevel::Unknown => "❓ Unknown".to_string(),
     }
