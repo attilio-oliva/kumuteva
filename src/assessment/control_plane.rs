@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use k8s_openapi::api::core::v1::Pod;
 use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
 use kube::ResourceExt;
+use tokio::time::sleep;
 
 use crate::assessment::{
     run_assessment, AssessableResource, AutonomyRatio, CrossTenantResult, MultitenancyAssessor,
@@ -430,10 +433,7 @@ async fn test_cross_tenant_create(
     if t1_create_result.is_err() {
         return Ok(CrossTenantResult {
             autonomy: false,
-            isolation: IsolationLevel::Soft(format!(
-                "Could not create test object: {}",
-                t1_create_result.unwrap_err()
-            )),
+            isolation: IsolationLevel::Unknown,
             details: format!(
                 "Cannot verify CREATE isolation for {} - tenant1 creation failed",
                 object_kind.kind()
@@ -487,8 +487,8 @@ async fn test_cross_tenant_create(
                 }
             } else {
                 CrossTenantResult {
-                    autonomy: true,
-                    isolation: IsolationLevel::Soft("Could not verify object state".to_string()),
+                    autonomy: false,
+                    isolation: IsolationLevel::Unknown,
                     details: format!(
                         "Cannot verify CREATE isolation for {} - object state unclear",
                         object_kind.kind()
@@ -527,6 +527,11 @@ async fn test_cross_tenant_update(
     tenant2: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> anyhow::Result<CrossTenantResult> {
+    // Special handling for resources that can't be created
+    if requires_existing_object(object_kind) {
+        return test_cross_tenant_update_for_existing_resource(tenant1, tenant2, object_kind).await;
+    }
+
     let test_name = format!(
         "update-test-{}",
         uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
@@ -672,12 +677,153 @@ async fn test_cross_tenant_update(
     Ok(result)
 }
 
+/// Test UPDATE for resources that can't be created (like Node)
+async fn test_cross_tenant_update_for_existing_resource(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+) -> anyhow::Result<CrossTenantResult> {
+    // Get an existing object
+    let existing_name = match get_existing_object_for_testing(tenant1, object_kind).await {
+        Ok(name) => name,
+        Err(e) => {
+            return Ok(CrossTenantResult {
+                autonomy: false,
+                isolation: IsolationLevel::Unknown,
+                details: format!(
+                    "Cannot test {} UPDATE - no existing object available: {}",
+                    object_kind.kind(),
+                    e
+                ),
+            });
+        }
+    };
+
+    tracing::info!(
+        "Testing UPDATE isolation for {} using existing object: {}",
+        object_kind.kind(),
+        existing_name
+    );
+
+    // Get the current state (to restore later if needed)
+    let current_obj = tenant1
+        .cluster
+        .get_resource_dyn(object_kind, &existing_name, None)
+        .await;
+
+    let original_labels = current_obj
+        .as_ref()
+        .ok()
+        .and_then(|obj| obj.metadata.labels.clone());
+
+    // Tenant2 attempts to update the existing object
+    let test_label_key = "kumuteva-update-test";
+    let test_label_value = "tenant2-attempted-modification";
+
+    let patch = kube::api::Patch::Merge(serde_json::json!({
+        "metadata": {
+            "labels": {
+                test_label_key: test_label_value
+            }
+        }
+    }));
+
+    let update_result = tenant2
+        .cluster
+        .patch_resource_dyn(object_kind, &existing_name, &patch, None)
+        .await;
+
+    let result = match update_result {
+        Ok(_) => {
+            // Update succeeded - verify if it took effect
+            let updated_obj = tenant1
+                .cluster
+                .get_resource_dyn(object_kind, &existing_name, None)
+                .await;
+
+            let was_modified = updated_obj
+                .as_ref()
+                .ok()
+                .and_then(|obj| obj.metadata.labels.as_ref())
+                .and_then(|labels| labels.get(test_label_key))
+                == Some(&test_label_value.to_string());
+
+            if was_modified {
+                // Revert the modification
+                let revert_patch = if let Some(ref orig) = original_labels {
+                    kube::api::Patch::Merge(serde_json::json!({
+                        "metadata": {
+                            "labels": orig
+                        }
+                    }))
+                } else {
+                    kube::api::Patch::Merge(serde_json::json!({
+                        "metadata": {
+                            "labels": {
+                                test_label_key: null
+                            }
+                        }
+                    }))
+                };
+
+                let _ = tenant1
+                    .cluster
+                    .patch_resource_dyn(object_kind, &existing_name, &revert_patch, None)
+                    .await;
+
+                CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::None,
+                    details: format!(
+                        "Cross-tenant UPDATE breach: {} '{}' modified by other tenant",
+                        object_kind.kind(),
+                        existing_name
+                    ),
+                }
+            } else {
+                CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::Soft(
+                        "Update succeeded but modification not visible".to_string(),
+                    ),
+                    details: format!(
+                        "UPDATE has soft isolation for {} - modification not effective",
+                        object_kind.kind()
+                    ),
+                }
+            }
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            let isolation = infer_isolation_from_error(&error_msg);
+
+            CrossTenantResult {
+                autonomy: true, // Tenant1 can see the node, so there's autonomy
+                isolation,
+                details: format!(
+                    "Cross-tenant UPDATE blocked for {} '{}': {}",
+                    object_kind.kind(),
+                    existing_name,
+                    error_msg
+                ),
+            }
+        }
+    };
+
+    Ok(result)
+}
+
 /// Test cross-tenant GET isolation
 async fn test_cross_tenant_get(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> anyhow::Result<CrossTenantResult> {
+    // Special handling for resources that can't be created
+    if requires_existing_object(object_kind) {
+        return test_cross_tenant_get_for_existing_resource(tenant1, tenant2, object_kind).await;
+    }
+
     let test_name = format!(
         "get-test-{}",
         uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
@@ -749,12 +895,103 @@ async fn test_cross_tenant_get(
     Ok(result)
 }
 
+/// Test GET for resources that can't be created (like Node)
+async fn test_cross_tenant_get_for_existing_resource(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+) -> anyhow::Result<CrossTenantResult> {
+    // Get an existing object visible to tenant1
+    let existing_name = match get_existing_object_for_testing(tenant1, object_kind).await {
+        Ok(name) => name,
+        Err(e) => {
+            return Ok(CrossTenantResult {
+                autonomy: false,
+                isolation: IsolationLevel::Unknown,
+                details: format!(
+                    "Cannot test {} GET - no existing object available: {}",
+                    object_kind.kind(),
+                    e
+                ),
+            });
+        }
+    };
+
+    tracing::info!(
+        "Testing GET isolation for {} using existing object: {}",
+        object_kind.kind(),
+        existing_name
+    );
+
+    // Tenant2 attempts to GET the same object
+    let t2_get_result = tenant2
+        .cluster
+        .get_resource_dyn(object_kind, &existing_name, None)
+        .await;
+
+    match t2_get_result {
+        Ok(t2_obj) => {
+            // Both tenants can see the same resource
+            // For cluster-scoped resources like nodes, this is expected
+            // We need to check if it is the same object or not
+
+            let t1_obj = tenant1
+                .cluster
+                .get_resource_dyn(object_kind, &existing_name, None)
+                .await?;
+
+            if t1_obj.metadata == t2_obj.metadata {
+                // Same view
+                Ok(CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::None,
+                    details: format!(
+                        "{} GET retrieve the same object named '{}'",
+                        object_kind.kind(),
+                        existing_name
+                    ),
+                })
+            } else {
+                Ok(CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::Hard,
+                    details: format!(
+                        "{} GET retrieve different objects named '{}'",
+                        object_kind.kind(),
+                        existing_name
+                    ),
+                })
+            }
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            let isolation = infer_isolation_from_error(&error_msg);
+
+            Ok(CrossTenantResult {
+                autonomy: true,
+                isolation,
+                details: format!(
+                    "Cross-tenant GET blocked for {} '{}': {}",
+                    object_kind.kind(),
+                    existing_name,
+                    error_msg
+                ),
+            })
+        }
+    }
+}
+
 /// Test cross-tenant LIST isolation
 async fn test_cross_tenant_list(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> anyhow::Result<CrossTenantResult> {
+    // Special handling for resources that can't be created
+    if requires_existing_object(object_kind) {
+        return test_cross_tenant_list_for_existing_resource(tenant1, tenant2, object_kind).await;
+    }
+
     let test_name = format!(
         "list-test-{}",
         uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
@@ -845,12 +1082,108 @@ async fn test_cross_tenant_list(
     Ok(result)
 }
 
+/// Test LIST for resources that can't be created (like Node)
+async fn test_cross_tenant_list_for_existing_resource(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+) -> anyhow::Result<CrossTenantResult> {
+    // Ensure at least one object exists (trigger node sync in vCluster)
+    let _ = get_existing_object_for_testing(tenant1, object_kind).await;
+
+    // List from both tenants
+    let tenant1_list = tenant1.cluster.list_resources_dyn(object_kind, None).await;
+
+    let tenant2_list = tenant2.cluster.list_resources_dyn(object_kind, None).await;
+
+    match (tenant1_list, tenant2_list) {
+        (Ok(t1_items), Ok(t2_items)) => {
+            let t1_names: std::collections::HashSet<_> = t1_items
+                .items
+                .iter()
+                .filter_map(|n| n.metadata.name.clone())
+                .collect();
+
+            let t2_names: std::collections::HashSet<_> = t2_items
+                .items
+                .iter()
+                .filter_map(|n| n.metadata.name.clone())
+                .collect();
+
+            if t1_names == t2_names {
+                // Identical view
+                Ok(CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::None,
+                    details: format!(
+                        "LIST shows shared {} view - both tenants see same {} items",
+                        object_kind.kind(),
+                        t1_names.len()
+                    ),
+                })
+            } else {
+                Ok(CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::Hard,
+                    details: format!(
+                        "LIST has hard isolation for {} - no shared items",
+                        object_kind.kind(),
+                    ),
+                })
+            }
+        }
+        (Ok(t1_items), Err(e)) => {
+            // Tenant1 can list, tenant2 cannot
+            Ok(CrossTenantResult {
+                autonomy: true,
+                isolation: IsolationLevel::Hard,
+                details: format!(
+                    "LIST has asymmetric isolation for {} - tenant1 sees {} items, tenant2 blocked: {}",
+                    object_kind.kind(),
+                    t1_items.items.len(),
+                    e
+                ),
+            })
+        }
+        (Err(e), Ok(t2_items)) => {
+            // Tenant2 can list, tenant1 cannot
+            Ok(CrossTenantResult {
+                autonomy: false,
+                isolation: IsolationLevel::Unknown,
+                details: format!(
+                    "Cannot verify {} LIST isolation - tenant1 blocked: {}, tenant2 sees {} items",
+                    object_kind.kind(),
+                    e,
+                    t2_items.items.len()
+                ),
+            })
+        }
+        (Err(e1), Err(_e2)) => {
+            // Neither can list
+            Ok(CrossTenantResult {
+                autonomy: false,
+                isolation: IsolationLevel::Unknown,
+                details: format!(
+                    "Cannot verify {} LIST isolation - both tenants blocked: {}",
+                    object_kind.kind(),
+                    e1
+                ),
+            })
+        }
+    }
+}
+
 /// Test cross-tenant DELETE isolation
 async fn test_cross_tenant_delete(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> anyhow::Result<CrossTenantResult> {
+    // Special handling for resources that can't be created
+    if requires_existing_object(object_kind) {
+        return test_cross_tenant_delete_for_existing_resource(tenant1, tenant2, object_kind).await;
+    }
+
     let test_name = format!(
         "delete-test-{}",
         uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
@@ -947,6 +1280,241 @@ async fn test_cross_tenant_delete(
     };
 
     Ok(result)
+}
+
+/// Test DELETE for resources that can't be created (like Node)
+async fn test_cross_tenant_delete_for_existing_resource(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+) -> anyhow::Result<CrossTenantResult> {
+    // Get an existing object name
+    let existing_name = match get_existing_object_for_testing(tenant1, object_kind).await {
+        Ok(name) => name,
+        Err(e) => {
+            return Ok(CrossTenantResult {
+                autonomy: false,
+                isolation: IsolationLevel::Unknown,
+                details: format!(
+                    "Cannot test {} DELETE - no existing object available: {}",
+                    object_kind.kind(),
+                    e
+                ),
+            });
+        }
+    };
+
+    // Check if tenant2 is authorized to delete (don't actually delete!)
+    let t2_can_delete = tenant2
+        .cluster
+        .is_authorized_to("delete", &object_kind.plural_kind(), None)
+        .await
+        .unwrap_or(false);
+
+    if !t2_can_delete {
+        return Ok(CrossTenantResult {
+            autonomy: false,
+            isolation: IsolationLevel::Soft(
+                "Tenant2 not authorized to delete resource".to_string(),
+            ),
+            details: format!(
+                "Cannot verify DELETE isolation for {} - tenant2 lacks delete permission",
+                object_kind.kind()
+            ),
+        });
+    }
+
+    // let's try deleting and chech if is still existing
+    let delete_result = tenant2
+        .cluster
+        .delete_resource_dyn(object_kind, &existing_name, None)
+        .await;
+
+    match delete_result {
+        Ok(_) => {
+            // Delete succeeded - verify if object is actually gone
+            let exists = tenant1
+                .cluster
+                .dyn_object_exists(object_kind, &existing_name, None)
+                .await
+                .unwrap_or(true);
+
+            if !exists {
+                // Object was deleted - no isolation
+                Ok(CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::None,
+                    details: format!(
+                        "Cross-tenant DELETE breach: {} '{}' deleted by other tenant",
+                        object_kind.kind(),
+                        existing_name
+                    ),
+                })
+            } else {
+                // Object still exists - delete was silently ignored
+                Ok(CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::Soft(
+                        "Delete succeeded but object still exists".to_string(),
+                    ),
+                    details: format!(
+                        "DELETE has soft isolation for {} - object '{}' preserved",
+                        object_kind.kind(),
+                        existing_name
+                    ),
+                })
+            }
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            let isolation = infer_isolation_from_error(&error_msg);
+
+            Ok(CrossTenantResult {
+                autonomy: true,
+                isolation,
+                details: format!(
+                    "Cross-tenant DELETE blocked for {} '{}': {}",
+                    object_kind.kind(),
+                    existing_name,
+                    error_msg
+                ),
+            })
+        }
+    }
+}
+
+// =============================================================================
+// SPECIAL RESOURCE HANDLING
+// =============================================================================
+
+/// Resources that cannot be created programmatically and require special handling
+fn requires_existing_object(object_kind: &KubernetesObject) -> bool {
+    matches!(object_kind, KubernetesObject::Node)
+}
+
+/// Get an existing node for testing, handling vCluster edge case where nodes
+/// only appear after scheduling a pod
+async fn get_existing_node(tenant: &TenantClusterConfig) -> anyhow::Result<String> {
+    // First, try to list nodes directly
+    let nodes = tenant
+        .cluster
+        .list_resources_dyn(&KubernetesObject::Node, None)
+        .await;
+
+    if let Ok(node_list) = nodes {
+        if let Some(node) = node_list.items.first() {
+            if let Some(name) = &node.metadata.name {
+                return Ok(name.clone());
+            }
+        }
+    }
+
+    // No nodes found - this might be vCluster
+    // Schedule a temporary pod to trigger node sync
+    tracing::info!(
+        "No nodes found, scheduling temporary pod to trigger node sync (vCluster edge case)..."
+    );
+
+    let temp_pod_name = format!(
+        "node-sync-trigger-{}",
+        uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
+    );
+
+    let temp_pod: Pod = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": temp_pod_name,
+            "namespace": tenant.namespace
+        },
+        "spec": {
+            "containers": [{
+                "name": "pause",
+                "image": "registry.k8s.io/pause:3.9",
+                "resources": {
+                    "requests": {
+                        "cpu": "10m",
+                        "memory": "16Mi"
+                    },
+                    "limits": {
+                        "cpu": "10m",
+                        "memory": "16Mi"
+                    }
+                }
+            }],
+            "restartPolicy": "Never"
+        }
+    }))?;
+
+    // Create the pod
+    let pod_result = tenant
+        .cluster
+        .create_pod_in_namespace(&temp_pod, &tenant.namespace)
+        .await;
+
+    if pod_result.is_err() {
+        return Err(anyhow::anyhow!(
+            "Could not create temporary pod to trigger node sync: {}",
+            pod_result.unwrap_err()
+        ));
+    }
+
+    // Wait for pod to be scheduled (which should trigger node visibility)
+    // Poll for nodes with exponential backoff
+    let max_attempts = 10;
+    let mut attempt = 0;
+    let mut node_name: Option<String> = None;
+
+    while attempt < max_attempts {
+        sleep(Duration::from_millis(500 * (attempt + 1) as u64)).await;
+
+        let nodes = tenant
+            .cluster
+            .list_resources_dyn(&KubernetesObject::Node, None)
+            .await;
+
+        if let Ok(node_list) = nodes {
+            if let Some(node) = node_list.items.first() {
+                if let Some(name) = &node.metadata.name {
+                    node_name = Some(name.clone());
+                    break;
+                }
+            }
+        }
+
+        attempt += 1;
+        tracing::debug!(
+            "Waiting for nodes to appear... attempt {}/{}",
+            attempt,
+            max_attempts
+        );
+    }
+
+    // Cleanup the temporary pod
+    let _ = tenant
+        .cluster
+        .delete_pod_in_namespace(&temp_pod_name, &tenant.namespace)
+        .await;
+
+    node_name.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No nodes became visible after scheduling pod - cluster may not expose nodes to tenants"
+        )
+    })
+}
+
+/// Get an existing object for resources that can't be created
+async fn get_existing_object_for_testing(
+    tenant: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+) -> anyhow::Result<String> {
+    match object_kind {
+        KubernetesObject::Node => get_existing_node(tenant).await,
+        _ => Err(anyhow::anyhow!(
+            "No special handling for {} - should use create flow",
+            object_kind.kind()
+        )),
+    }
 }
 
 // =============================================================================
