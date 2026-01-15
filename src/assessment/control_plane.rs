@@ -9,8 +9,8 @@ use kube::ResourceExt;
 use tokio::time::sleep;
 
 use crate::assessment::{
-    run_assessment, AssessableResource, AutonomyRatio, CrossTenantResult, MultitenancyAssessor,
-    OperationAssessment, SafetyLevel, SubsystemReport,
+    run_assessment, AssessableResource, AutonomyRatio, CrossTenantResult, IsolationLevel,
+    MultitenancyAssessor, OperationAssessment, SubsystemReport,
 };
 use crate::verifier::TenantClusterConfig;
 use crate::verifier::{create_minimal_object, KubernetesObject};
@@ -20,31 +20,6 @@ use crate::verifier::{create_minimal_object, KubernetesObject};
 // =============================================================================
 
 pub type ControlPlaneIsolationReport = SubsystemReport<ControlPlaneResource>;
-
-/// Isolation level for cross-tenant operations
-#[derive(Debug, Clone, PartialEq)]
-pub enum IsolationLevel {
-    /// Isolation level could not be determined
-    Unknown,
-    /// No isolation - cross-tenant operation succeeded and affected other tenant's resources
-    None,
-    /// Soft isolation - operation blocked but reveals shared environment
-    /// (e.g., Forbidden error, AlreadyExists indicating name collision)
-    Soft(String),
-    /// Hard isolation - operation fails as if system were single-tenant
-    /// (e.g., NotFound error because resource doesn't exist in intruder's scope)
-    Hard,
-}
-
-impl IsolationLevel {
-    pub fn is_isolated(&self) -> bool {
-        !matches!(self, IsolationLevel::None)
-    }
-
-    pub fn is_hard(&self) -> bool {
-        matches!(self, IsolationLevel::Hard)
-    }
-}
 
 /// Assessment of a single resource with all its operations
 #[derive(Debug, Clone)]

@@ -4,6 +4,7 @@ mod storage;
 mod workload;
 
 pub use control_plane::*;
+
 pub use network::*;
 pub use storage::*;
 pub use workload::*;
@@ -23,12 +24,57 @@ use colored::Colorize;
 
 use crate::verifier::TenantClusterConfig;
 
-/// Safety level for cross-tenant operations
-#[derive(Debug, Clone, PartialEq)]
-pub enum SafetyLevel {
-    Safe,
-    Unsafe,
+/// Isolation level for cross-tenant operations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// Isolation level could not be determined
     Unknown,
+    /// No isolation - cross-tenant operation succeeded and affected other tenant's resources
+    None,
+    /// Soft isolation - operation blocked but reveals shared environment
+    /// (e.g., Forbidden error, AlreadyExists indicating name collision)
+    Soft(String),
+    /// Hard isolation - operation fails as if system were single-tenant
+    /// (e.g., NotFound error because resource doesn't exist in intruder's scope)
+    Hard,
+}
+
+impl IsolationLevel {
+    pub fn is_isolated(&self) -> bool {
+        !matches!(self, IsolationLevel::None)
+    }
+
+    pub fn is_hard(&self) -> bool {
+        matches!(self, IsolationLevel::Hard)
+    }
+}
+
+impl PartialOrd for IsolationLevel {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IsolationLevel {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn rank(level: &IsolationLevel) -> u8 {
+            match level {
+                IsolationLevel::None => 0, // Worst
+                IsolationLevel::Unknown => 1,
+                IsolationLevel::Soft(_) => 2,
+                IsolationLevel::Hard => 3, // Best
+            }
+        }
+        rank(self).cmp(&rank(other))
+    }
+}
+
+fn compute_overall_isolation_level(assessments: &[IsolationLevel]) -> IsolationLevel {
+    assessments
+        .iter()
+        .min()
+        .cloned()
+        .unwrap_or(IsolationLevel::Hard)
 }
 
 /// Result of assessing a single operation
@@ -44,8 +90,7 @@ pub struct OperationAssessment {
 pub struct ResourceAssessment<R: AssessableResource> {
     pub resource: R,
     pub operations: HashMap<R::Operation, OperationAssessment>,
-    pub is_autonomous: bool,
-    pub is_isolated: bool,
+    pub overall_isolation: IsolationLevel,
 }
 
 /// Autonomy level categories for control plane resources
@@ -108,8 +153,7 @@ impl Display for AutonomyRatio {
 pub struct SubsystemReport<R: AssessableResource> {
     pub name: String,
     pub assessments: Vec<ResourceAssessment<R>>,
-    pub overall_autonomy: bool,
-    pub overall_isolation: bool,
+    pub isolation_level: IsolationLevel,
     pub autonomy_ratio: AutonomyRatio,
     pub warnings: Vec<String>,
 }
@@ -238,13 +282,17 @@ pub async fn run_assessment<A: MultitenancyAssessor>(
         // Determine overall autonomy for resource: all operations have Full autonomy
         let is_autonomous = ops_map.values().all(|a| a.autonomy);
 
-        // Determine isolation: no operation is unsafe
-        let is_isolated = !ops_map
-            .values()
-            .any(|a| a.isolation == IsolationLevel::None);
+        // Determine isolation
+        let overall_isolation = compute_overall_isolation_level(
+            ops_map
+                .values()
+                .map(|a| a.isolation.clone())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
 
         // Generate warnings for partial isolation
-        if !is_isolated {
+        if overall_isolation == IsolationLevel::None {
             warnings.push(format!(
                 "Resource {} has unsafe cross-tenant operations",
                 resource
@@ -264,33 +312,26 @@ pub async fn run_assessment<A: MultitenancyAssessor>(
         assessments.push(ResourceAssessment {
             resource,
             operations: ops_map,
-            is_autonomous,
-            is_isolated,
+            overall_isolation,
         });
     }
 
-    let overall_autonomy = assessments.iter().all(|a| a.is_autonomous);
-    let overall_isolation = assessments.iter().all(|a| a.is_isolated);
+    let overall_isolation = compute_overall_isolation_level(
+        assessments
+            .iter()
+            .map(|a| a.overall_isolation.clone())
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
     let autonomy_ratio = SubsystemReport::calculate_autonomy_ratio(&assessments);
 
     Ok(SubsystemReport {
         name: assessor.name().to_string(),
         assessments,
-        overall_autonomy,
-        overall_isolation,
+        isolation_level: overall_isolation,
         autonomy_ratio,
         warnings,
     })
-}
-
-impl Display for SafetyLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SafetyLevel::Safe => write!(f, "Safe"),
-            SafetyLevel::Unsafe => write!(f, "Unsafe"),
-            SafetyLevel::Unknown => write!(f, "Unknown"),
-        }
-    }
 }
 
 impl Display for OperationAssessment {
@@ -412,8 +453,21 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let term_width = get_terminal_width();
 
-        let iso_emoji = if self.overall_isolation { "✅" } else { "❌" };
-        let auto_emoji = if self.overall_autonomy { "✅" } else { "❌" };
+        let iso_emoji = match self.isolation_level {
+            IsolationLevel::Hard => "✅",
+            IsolationLevel::Soft(_) => "🟡",
+            IsolationLevel::None => "❌",
+            IsolationLevel::Unknown => "❓",
+        };
+        let auto_emoji = if self.autonomy_ratio.is_perfect() {
+            "✅"
+        } else if self.autonomy_ratio.percentage() >= 50.0 {
+            "🟡"
+        } else if self.autonomy_ratio.allowed > 0 {
+            "🟠"
+        } else {
+            "❌"
+        };
 
         writeln!(
             f,
@@ -471,12 +525,19 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
             };
             let child_prefix = if is_last_resource { "    " } else { "│   " };
 
-            let res_iso = if assessment.is_isolated { "✅" } else { "❌" };
-            let res_auto = if assessment.is_autonomous {
-                "✅"
-            } else {
-                "❌"
+            let res_iso = match assessment.overall_isolation {
+                IsolationLevel::Hard => "✅",
+                IsolationLevel::Soft(_) => "🟡",
+                IsolationLevel::None => "❌",
+                IsolationLevel::Unknown => "❓",
             };
+            let res_auto =
+                match SubsystemReport::<R>::calculate_autonomy_ratio(&[assessment.clone()]) {
+                    ratio if ratio.is_perfect() => "✅",
+                    ratio if ratio.percentage() >= 50.0 => "🟡",
+                    ratio if ratio.allowed > 0 => "🟠",
+                    _ => "❌",
+                };
 
             writeln!(
                 f,
@@ -534,11 +595,13 @@ pub struct MultitenancyReport {
 }
 
 impl MultitenancyReport {
-    pub fn overall_isolation(&self) -> bool {
-        self.control_plane.overall_isolation
-            && self.storage.overall_isolation
-            && self.network.overall_isolation
-            && self.workload.overall_isolation
+    pub fn overall_isolation(&self) -> IsolationLevel {
+        compute_overall_isolation_level(&[
+            self.control_plane.isolation_level.clone(),
+            self.storage.isolation_level.clone(),
+            self.network.isolation_level.clone(),
+            self.workload.isolation_level.clone(),
+        ])
     }
 
     pub fn overall_autonomy_ratio(&self) -> AutonomyRatio {
@@ -624,11 +687,12 @@ fn format_ratio_with_icon(ratio: &AutonomyRatio) -> String {
     format!("{} {}", icon, ratio)
 }
 
-fn format_isolation(isolated: bool) -> String {
-    if isolated {
-        "✅".to_string()
-    } else {
-        "❌".to_string()
+fn format_isolation(level: &IsolationLevel) -> String {
+    match level {
+        IsolationLevel::Hard => "✅ Hard".to_string(),
+        IsolationLevel::Soft(_reason) => format!("🟡 Soft"),
+        IsolationLevel::None => "❌ None".to_string(),
+        IsolationLevel::Unknown => "❓ Unknown".to_string(),
     }
 }
 
@@ -639,7 +703,7 @@ impl Display for MultitenancyReport {
             ReportRow {
                 system: "Control Plane".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(self.control_plane.overall_isolation),
+                value: format_isolation(&self.control_plane.isolation_level),
             },
             ReportRow {
                 system: "".to_string(),
@@ -676,7 +740,7 @@ impl Display for MultitenancyReport {
             ReportRow {
                 system: "Storage".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(self.storage.overall_isolation),
+                value: format_isolation(&self.storage.isolation_level),
             },
             ReportRow {
                 system: "".to_string(),
@@ -693,7 +757,7 @@ impl Display for MultitenancyReport {
             ReportRow {
                 system: "Network".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(self.network.overall_isolation),
+                value: format_isolation(&self.network.isolation_level),
             },
             ReportRow {
                 system: "".to_string(),
@@ -710,7 +774,7 @@ impl Display for MultitenancyReport {
             ReportRow {
                 system: "Workload".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(self.workload.overall_isolation),
+                value: format_isolation(&self.workload.isolation_level),
             },
             ReportRow {
                 system: "".to_string(),
@@ -734,7 +798,11 @@ impl Display for MultitenancyReport {
         let overall_auto = self.overall_autonomy_ratio();
 
         writeln!(f, "\n📋 Summary:")?;
-        writeln!(f, "   Overall Isolation: {}", format_isolation(overall_iso))?;
+        writeln!(
+            f,
+            "   Overall Isolation: {}",
+            format_isolation(&overall_iso)
+        )?;
         writeln!(
             f,
             "   Overall Autonomy:  {}",

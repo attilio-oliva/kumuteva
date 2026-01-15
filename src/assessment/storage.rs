@@ -11,7 +11,7 @@ use tracing::info;
 
 use crate::assessment::{
     run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
-    SafetyLevel, SubsystemReport,
+    SubsystemReport,
 };
 use crate::verifier::TenantClusterConfig;
 

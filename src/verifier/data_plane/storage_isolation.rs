@@ -7,7 +7,7 @@ use k8s_openapi::api::{
 };
 use serde::Serialize;
 
-use crate::{assessment::SafetyLevel, verifier::TenantClusterConfig};
+use crate::verifier::TenantClusterConfig;
 
 // Constants for resource naming and configuration
 const POD_NAME: &str = "persistent-pod";
@@ -20,6 +20,13 @@ const HOSTPATH_MOUNT_PATH: &str = "/tmp/kumuteva-hostpath";
 const STORAGE_SIZE: &str = "1Gi";
 const POD_CREATION_TIMEOUT: u32 = 30;
 
+/// Safety level for cross-tenant operations
+#[derive(Debug, Clone, PartialEq)]
+pub enum SafetyLevel {
+    Safe,
+    Unsafe,
+    Unknown,
+}
 #[derive(Debug, Clone)]
 pub struct StorageIsolationReport {
     pub resources_assessment: Vec<StorageResourceAssessment>,
@@ -1483,5 +1490,15 @@ impl Display for StorageIsolationReport {
         }
 
         Ok(())
+    }
+}
+
+impl Display for SafetyLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SafetyLevel::Safe => write!(f, "Safe"),
+            SafetyLevel::Unsafe => write!(f, "Unsafe"),
+            SafetyLevel::Unknown => write!(f, "Unknown"),
+        }
     }
 }
