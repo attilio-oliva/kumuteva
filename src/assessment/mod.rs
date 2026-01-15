@@ -1,12 +1,12 @@
 mod control_plane;
-// mod network;
-// mod storage;
-// mod workload;
+mod network;
+mod storage;
+mod workload;
 
 pub use control_plane::*;
-// pub use network::*;
-// pub use storage::*;
-// pub use workload::*;
+pub use network::*;
+pub use storage::*;
+pub use workload::*;
 
 use tabled::settings::object::{Columns, Rows};
 use tabled::settings::{Alignment, Border, Modify, Span, Style};
@@ -86,7 +86,7 @@ impl AutonomyRatio {
         }
     }
 
-    pub fn is_full(&self) -> bool {
+    pub fn is_perfect(&self) -> bool {
         self.total > 0 && self.allowed == self.total
     }
 }
@@ -175,12 +175,7 @@ pub trait MultitenancyAssessor: Send + Sync {
     /// 1. Have tenant1 create/setup a resource
     /// 2. Have tenant2 attempt to operate on it (or create with same name for CREATE)
     /// 3. Infer isolation from whether tenant2 affected tenant1's resource
-    /// 4. Infer autonomy from the operation result:
-    ///    - Unauthorized -> Partial (tenant2 can't do what tenant1 can)
-    ///    - Error (expected) -> Full (isolation working as expected)
-    ///    - Error (unexpected, e.g., AlreadyExists) -> Partial (name collision)
-    ///    - Success + isolated -> Full
-    ///    - Success + not isolated -> Unsafe
+    /// 4. Infer autonomy from the operation result
     async fn check_cross_tenant_effect(
         &self,
         tenant1: &TenantClusterConfig,
@@ -529,7 +524,7 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
         Ok(())
     }
 }
-/*
+
 pub struct MultitenancyReport {
     pub control_plane: SubsystemReport<ControlPlaneResource>,
     pub control_plane_autonomy_levels: ControlPlaneAutonomyLevels,
@@ -573,7 +568,7 @@ fn calculate_control_plane_autonomy_levels(
 
         for op_assessment in assessment.operations.values() {
             ratio.total += 1;
-            if op_assessment.autonomy == AutonomyLevel::Full {
+            if op_assessment.autonomy {
                 ratio.allowed += 1;
             }
         }
@@ -639,96 +634,90 @@ fn format_isolation(isolated: bool) -> String {
 
 impl Display for MultitenancyReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut rows = Vec::new();
-
-        // Control Plane section
-        rows.push(ReportRow {
-            system: "Control Plane".to_string(),
-            property: "Isolation".to_string(),
-            value: format_isolation(self.control_plane.overall_isolation),
-        });
-        rows.push(ReportRow {
-            system: "".to_string(),
-            property: "Autonomy".to_string(),
-            value: format_ratio_with_icon(&self.control_plane.autonomy_ratio),
-        });
-        rows.push(ReportRow {
-            system: "".to_string(),
-            property: "  ├─ Workload".to_string(),
-            value: format_ratio_with_icon(&self.control_plane_autonomy_levels.workload),
-        });
-        rows.push(ReportRow {
-            system: "".to_string(),
-            property: "  ├─ Scope".to_string(),
-            value: format_ratio_with_icon(&self.control_plane_autonomy_levels.scope),
-        });
-        rows.push(ReportRow {
-            system: "".to_string(),
-            property: "  ├─ Infrastructure".to_string(),
-            value: format_ratio_with_icon(&self.control_plane_autonomy_levels.infrastructure),
-        });
-        rows.push(ReportRow {
-            system: "".to_string(),
-            property: "  └─ Cluster".to_string(),
-            value: format_ratio_with_icon(&self.control_plane_autonomy_levels.cluster),
-        });
-
-        // Separator row
-        rows.push(ReportRow {
-            system: "─────────────".to_string(),
-            property: "─────────────────".to_string(),
-            value: "─────────────────".to_string(),
-        });
-
-        // Storage section
-        rows.push(ReportRow {
-            system: "Storage".to_string(),
-            property: "Isolation".to_string(),
-            value: format_isolation(self.storage.overall_isolation),
-        });
-        rows.push(ReportRow {
-            system: "".to_string(),
-            property: "Autonomy".to_string(),
-            value: format_ratio_with_icon(&self.storage.autonomy_ratio),
-        });
-
-        // Separator row
-        rows.push(ReportRow {
-            system: "─────────────".to_string(),
-            property: "─────────────────".to_string(),
-            value: "─────────────────".to_string(),
-        });
-
-        // Network section
-        rows.push(ReportRow {
-            system: "Network".to_string(),
-            property: "Isolation".to_string(),
-            value: format_isolation(self.network.overall_isolation),
-        });
-        rows.push(ReportRow {
-            system: "".to_string(),
-            property: "Autonomy".to_string(),
-            value: format_ratio_with_icon(&self.network.autonomy_ratio),
-        });
-
-        // Separator row
-        rows.push(ReportRow {
-            system: "─────────────".to_string(),
-            property: "─────────────────".to_string(),
-            value: "─────────────────".to_string(),
-        });
-
-        // Workload section
-        rows.push(ReportRow {
-            system: "Workload".to_string(),
-            property: "Isolation".to_string(),
-            value: format_isolation(self.workload.overall_isolation),
-        });
-        rows.push(ReportRow {
-            system: "".to_string(),
-            property: "Autonomy".to_string(),
-            value: format_ratio_with_icon(&self.workload.autonomy_ratio),
-        });
+        let rows = vec![
+            // Control Plane section
+            ReportRow {
+                system: "Control Plane".to_string(),
+                property: "Isolation".to_string(),
+                value: format_isolation(self.control_plane.overall_isolation),
+            },
+            ReportRow {
+                system: "".to_string(),
+                property: "Autonomy".to_string(),
+                value: format_ratio_with_icon(&self.control_plane.autonomy_ratio),
+            },
+            ReportRow {
+                system: "".to_string(),
+                property: "  ├─ Workload".to_string(),
+                value: format_ratio_with_icon(&self.control_plane_autonomy_levels.workload),
+            },
+            ReportRow {
+                system: "".to_string(),
+                property: "  ├─ Scope".to_string(),
+                value: format_ratio_with_icon(&self.control_plane_autonomy_levels.scope),
+            },
+            ReportRow {
+                system: "".to_string(),
+                property: "  ├─ Infrastructure".to_string(),
+                value: format_ratio_with_icon(&self.control_plane_autonomy_levels.infrastructure),
+            },
+            ReportRow {
+                system: "".to_string(),
+                property: "  └─ Cluster".to_string(),
+                value: format_ratio_with_icon(&self.control_plane_autonomy_levels.cluster),
+            },
+            // Separator row
+            ReportRow {
+                system: "─────────────".to_string(),
+                property: "─────────────────".to_string(),
+                value: "─────────────────".to_string(),
+            },
+            // Storage section
+            ReportRow {
+                system: "Storage".to_string(),
+                property: "Isolation".to_string(),
+                value: format_isolation(self.storage.overall_isolation),
+            },
+            ReportRow {
+                system: "".to_string(),
+                property: "Autonomy".to_string(),
+                value: format_ratio_with_icon(&self.storage.autonomy_ratio),
+            },
+            // Separator row
+            ReportRow {
+                system: "─────────────".to_string(),
+                property: "─────────────────".to_string(),
+                value: "─────────────────".to_string(),
+            },
+            // Network section
+            ReportRow {
+                system: "Network".to_string(),
+                property: "Isolation".to_string(),
+                value: format_isolation(self.network.overall_isolation),
+            },
+            ReportRow {
+                system: "".to_string(),
+                property: "Autonomy".to_string(),
+                value: format_ratio_with_icon(&self.network.autonomy_ratio),
+            },
+            // Separator row
+            ReportRow {
+                system: "─────────────".to_string(),
+                property: "─────────────────".to_string(),
+                value: "─────────────────".to_string(),
+            },
+            // Workload section
+            ReportRow {
+                system: "Workload".to_string(),
+                property: "Isolation".to_string(),
+                value: format_isolation(self.workload.overall_isolation),
+            },
+            ReportRow {
+                system: "".to_string(),
+                property: "Autonomy".to_string(),
+                value: format_ratio_with_icon(&self.workload.autonomy_ratio),
+            },
+        ];
 
         let table = Table::new(rows)
             .with(Style::rounded())
@@ -755,5 +744,3 @@ impl Display for MultitenancyReport {
         Ok(())
     }
 }
-
-*/

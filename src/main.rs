@@ -268,21 +268,21 @@ async fn main() -> anyhow::Result<()> {
             let tenant1_config = Arc::new(tenant1_config);
             let tenant2_config = Arc::new(tenant2_config);
 
-            // let report =
-            //     assessment::assess_multitenancy(tenant1_config.clone(), tenant2_config.clone())
-            //         .await
-            //         .context("Failed to run multitenancy assessment")?;
-            // println!("{}", report.control_plane);
-            // println!("{}", report.storage);
-            // println!("{}", report.network);
-            // println!("{}", report.workload);
-            // println!("Multitenancy assessment report:\n{}", report);
+            let report =
+                assessment::assess_multitenancy(tenant1_config.clone(), tenant2_config.clone())
+                    .await
+                    .context("Failed to run multitenancy assessment")?;
+            println!("{}", report.control_plane);
+            println!("{}", report.storage);
+            println!("{}", report.network);
+            println!("{}", report.workload);
+            println!("Multitenancy assessment report:\n{}", report);
 
-            let assessment = assessment::ControlPlaneAssessor {};
-            let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
-                .await
-                .context("Failed to run control plane assessment")?;
-            println!("Control plane isolation assessment report:\n{}", report);
+            // let assessment = assessment::ControlPlaneAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run control plane assessment")?;
+            // println!("Control plane isolation assessment report:\n{}", report);
             // let assessment = assessment::WorkloadAssessor {};
             // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
             //     .await

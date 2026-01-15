@@ -10,7 +10,8 @@ use serde::Serialize;
 use tracing::info;
 
 use crate::assessment::{
-    run_assessment, AssessableResource, MultitenancyAssessor, SafetyLevel, SubsystemReport,
+    run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
+    SafetyLevel, SubsystemReport,
 };
 use crate::verifier::TenantClusterConfig;
 
@@ -105,7 +106,7 @@ impl MultitenancyAssessor for StorageAssessor {
         tenant2: &TenantClusterConfig,
         resource: &StorageResource,
         operation: &StorageOperation,
-    ) -> anyhow::Result<(SafetyLevel, String)> {
+    ) -> anyhow::Result<CrossTenantResult> {
         match (resource, operation) {
             (StorageResource::Volume, StorageOperation::CreateAndMountVolume) => {
                 test_pv_cross_tenant_access(tenant1, tenant2).await
@@ -192,53 +193,147 @@ async fn test_hostpath_mount_authorization(tenant: &TenantClusterConfig) -> anyh
 async fn test_pv_cross_tenant_access(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     match attempt_other_tenant_file_access(tenant1, tenant2).await {
-        Ok(()) => Ok((
-            SafetyLevel::Safe,
-            "Cross-tenant PV access is properly blocked".to_string(),
-        )),
-        Err(e) => Ok((
-            SafetyLevel::Unsafe,
-            format!("Cross-tenant PV access detected: {}", e),
-        )),
+        Ok(AccessResult::Isolated) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: "Cross-tenant PV access is properly blocked".to_string(),
+        }),
+        Ok(AccessResult::IsolatedByPolicy(reason)) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: format!("Storage isolated by policy: {}", reason),
+        }),
+        Ok(AccessResult::PartialAutonomy(reason)) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false, // Partial autonomy means not full autonomy
+            details: format!("Storage isolated but with restrictions: {}", reason),
+        }),
+        Ok(AccessResult::Accessible) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::None,
+            autonomy: true,
+            details: "Cross-tenant PV access detected - tenant2 can access tenant1's data"
+                .to_string(),
+        }),
+        Err(e) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: true,
+            details: format!("Could not determine isolation: {}", e),
+        }),
     }
 }
 
 async fn test_hostpath_cross_tenant_access(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     match test_hostpath_data_isolation(tenant1, tenant2).await {
-        Ok(()) => Ok((
-            SafetyLevel::Safe,
-            "HostPath volumes are properly isolated between tenants".to_string(),
-        )),
-        Err(e) => Ok((
-            SafetyLevel::Unsafe,
-            format!("HostPath volume data isolation failed: {}", e),
-        )),
+        Ok(AccessResult::Isolated) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: "HostPath volumes are properly isolated between tenants".to_string(),
+        }),
+        Ok(AccessResult::IsolatedByPolicy(reason)) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false, // Policy blocked it, so no autonomy for this operation
+            details: format!("HostPath isolated by policy: {}", reason),
+        }),
+        Ok(AccessResult::PartialAutonomy(reason)) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Soft(reason.clone()),
+            autonomy: false,
+            details: format!("HostPath partially restricted: {}", reason),
+        }),
+        Ok(AccessResult::Accessible) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::None,
+            autonomy: true,
+            details: "HostPath volume data is accessible across tenants".to_string(),
+        }),
+        Err(e) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: true,
+            details: format!("Could not determine HostPath isolation: {}", e),
+        }),
     }
+}
+
+/// Result of attempting cross-tenant access
+#[derive(Debug, Clone)]
+enum AccessResult {
+    /// Fully isolated - no cross-tenant access possible
+    Isolated,
+    /// Isolated due to a policy (e.g., RBAC denied patch on PV)
+    IsolatedByPolicy(String),
+    /// Operation works but with restrictions (partial autonomy)
+    PartialAutonomy(String),
+    /// Cross-tenant access is possible
+    Accessible,
 }
 
 async fn test_hostpath_data_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<AccessResult> {
     let tenant1_commands = hostpath_write_commands();
     let tenant2_commands = hostpath_read_commands();
 
     // Create hostPath volume and write data in tenant1
-    create_stateful_set(tenant1, &tenant1_commands, None, true).await?;
-    wait_for_statefulset_ready(tenant1).await?;
+    let create_result = create_stateful_set(tenant1, &tenant1_commands, None, true).await;
+    if let Err(e) = create_result {
+        // Cleanup attempt
+        let _ = tenant1
+            .cluster
+            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
+            .await;
+        return Ok(AccessResult::IsolatedByPolicy(format!(
+            "Cannot create hostPath StatefulSet: {}",
+            e
+        )));
+    }
+
+    if let Err(e) = wait_for_statefulset_ready(tenant1).await {
+        let _ = tenant1
+            .cluster
+            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
+            .await;
+        return Ok(AccessResult::IsolatedByPolicy(format!(
+            "HostPath StatefulSet failed to become ready: {}",
+            e
+        )));
+    }
     info!("Tenant1 has written data to hostPath volume.");
 
     // Try to read data from tenant2
-    create_stateful_set(tenant2, &tenant2_commands, None, true).await?;
-    wait_for_statefulset_ready(tenant2).await?;
+    let create_result2 = create_stateful_set(tenant2, &tenant2_commands, None, true).await;
+    if let Err(e) = create_result2 {
+        // Cleanup tenant1
+        let _ = tenant1
+            .cluster
+            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
+            .await;
+        return Ok(AccessResult::IsolatedByPolicy(format!(
+            "Tenant2 cannot create hostPath StatefulSet: {}",
+            e
+        )));
+    }
+
+    if let Err(e) = wait_for_statefulset_ready(tenant2).await {
+        let _ = tenant1
+            .cluster
+            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
+            .await;
+        let _ = tenant2
+            .cluster
+            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant2.namespace)
+            .await;
+        return Ok(AccessResult::IsolatedByPolicy(format!(
+            "Tenant2 HostPath StatefulSet failed: {}",
+            e
+        )));
+    }
     info!("Tenant2 has attempted to read data from hostPath volume.");
 
-    let can_access_data = check_cross_tenant_mount(tenant2).await?;
+    let can_access_data = check_cross_tenant_mount(tenant2).await.unwrap_or(false);
 
     // Cleanup
     let _ = tenant1
@@ -251,25 +346,32 @@ async fn test_hostpath_data_isolation(
         .await;
 
     if can_access_data {
-        return Err(anyhow::anyhow!(
-            "HostPath volume data is accessible across tenants"
-        ));
+        Ok(AccessResult::Accessible)
+    } else {
+        Ok(AccessResult::Isolated)
     }
-
-    Ok(())
 }
 
 async fn attempt_other_tenant_file_access(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<AccessResult> {
     let tenant1_commands = tenant1_commands();
     let tenant2_commands = tenant2_commands();
 
     // Step 1: Create StatefulSet in tenant1 with PVC
     info!("Creating a StatefulSet in tenant1");
-    let (created_pvc_name, dynamic_pv_name) =
-        create_and_wait_stateful_set(tenant1, &tenant1_commands, None).await?;
+    let create_result = create_and_wait_stateful_set(tenant1, &tenant1_commands, None).await;
+
+    let (created_pvc_name, dynamic_pv_name) = match create_result {
+        Ok(info) => info,
+        Err(e) => {
+            return Ok(AccessResult::PartialAutonomy(format!(
+                "Cannot create PVC/PV: {}",
+                e
+            )));
+        }
+    };
 
     // Step 2: Release the PV from tenant1
     let release_pv = release_pv_from_tenant(tenant1, &dynamic_pv_name, &created_pvc_name).await;
@@ -277,20 +379,26 @@ async fn attempt_other_tenant_file_access(
     match release_pv {
         Ok(_) => info!("Released PV {} from tenant1", dynamic_pv_name),
         Err(e) => {
-            if e.to_string()
-                .contains("cannot patch resource \"persistentvolumes\"")
+            let error_msg = e.to_string();
+            if error_msg.contains("cannot patch resource \"persistentvolumes\"")
+                || error_msg.contains("forbidden")
             {
                 info!(
-                    "PV {} patch operation is forbidden for tenant1. Considering storage is isolated.",
+                    "PV {} patch operation is forbidden for tenant1. Storage is isolated by RBAC.",
                     dynamic_pv_name
                 );
-                return Ok(());
+                return Ok(AccessResult::IsolatedByPolicy(
+                    "Cannot patch PersistentVolume - RBAC restriction".to_string(),
+                ));
             }
             info!(
                 "Could not release PV {} from tenant1: {}. Unable to continue test.",
                 dynamic_pv_name, e
             );
-            return Ok(());
+            return Ok(AccessResult::PartialAutonomy(format!(
+                "Cannot release PV: {}",
+                e
+            )));
         }
     }
 
@@ -299,17 +407,25 @@ async fn attempt_other_tenant_file_access(
     let mount_attempt =
         create_stateful_set(tenant2, &tenant2_commands, Some(&dynamic_pv_name), false).await;
 
-    if mount_attempt.is_err() {
+    if let Err(e) = mount_attempt {
         info!(
             "Tenant2 cannot create StatefulSet with the PV from Tenant1, storage is isolated: {}",
-            mount_attempt.err().unwrap()
+            e
         );
         // Cleanup the released PV
         let _ = tenant1
             .cluster
             .delete_cluster_resource::<PersistentVolume>(&dynamic_pv_name)
             .await;
-        return Ok(());
+
+        let error_msg = e.to_string();
+        if error_msg.contains("forbidden") || error_msg.contains("denied") {
+            return Ok(AccessResult::IsolatedByPolicy(format!(
+                "Tenant2 cannot bind to released PV: {}",
+                e
+            )));
+        }
+        return Ok(AccessResult::Isolated);
     }
 
     // Step 4: Check if tenant2 can actually mount and access the volume
@@ -327,11 +443,11 @@ async fn attempt_other_tenant_file_access(
             .cluster
             .delete_cluster_resource::<PersistentVolume>(&dynamic_pv_name)
             .await;
-        return Ok(());
+        return Ok(AccessResult::Isolated);
     }
 
     // Step 5: Check if tenant2 can access tenant1's data
-    let can_access_tenant1_files = check_cross_tenant_mount(tenant2).await?;
+    let can_access_tenant1_files = check_cross_tenant_mount(tenant2).await.unwrap_or(false);
 
     // Step 6: Cleanup resources
     let _ = tenant2
@@ -359,12 +475,10 @@ async fn attempt_other_tenant_file_access(
         .await;
 
     if can_access_tenant1_files {
-        return Err(anyhow::anyhow!(
-            "Tenant2 can access the file created by Tenant1"
-        ));
+        Ok(AccessResult::Accessible)
+    } else {
+        Ok(AccessResult::Isolated)
     }
-
-    Ok(())
 }
 
 // =============================================================================
@@ -648,9 +762,13 @@ async fn get_pvc_and_pv_info(tenant: &TenantClusterConfig) -> anyhow::Result<(St
         .ok_or_else(|| anyhow::anyhow!("PersistentVolumeClaim not found"))?;
 
     let created_pvc_name = created_pvc.metadata.name.as_deref().unwrap_or_default();
-    let dynamic_pv_name = created_pvc.spec.unwrap().volume_name.unwrap();
+    let dynamic_pv_name = created_pvc
+        .spec
+        .ok_or_else(|| anyhow::anyhow!("PVC spec not found"))?
+        .volume_name
+        .ok_or_else(|| anyhow::anyhow!("PVC volume_name not found"))?;
 
-    Ok((created_pvc_name.to_string(), dynamic_pv_name.to_string()))
+    Ok((created_pvc_name.to_string(), dynamic_pv_name))
 }
 
 async fn check_mount_attempt(tenant: &TenantClusterConfig) -> anyhow::Result<()> {

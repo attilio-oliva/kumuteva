@@ -654,8 +654,8 @@ fn save_vcluster_helm_values(path: &str) -> anyhow::Result<()> {
         "sync": {
                 "fromHost": {
                     "nodes": {
-                        "enabled": true,
-                        "syncBackChanges": true
+                        //"enabled": true,
+                        //"syncBackChanges": true
                     },
                 },
                 "toHost": {

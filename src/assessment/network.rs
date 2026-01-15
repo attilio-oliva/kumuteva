@@ -2,11 +2,11 @@ use std::fmt::Display;
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Pod, Service};
-use kube::runtime::reflector::Lookup;
 use tracing::info;
 
 use crate::assessment::{
-    run_assessment, AssessableResource, MultitenancyAssessor, SafetyLevel, SubsystemReport,
+    run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
+    SubsystemReport,
 };
 use crate::verifier::TenantClusterConfig;
 
@@ -123,7 +123,7 @@ impl MultitenancyAssessor for NetworkAssessor {
         tenant2: &TenantClusterConfig,
         resource: &NetworkResource,
         operation: &NetworkOperation,
-    ) -> anyhow::Result<(SafetyLevel, String)> {
+    ) -> anyhow::Result<CrossTenantResult> {
         info!(
             "Checking cross-tenant effect for {:?} - {:?}",
             resource, operation
@@ -141,7 +141,11 @@ impl MultitenancyAssessor for NetworkAssessor {
             (NetworkResource::DnsResolution, NetworkOperation::ResolveDns) => {
                 test_dns_isolation(tenant1, tenant2).await
             }
-            _ => Ok((SafetyLevel::Unknown, "Test not implemented".to_string())),
+            _ => Ok(CrossTenantResult {
+                isolation: IsolationLevel::Unknown,
+                autonomy: true,
+                details: "Test not implemented".to_string(),
+            }),
         }
     }
 }
@@ -229,7 +233,7 @@ async fn test_nodeport_authorization(tenant: &TenantClusterConfig) -> anyhow::Re
 async fn test_pod_network_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     // Create pods in both namespaces
     let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
 
@@ -298,22 +302,25 @@ async fn test_pod_network_isolation(
         .await;
 
     if can_reach_other_pod {
-        Ok((
-            SafetyLevel::Unsafe,
-            "Tenant1 can directly connect to tenant2's pod - Network not isolated".to_string(),
-        ))
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::None,
+            autonomy: true,
+            details: "Tenant1 can directly connect to tenant2's pod - Network not isolated"
+                .to_string(),
+        })
     } else {
-        Ok((
-            SafetyLevel::Safe,
-            "Pod-to-pod network isolation is enforced".to_string(),
-        ))
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: "Pod-to-pod network isolation is enforced".to_string(),
+        })
     }
 }
 
 async fn test_service_network_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     // Create test pod in tenant1 and service in tenant2
     let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
     let service = create_webserver_service(&tenant2.namespace);
@@ -396,22 +403,25 @@ async fn test_service_network_isolation(
         .await;
 
     if can_reach_service {
-        Ok((
-            SafetyLevel::Unsafe,
-            "Tenant1 can access tenant2's services - Service network not isolated".to_string(),
-        ))
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::None,
+            autonomy: true,
+            details: "Tenant1 can access tenant2's services - Service network not isolated"
+                .to_string(),
+        })
     } else {
-        Ok((
-            SafetyLevel::Safe,
-            "Service network isolation is enforced".to_string(),
-        ))
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: "Service network isolation is enforced".to_string(),
+        })
     }
 }
 
 async fn test_nodeport_autonomy(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     info!("Testing network autonomy - NodePort service exposure independence...");
 
     // Create identical NodePort services in both tenant namespaces
@@ -433,13 +443,14 @@ async fn test_nodeport_autonomy(
         .await;
 
     if tenant1_result.is_err() {
-        return Ok((
-            SafetyLevel::Unknown,
-            format!(
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: false,
+            details: format!(
                 "Could not create NodePort service in tenant1: {:?}",
                 tenant1_result.err()
             ),
-        ));
+        });
     }
 
     // Try to create identical service in tenant2 (same NodePort)
@@ -463,31 +474,74 @@ async fn test_nodeport_autonomy(
             .await;
     }
 
+    // Wait for cleanup
+    let _ = tenant1
+        .cluster
+        .wait_for_namespaced_resource_deletion::<Service>(
+            AUTONOMY_TEST_SERVICE_NAME,
+            &tenant1.namespace,
+        )
+        .await;
+
     if autonomy_success {
-        Ok((
-            SafetyLevel::Safe,
-            format!(
-                "Both tenants can independently expose services on NodePort {} - Network autonomy verified",
+        let _ = tenant2
+            .cluster
+            .wait_for_namespaced_resource_deletion::<Service>(
+                AUTONOMY_TEST_SERVICE_NAME,
+                &tenant2.namespace,
+            )
+            .await;
+    }
+
+    if autonomy_success {
+        // Both tenants can create NodePort on same port - full isolation (separate network namespaces)
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: format!(
+                "Both tenants can independently expose services on NodePort {} - Full network autonomy",
                 AUTONOMY_TEST_NODE_PORT
             ),
-        ))
+        })
     } else {
-        // NodePort conflict means tenants share the same network namespace for NodePorts
-        // This is actually expected behavior in most multi-tenant setups
-        Ok((
-            SafetyLevel::Safe,
-            format!(
-                "NodePort {} conflict detected - Tenants share NodePort space (expected in shared-node setups)",
-                AUTONOMY_TEST_NODE_PORT
-            ),
-        ))
+        // NodePort conflict - tenants share the NodePort space
+        // Check if the error is due to port conflict
+        let error_msg = tenant2_result
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+
+        if error_msg.contains("already allocated")
+            || error_msg.contains("port is already allocated")
+            || error_msg.contains("nodePort")
+        {
+            // Port collision detected - partial autonomy
+            Ok(CrossTenantResult {
+                isolation: IsolationLevel::Soft(format!(
+                    "NodePort {} shared across tenants",
+                    AUTONOMY_TEST_NODE_PORT
+                )),
+                autonomy: false, // Partial autonomy - can use NodePorts but may conflict
+                details: format!(
+                    "NodePort {} collision detected - Tenants share NodePort space, may conflict with each other",
+                    AUTONOMY_TEST_NODE_PORT
+                ),
+            })
+        } else {
+            // Some other error
+            Ok(CrossTenantResult {
+                isolation: IsolationLevel::Unknown,
+                autonomy: false,
+                details: format!("NodePort creation failed for tenant2: {}", error_msg),
+            })
+        }
     }
 }
 
 async fn test_dns_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     // Create pod in tenant1 and service in tenant2
     let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
     let service = create_webserver_service(&tenant2.namespace);
@@ -538,17 +592,24 @@ async fn test_dns_isolation(
         .delete_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant2.namespace)
         .await;
 
+    let _ = tenant1
+        .cluster
+        .wait_for_pod_deletion(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
+        .await;
+
     if can_resolve_dns {
-        Ok((
-            SafetyLevel::Unsafe,
-            "Tenant1 can resolve DNS records from tenant2's namespace - DNS not isolated"
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::None,
+            autonomy: true,
+            details: "Tenant1 can resolve DNS records from tenant2's namespace - DNS not isolated"
                 .to_string(),
-        ))
+        })
     } else {
-        Ok((
-            SafetyLevel::Safe,
-            "DNS isolation is enforced between tenants".to_string(),
-        ))
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: "DNS isolation is enforced between tenants".to_string(),
+        })
     }
 }
 

@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 use std::fmt::Display;
+use tracing::info;
 
 use crate::assessment::{
-    run_assessment, AssessableResource, MultitenancyAssessor, SafetyLevel, SubsystemReport,
+    run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
+    SubsystemReport,
 };
 use crate::verifier::TenantClusterConfig;
 
@@ -94,7 +96,7 @@ impl MultitenancyAssessor for WorkloadAssessor {
         tenant2: &TenantClusterConfig,
         resource: &WorkloadResource,
         operation: &WorkloadOperation,
-    ) -> anyhow::Result<(SafetyLevel, String)> {
+    ) -> anyhow::Result<CrossTenantResult> {
         match (resource, operation) {
             (WorkloadResource::ProcessNamespace, WorkloadOperation::ViewProcesses) => {
                 test_process_visibility_cross_tenant(tenant1, tenant2).await
@@ -111,7 +113,11 @@ impl MultitenancyAssessor for WorkloadAssessor {
             (WorkloadResource::PrivilegedSyscalls, WorkloadOperation::UsePrivilegedSyscalls) => {
                 test_privileged_syscalls_cross_tenant(tenant1, tenant2).await
             }
-            _ => Ok((SafetyLevel::Unknown, "Test not implemented".to_string())),
+            _ => Ok(CrossTenantResult {
+                isolation: IsolationLevel::Unknown,
+                autonomy: true,
+                details: "Test not implemented".to_string(),
+            }),
         }
     }
 }
@@ -123,6 +129,10 @@ pub async fn check_workload_isolation(
 ) -> anyhow::Result<WorkloadIsolationReport> {
     run_assessment(&WorkloadAssessor, tenant1, tenant2).await
 }
+
+// =============================================================================
+// AUTHORIZATION TESTS
+// =============================================================================
 
 async fn test_host_pid_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
     let test_pod_name = "hostpid-auth-test";
@@ -196,11 +206,32 @@ async fn test_host_ipc_authorization(tenant: &TenantClusterConfig) -> anyhow::Re
     Ok(result.is_ok())
 }
 
-// Cross-tenant effect test functions
+async fn test_host_user_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+    let test_pod_name = "hostuser-auth-test";
+    let test_pod = create_host_user_test_pod(test_pod_name);
+
+    let result = tenant
+        .cluster
+        .create_pod_in_namespace(&test_pod, &tenant.namespace)
+        .await;
+
+    // Cleanup
+    let _ = tenant
+        .cluster
+        .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
+        .await;
+
+    Ok(result.is_ok())
+}
+
+// =============================================================================
+// CROSS-TENANT EFFECT TESTS
+// =============================================================================
+
 async fn test_process_visibility_cross_tenant(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     // Create target pod in tenant2
     let target_pod_name = "process-target";
     let target_pod = create_target_process_pod(target_pod_name);
@@ -237,11 +268,12 @@ async fn test_process_visibility_cross_tenant(
         .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
         .await;
 
-    let (safety_level, details) = if spy_result.is_err() {
-        (
-            SafetyLevel::Safe,
-            "Cannot create hostPID pod - processes isolated".to_string(),
-        )
+    let result = if spy_result.is_err() {
+        CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false, // Cannot create hostPID pod
+            details: "Cannot create hostPID pod - processes isolated by policy".to_string(),
+        }
     } else {
         // Wait for spy pod to complete
         tenant1
@@ -270,15 +302,18 @@ async fn test_process_visibility_cross_tenant(
             .unwrap_or_default();
 
         if logs.contains("TENANT2_PROCESS_FOUND") {
-            (
-                SafetyLevel::Unsafe,
-                "Cross-tenant process visibility detected".to_string(),
-            )
+            CrossTenantResult {
+                isolation: IsolationLevel::None,
+                autonomy: true,
+                details: "Cross-tenant process visibility detected - hostPID allows seeing other tenant's processes".to_string(),
+            }
         } else {
-            (
-                SafetyLevel::Safe,
-                "No cross-tenant process visibility".to_string(),
-            )
+            CrossTenantResult {
+                isolation: IsolationLevel::Hard,
+                autonomy: true,
+                details: "No cross-tenant process visibility - processes properly isolated"
+                    .to_string(),
+            }
         }
     };
 
@@ -292,13 +327,13 @@ async fn test_process_visibility_cross_tenant(
         .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
         .await;
 
-    Ok((safety_level, details))
+    Ok(result)
 }
 
 async fn test_network_cross_tenant(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     // Create a target pod in tenant2 that listens on a specific port
     let target_pod_name = "network-target";
     let target_pod = create_network_target_pod(target_pod_name);
@@ -329,11 +364,12 @@ async fn test_network_cross_tenant(
         .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
         .await;
 
-    let (safety_level, details) = if spy_result.is_err() {
-        (
-            SafetyLevel::Safe,
-            "Cannot create hostNetwork pod - network isolated".to_string(),
-        )
+    let result = if spy_result.is_err() {
+        CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false, // Cannot create hostNetwork pod
+            details: "Cannot create hostNetwork pod - network isolated by policy".to_string(),
+        }
     } else {
         // Wait for spy pod to complete
         tenant1
@@ -362,15 +398,17 @@ async fn test_network_cross_tenant(
             .unwrap_or_default();
 
         if logs.contains("NETWORK_ACCESS_SUCCESS") {
-            (
-                SafetyLevel::Unsafe,
-                "Cross-tenant network access detected - hostNetwork bypass".to_string(),
-            )
+            CrossTenantResult {
+                isolation: IsolationLevel::None,
+                autonomy: true,
+                details: "Cross-tenant network access detected - hostNetwork bypass allows reaching other tenant's pods".to_string(),
+            }
         } else {
-            (
-                SafetyLevel::Safe,
-                "No cross-tenant network access detected".to_string(),
-            )
+            CrossTenantResult {
+                isolation: IsolationLevel::Hard,
+                autonomy: true,
+                details: "No cross-tenant network access - network properly isolated".to_string(),
+            }
         }
     };
 
@@ -384,23 +422,13 @@ async fn test_network_cross_tenant(
         .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
         .await;
 
-    Ok((safety_level, details))
-}
-
-async fn test_hostname_cross_tenant(
-    _tenant1: &TenantClusterConfig,
-    _tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
-    Ok((
-        SafetyLevel::Unknown,
-        "Hostname cross-tenant test not implemented".to_string(),
-    ))
+    Ok(result)
 }
 
 async fn test_ipc_cross_tenant(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     // Create IPC target pod in tenant2 that creates shared memory
     let target_pod_name = "ipc-target";
     let target_pod = create_ipc_target_pod(target_pod_name);
@@ -437,11 +465,12 @@ async fn test_ipc_cross_tenant(
         .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
         .await;
 
-    let (safety_level, details) = if spy_result.is_err() {
-        (
-            SafetyLevel::Safe,
-            "Cannot create hostIPC pod - IPC isolated".to_string(),
-        )
+    let result = if spy_result.is_err() {
+        CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false, // Cannot create hostIPC pod
+            details: "Cannot create hostIPC pod - IPC isolated by policy".to_string(),
+        }
     } else {
         // Wait for spy pod to complete
         tenant1
@@ -483,18 +512,20 @@ async fn test_ipc_cross_tenant(
             .unwrap_or("");
 
         if spy_logs.contains(target_fingerprint) && !target_fingerprint.is_empty() {
-            (
-                SafetyLevel::Unsafe,
-                format!(
-                    "Cross-tenant IPC access detected - fingerprint {} found",
+            CrossTenantResult {
+                isolation: IsolationLevel::None,
+                autonomy: true,
+                details: format!(
+                    "Cross-tenant IPC access detected - fingerprint {} visible to other tenant",
                     target_fingerprint
                 ),
-            )
+            }
         } else {
-            (
-                SafetyLevel::Safe,
-                "No cross-tenant IPC access detected".to_string(),
-            )
+            CrossTenantResult {
+                isolation: IsolationLevel::Hard,
+                autonomy: true,
+                details: "No cross-tenant IPC access - IPC properly isolated".to_string(),
+            }
         }
     };
 
@@ -508,31 +539,13 @@ async fn test_ipc_cross_tenant(
         .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
         .await;
 
-    Ok((safety_level, details))
-}
-
-async fn test_host_user_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
-    let test_pod_name = "hostuser-auth-test";
-    let test_pod = create_host_user_test_pod(test_pod_name);
-
-    let result = tenant
-        .cluster
-        .create_pod_in_namespace(&test_pod, &tenant.namespace)
-        .await;
-
-    // Cleanup
-    let _ = tenant
-        .cluster
-        .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
-        .await;
-
-    Ok(result.is_ok())
+    Ok(result)
 }
 
 async fn test_user_namespace_cross_tenant(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
     // Create target pod in tenant2 with specific user
     let target_pod_name = "user-target";
     let target_pod = create_user_target_pod(target_pod_name);
@@ -556,11 +569,12 @@ async fn test_user_namespace_cross_tenant(
         .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
         .await;
 
-    let (safety_level, details) = if spy_result.is_err() {
-        (
-            SafetyLevel::Safe,
-            "Cannot create hostUser pod - user namespace isolated".to_string(),
-        )
+    let result = if spy_result.is_err() {
+        CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false, // Cannot create hostUser pod
+            details: "Cannot create hostUser pod - user namespace isolated by policy".to_string(),
+        }
     } else {
         // Wait for spy pod to complete and analyze results
         tenant1
@@ -588,15 +602,19 @@ async fn test_user_namespace_cross_tenant(
             .unwrap_or_default();
 
         if logs.contains("USER_NAMESPACE_BREACH") {
-            (
-                SafetyLevel::Unsafe,
-                "Cross-tenant user namespace access detected".to_string(),
-            )
+            CrossTenantResult {
+                isolation: IsolationLevel::None,
+                autonomy: true,
+                details: "Cross-tenant user namespace access detected - host user namespace shared"
+                    .to_string(),
+            }
         } else {
-            (
-                SafetyLevel::Safe,
-                "No cross-tenant user namespace access detected".to_string(),
-            )
+            CrossTenantResult {
+                isolation: IsolationLevel::Hard,
+                autonomy: true,
+                details: "No cross-tenant user namespace access - user namespace properly isolated"
+                    .to_string(),
+            }
         }
     };
 
@@ -610,13 +628,15 @@ async fn test_user_namespace_cross_tenant(
         .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
         .await;
 
-    Ok((safety_level, details))
+    Ok(result)
 }
 
 async fn test_privileged_syscalls_cross_tenant(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
-) -> anyhow::Result<(SafetyLevel, String)> {
+) -> anyhow::Result<CrossTenantResult> {
+    info!("Testing privileged syscalls cross-tenant isolation'");
+
     // Create target pod in tenant2 with sensitive data (NON-PRIVILEGED)
     let target_pod_name = "privileged-target";
     let target_pod = create_non_privileged_target_pod(target_pod_name);
@@ -644,20 +664,32 @@ async fn test_privileged_syscalls_cross_tenant(
         .and_then(|spec| spec.node_name.as_ref())
         .ok_or_else(|| anyhow::anyhow!("Could not determine target pod node"))?;
 
+    info!(
+        "Target pod '{}' with sensitive data is running on node '{}'",
+        target_pod_name, node_name
+    );
+
     // Create escape pod in tenant1 on the same node with ONLY privileged flag
     let escape_pod_name = "privileged-escape";
     let escape_pod = create_privileged_escape_pod(escape_pod_name, node_name);
+
+    info!(
+        "Malicious escape pod '{}' created on the same node as target pod in tenant",
+        escape_pod_name
+    );
 
     let escape_result = tenant1
         .cluster
         .create_pod_in_namespace(&escape_pod, &tenant1.namespace)
         .await;
 
-    let (safety_level, details) = if escape_result.is_err() {
-        (
-            SafetyLevel::Safe,
-            "Cannot create privileged pod - privileged syscalls isolated".to_string(),
-        )
+    let result = if escape_result.is_err() {
+        CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false, // Cannot create privileged pod
+            details: "Cannot create privileged pod - privileged syscalls isolated by policy"
+                .to_string(),
+        }
     } else {
         // Wait for escape pod to complete
         tenant1
@@ -689,19 +721,6 @@ async fn test_privileged_syscalls_cross_tenant(
             .await
             .unwrap_or_default();
 
-        let target_logs = tenant2
-            .cluster
-            .get_pod_logs(target_pod_name, &tenant2.namespace)
-            .await
-            .unwrap_or_default();
-
-        // Extract target's secret from logs
-        let target_secret = target_logs
-            .lines()
-            .find(|line| line.contains("SECRET_DATA:"))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("");
-
         let mut breaches = Vec::new();
 
         // Check for various container escape indicators
@@ -713,26 +732,39 @@ async fn test_privileged_syscalls_cross_tenant(
         if escape_logs.contains("CONTAINER_ESCAPE_SUCCESS") {
             breaches.push("successful container escape to host");
         }
-        if escape_logs.contains("KERNEL_MODULE_BLOCKED") {
-            // This is actually good - it means isolation is working
-        }
         if escape_logs.contains("TENANT2_PROCESS_VISIBLE") {
             breaches.push("tenant2 processes visible from privileged container");
         }
 
+        info!(
+            "Privileged escape pod logs analyzed, breaches found: {:?}",
+            breaches
+        );
+
         if !breaches.is_empty() {
-            (
-                SafetyLevel::Unsafe,
-                format!(
+            CrossTenantResult {
+                isolation: IsolationLevel::None,
+                autonomy: true,
+                details: format!(
                     "Container escape successful with cross-tenant access: {}",
                     breaches.join(", ")
                 ),
-            )
+            }
+        } else if escape_logs.contains("KERNEL_MODULE_BLOCKED") {
+            // Soft isolation - privileged pod created but kernel module loading blocked
+            CrossTenantResult {
+                isolation: IsolationLevel::Soft("Kernel module loading blocked".to_string()),
+                autonomy: true,
+                details:
+                    "Privileged pod created but kernel module loading blocked - partial isolation"
+                        .to_string(),
+            }
         } else {
-            (
-                SafetyLevel::Safe,
-                "No container escape or cross-tenant access detected".to_string(),
-            )
+            CrossTenantResult {
+                isolation: IsolationLevel::Hard,
+                autonomy: true,
+                details: "No container escape or cross-tenant access detected - privileged syscalls properly isolated".to_string(),
+            }
         }
     };
 
@@ -746,8 +778,12 @@ async fn test_privileged_syscalls_cross_tenant(
         .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
         .await;
 
-    Ok((safety_level, details))
+    Ok(result)
 }
+
+// =============================================================================
+// MANIFEST CREATION HELPERS
+// =============================================================================
 
 fn create_privileged_escape_pod(pod_name: &str, node_name: &str) -> Pod {
     let script = [
@@ -930,16 +966,7 @@ fn create_privileged_escape_pod(pod_name: &str, node_name: &str) -> Pod {
         "EOF",
         "",
         "# Create Makefile with proper TAB characters",
-        "printf '%s\n' 'obj-m := tenant_spy.o' '' 'all:' '\t@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules' '' 'clean:' '\t@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean' > Makefile",
-        // "cat > Makefile << 'EOF'",
-        // "obj-m := tenant_spy.o",
-        // "",
-        // "all:",
-        // r#"	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules"#,
-        // "",
-        // "clean:",
-        // r#"	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean"#,
-        // "EOF",
+        "printf '%s\\n' 'obj-m := tenant_spy.o' '' 'all:' '\\t@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules' '' 'clean:' '\\t@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean' > Makefile",
         "# Try to compile the kernel module",
         "echo 'Compiling kernel module...'",
         "if make; then",
@@ -983,8 +1010,6 @@ fn create_privileged_escape_pod(pod_name: &str, node_name: &str) -> Pod {
         "echo 'Kernel module container escape test completed'",
         "sleep 3600",
     ].join("\n");
-
-    //println!("Privileged escape pod script:\n{}", script);
 
     serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
@@ -1140,7 +1165,6 @@ fn create_user_spy_pod(pod_name: &str) -> Pod {
     .unwrap()
 }
 
-// Pod creation helper functions
 fn create_host_pid_test_pod(pod_name: &str) -> Pod {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
@@ -1176,35 +1200,6 @@ fn create_privileged_test_pod(pod_name: &str) -> Pod {
                 "securityContext": {
                     "privileged": true
                 }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
-}
-
-fn create_host_path_test_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "volumes": [{
-                "name": "host-vol",
-                "hostPath": {
-                    "path": "/tmp"
-                }
-            }],
-            "containers": [{
-                "name": "test",
-                "image": "alpine:latest",
-                "command": ["sleep", "1"],
-                "volumeMounts": [{
-                    "name": "host-vol",
-                    "mountPath": "/host-tmp"
-                }]
             }],
             "restartPolicy": "Never",
         }
@@ -1258,7 +1253,6 @@ fn create_ipc_target_pod(pod_name: &str) -> Pod {
         "ipcmk -M 64",
         "ipcmk -S 1",
         "ipcmk -Q",
-        // concat all the ipcs commands and then pass to sha1sum to get a fingerprint
         "fingerprint=`(ipcs -m; ipcs -s; ipcs -q) | sha1sum | cut -d' ' -f1`",
         "echo 'Fingerprint: ' $fingerprint",
         "while true; do sleep 30; done",
@@ -1452,6 +1446,10 @@ fn create_network_spy_pod(pod_name: &str, target_ip: &str) -> Pod {
     }))
     .unwrap()
 }
+
+// =============================================================================
+// DISPLAY IMPLEMENTATIONS
+// =============================================================================
 
 impl Display for WorkloadResource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
