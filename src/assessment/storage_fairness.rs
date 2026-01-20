@@ -1,10 +1,10 @@
 //! Storage Fairness Assessor
 //!
 //! This module implements the `FairnessAssessor` trait for the storage subsystem.
-//! It measures I/O throughput fairness by comparing how a "regular" tenant's disk
-//! performance is affected when a "malicious" tenant increases their I/O load.
+//! It measures I/O latency fairness by comparing how a "regular" tenant's disk
+//! operation latency is affected when a "malicious" tenant increases their I/O load.
 //!
-//! Uses fio (Flexible I/O Tester) to measure disk throughput.
+//! Uses fio (Flexible I/O Tester) to measure I/O latency.
 
 #![allow(dead_code)] // Framework code - will be used by callers
 
@@ -50,14 +50,14 @@ impl Default for StorageFairnessConfig {
     fn default() -> Self {
         Self {
             pods_per_tenant: 1,
-            block_size_kb: 1024,
+            block_size_kb: 4, // 4KB blocks typical for database workloads
             file_size_mb: 100,
             scenario: StorageTestScenario::RandomIO,
         }
     }
 }
 
-/// Storage fairness assessor using fio
+/// Storage fairness assessor using fio for latency measurement
 pub struct StorageFairnessAssessor {
     pub config: StorageFairnessConfig,
 }
@@ -94,49 +94,38 @@ impl StorageFairnessAssessor {
         // Wait for completion
         wait_for_storage_pods_completion(&tenant1, &tenant2, tenant1_pods, tenant2_pods).await?;
 
-        // Collect results
-        let (tenant1_throughputs, tenant2_throughputs) = collect_storage_results(
-            &tenant1,
-            &tenant2,
-            tenant1_pods,
-            tenant2_pods,
-            &self.config.scenario,
-        )
-        .await?;
+        // Collect latency results
+        let (tenant1_latencies, tenant2_latencies) =
+            collect_storage_latency_results(&tenant1, &tenant2, tenant1_pods, tenant2_pods).await?;
 
         // Cleanup
         cleanup_storage_pods(&tenant1, tenant1_pods).await?;
         cleanup_storage_pods(&tenant2, tenant2_pods).await?;
 
-        // Calculate averages
-        let tenant1_avg = if tenant1_throughputs.is_empty() {
-            0.0
-        } else {
-            tenant1_throughputs.iter().sum::<f64>() / tenant1_throughputs.len() as f64
-        };
-
-        let tenant2_avg = if tenant2_throughputs.is_empty() {
-            0.0
-        } else {
-            tenant2_throughputs.iter().sum::<f64>() / tenant2_throughputs.len() as f64
-        };
+        // Calculate statistics
+        let (t1_avg, t1_std, t1_count) = calculate_stats(&tenant1_latencies);
+        let (t2_avg, t2_std, t2_count) = calculate_stats(&tenant2_latencies);
 
         Ok(PhaseResults {
             tenant1: TenantMetrics {
-                primary_metric: tenant1_avg,
-                secondary_metrics: vec![
-                    ("pods".to_string(), tenant1_pods as f64),
-                    ("samples".to_string(), tenant1_throughputs.len() as f64),
-                ],
-                error_rate: 0.0,
+                avg_latency_ms: t1_avg,
+                std_deviation_ms: t1_std,
+                total_operations: t1_count,
+                error_rate: if tenant1_latencies.is_empty() {
+                    100.0
+                } else {
+                    0.0
+                },
             },
             tenant2: TenantMetrics {
-                primary_metric: tenant2_avg,
-                secondary_metrics: vec![
-                    ("pods".to_string(), tenant2_pods as f64),
-                    ("samples".to_string(), tenant2_throughputs.len() as f64),
-                ],
-                error_rate: 0.0,
+                avg_latency_ms: t2_avg,
+                std_deviation_ms: t2_std,
+                total_operations: t2_count,
+                error_rate: if tenant2_latencies.is_empty() {
+                    100.0
+                } else {
+                    0.0
+                },
             },
         })
     }
@@ -148,12 +137,8 @@ impl FairnessAssessor for StorageFairnessAssessor {
         "Storage"
     }
 
-    fn metric_unit(&self) -> &'static str {
-        "MB/s"
-    }
-
-    fn higher_is_better(&self) -> bool {
-        true // Higher throughput is better
+    fn operation_description(&self) -> &'static str {
+        "I/O operation latency"
     }
 
     async fn run_baseline(
@@ -198,6 +183,21 @@ impl FairnessAssessor for StorageFairnessAssessor {
 // HELPER FUNCTIONS
 // =============================================================================
 
+fn calculate_stats(latencies: &[f64]) -> (f64, f64, u64) {
+    if latencies.is_empty() {
+        return (0.0, 0.0, 0);
+    }
+
+    let count = latencies.len() as u64;
+    let avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
+
+    let variance =
+        latencies.iter().map(|x| (x - avg).powi(2)).sum::<f64>() / latencies.len() as f64;
+    let std_dev = variance.sqrt();
+
+    (avg, std_dev, count)
+}
+
 fn storage_benchmark_pod_manifest(
     scenario: &StorageTestScenario,
     block_size_kb: u32,
@@ -207,52 +207,54 @@ fn storage_benchmark_pod_manifest(
 ) -> Pod {
     let pod_name = format!("storage-fairness-{}", pod_index);
 
+    // fio command to measure latency
+    // --output-format=json gives us structured output with latency stats
+    // clat = completion latency (what we care about)
     let command = match scenario {
         StorageTestScenario::SequentialIO => {
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "apk add --no-cache bc fio && \
-                     echo 'Starting sequential I/O benchmark...' && \
-                     dd if=/dev/zero of=/data/testfile bs={block_size_kb}K count={} oflag=sync 2>&1 | tee /tmp/dd_write.log && \
-                     write_throughput=$(tail -1 /tmp/dd_write.log | awk '{{for(i=1;i<=NF;i++) if($i~/MB\\/s/) print $(i-1)}}') && \
-                     echo \"THROUGHPUT_RESULT: $write_throughput MB/s\" && \
-                     sleep 5",
-                    file_size_mb * 1024 / block_size_kb,
-                ),
-            ]
+            // Sequential I/O with fio - measure latency
+            format!(
+                "apk add --no-cache fio jq && \
+                 mkdir -p /data && \
+                 fio --name=seq-rw \
+                 --ioengine=sync \
+                 --rw=rw \
+                 --bs={}k \
+                 --size={}m \
+                 --numjobs=1 \
+                 --runtime={} \
+                 --time_based=1 \
+                 --group_reporting=1 \
+                 --filename=/data/fio-test-file \
+                 --output-format=json \
+                 --output=/data/fio_result.json && \
+                 cat /data/fio_result.json",
+                block_size_kb, file_size_mb, duration_secs
+            )
         }
         StorageTestScenario::RandomIO => {
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "apk add --no-cache fio && \
-                     echo 'Starting random I/O benchmark with fio...' && \
-                     mkdir -p /data && \
-                     fio --name=random-rw \
-                     --ioengine=libaio \
-                     --iodepth=4 \
-                     --rw=randrw \
-                     --rwmixread=50 \
-                     --bs={block_size_kb}k \
-                     --direct=1 \
-                     --size={file_size_mb}m \
-                     --numjobs=1 \
-                     --runtime={duration_secs} \
-                     --time_based=1 \
-                     --group_reporting=1 \
-                     --filename=/data/fio-test-file \
-                     --output-format=json \
-                     --output=/data/fio_result.json && \
-                     echo 'FIO benchmark completed' && \
-                     bw=$(grep -o '\"bw\"[[:space:]]*:[[:space:]]*[0-9]*' /data/fio_result.json | head -1 | grep -o '[0-9]*') && \
-                     bw_mbs=$(echo \"scale=2; $bw / 1024\" | bc) && \
-                     echo \"THROUGHPUT_RESULT: $bw_mbs MB/s\" && \
-                     sleep 5"
-                ),
-            ]
+            // Random I/O with fio - measure latency
+            format!(
+                "apk add --no-cache fio jq && \
+                 mkdir -p /data && \
+                 fio --name=random-rw \
+                 --ioengine=libaio \
+                 --iodepth=4 \
+                 --rw=randrw \
+                 --rwmixread=50 \
+                 --bs={}k \
+                 --direct=1 \
+                 --size={}m \
+                 --numjobs=1 \
+                 --runtime={} \
+                 --time_based=1 \
+                 --group_reporting=1 \
+                 --filename=/data/fio-test-file \
+                 --output-format=json \
+                 --output=/data/fio_result.json && \
+                 cat /data/fio_result.json",
+                block_size_kb, file_size_mb, duration_secs
+            )
         }
     };
 
@@ -263,12 +265,12 @@ fn storage_benchmark_pod_manifest(
             "name": pod_name
         },
         "spec": {
-            "restartPolicy": "OnFailure",
+            "restartPolicy": "Never",
             "containers": [
                 {
                     "name": "storage-benchmark",
                     "image": "alpine:latest",
-                    "command": command,
+                    "command": ["sh", "-c", command],
                     "volumeMounts": [
                         {
                             "name": "benchmark-storage",
@@ -402,15 +404,9 @@ async fn wait_for_storage_pod_completion(
         .await?;
 
     if let Some(s) = status.status.as_ref() {
-        if let Some(statuses) = s.container_statuses.as_ref() {
-            if let Some(cs) = statuses.first() {
-                if let Some(state) = cs.state.as_ref() {
-                    if let Some(term) = state.terminated.as_ref() {
-                        if term.exit_code == 0 {
-                            return Ok(());
-                        }
-                    }
-                }
+        if let Some(phase) = s.phase.as_ref() {
+            if phase == "Succeeded" || phase == "Failed" {
+                return Ok(());
             }
         }
     }
@@ -423,11 +419,8 @@ async fn wait_for_storage_pod_completion(
                 status
                     .status
                     .as_ref()
-                    .and_then(|s| s.container_statuses.as_ref())
-                    .and_then(|statuses| statuses.first())
-                    .and_then(|cs| cs.state.as_ref())
-                    .and_then(|state| state.terminated.as_ref())
-                    .map(|term| term.exit_code == 0)
+                    .and_then(|s| s.phase.as_ref())
+                    .map(|phase| phase == "Succeeded" || phase == "Failed")
                     .unwrap_or(false)
             } else {
                 false
@@ -438,15 +431,14 @@ async fn wait_for_storage_pod_completion(
     Ok(())
 }
 
-async fn collect_storage_results(
+async fn collect_storage_latency_results(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
     tenant1_pods: u32,
     tenant2_pods: u32,
-    scenario: &StorageTestScenario,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
-    let mut tenant1_throughputs = Vec::new();
-    let mut tenant2_throughputs = Vec::new();
+    let mut tenant1_latencies = Vec::new();
+    let mut tenant2_latencies = Vec::new();
 
     // Collect from tenant1 pods
     for i in 0..tenant1_pods {
@@ -456,8 +448,8 @@ async fn collect_storage_results(
             .get_pod_logs(&pod_name, &tenant1.namespace)
             .await?;
 
-        if let Ok(throughput) = parse_storage_benchmark_logs(&logs, scenario) {
-            tenant1_throughputs.push(throughput);
+        if let Some(latency) = parse_fio_latency(&logs) {
+            tenant1_latencies.push(latency);
         }
     }
 
@@ -469,93 +461,87 @@ async fn collect_storage_results(
             .get_pod_logs(&pod_name, &tenant2.namespace)
             .await?;
 
-        if let Ok(throughput) = parse_storage_benchmark_logs(&logs, scenario) {
-            tenant2_throughputs.push(throughput);
+        if let Some(latency) = parse_fio_latency(&logs) {
+            tenant2_latencies.push(latency);
         }
     }
 
-    Ok((tenant1_throughputs, tenant2_throughputs))
+    Ok((tenant1_latencies, tenant2_latencies))
 }
 
-fn parse_storage_benchmark_logs(logs: &str, scenario: &StorageTestScenario) -> Result<f64> {
-    // First, look for our standardized output format
+fn parse_fio_latency(logs: &str) -> Option<f64> {
+    // Parse FIO JSON output to extract completion latency (clat)
+    // fio reports latency in nanoseconds, we convert to milliseconds
+
+    let json_start = logs.find('{');
+    let json_end = logs.rfind('}');
+
+    if let (Some(start), Some(end)) = (json_start, json_end) {
+        let json_str = &logs[start..=end];
+        if let Ok(fio_result) = serde_json::from_str::<serde_json::Value>(json_str) {
+            if let Some(jobs) = fio_result["jobs"].as_array() {
+                if let Some(job) = jobs.first() {
+                    // Try to get average completion latency from read operations
+                    if let Some(read_clat_mean) = job["read"]["clat_ns"]["mean"].as_f64() {
+                        if read_clat_mean > 0.0 {
+                            // Convert nanoseconds to milliseconds
+                            return Some(read_clat_mean / 1_000_000.0);
+                        }
+                    }
+
+                    // Fall back to write latency if read is not available
+                    if let Some(write_clat_mean) = job["write"]["clat_ns"]["mean"].as_f64() {
+                        if write_clat_mean > 0.0 {
+                            return Some(write_clat_mean / 1_000_000.0);
+                        }
+                    }
+
+                    // Try older fio format (clat without _ns suffix, in usec)
+                    if let Some(read_clat_mean) = job["read"]["clat"]["mean"].as_f64() {
+                        if read_clat_mean > 0.0 {
+                            // Convert microseconds to milliseconds
+                            return Some(read_clat_mean / 1_000.0);
+                        }
+                    }
+
+                    if let Some(write_clat_mean) = job["write"]["clat"]["mean"].as_f64() {
+                        if write_clat_mean > 0.0 {
+                            return Some(write_clat_mean / 1_000.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: look for clat pattern in text output
     for line in logs.lines() {
-        if line.contains("THROUGHPUT_RESULT:") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            for (i, part) in parts.iter().enumerate() {
-                if *part == "THROUGHPUT_RESULT:" && i + 1 < parts.len() {
-                    if let Ok(throughput) = parts[i + 1].parse::<f64>() {
-                        return Ok(throughput);
+        // fio text output: "clat (usec): min=123, max=456, avg=234.56, stdev=12.34"
+        // or: "clat (nsec): min=123, max=456, avg=234.56, stdev=12.34"
+        if line.contains("clat") && line.contains("avg=") {
+            let is_nsec = line.contains("nsec");
+            let is_usec = line.contains("usec");
+            let is_msec = line.contains("msec");
+
+            if let Some(avg_start) = line.find("avg=") {
+                let avg_part = &line[avg_start + 4..];
+                let avg_end = avg_part.find(',').unwrap_or(avg_part.len());
+                let avg_str = &avg_part[..avg_end].trim();
+
+                if let Ok(avg) = avg_str.parse::<f64>() {
+                    if is_nsec {
+                        return Some(avg / 1_000_000.0); // ns to ms
+                    } else if is_usec {
+                        return Some(avg / 1_000.0); // us to ms
+                    } else if is_msec {
+                        return Some(avg); // already ms
                     }
                 }
             }
         }
     }
 
-    // Fallback parsing based on scenario
-    match scenario {
-        StorageTestScenario::SequentialIO => {
-            // Parse dd output for throughput (MB/s)
-            for line in logs.lines().rev() {
-                if line.contains("MB/s") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    for (i, part) in parts.iter().enumerate() {
-                        if part.contains("MB/s") && i > 0 {
-                            if let Ok(throughput) = parts[i - 1].parse::<f64>() {
-                                return Ok(throughput);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        StorageTestScenario::RandomIO => {
-            // Parse FIO JSON output
-            let json_start = logs.find('{');
-            let json_end = logs.rfind('}');
-
-            if let (Some(start), Some(end)) = (json_start, json_end) {
-                let json_str = &logs[start..=end];
-                if let Ok(fio_result) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    if let Some(jobs) = fio_result["jobs"].as_array() {
-                        if let Some(job) = jobs.first() {
-                            // Try read bandwidth first
-                            if let Some(read_bw) = job["read"]["bw"].as_f64() {
-                                if read_bw > 0.0 {
-                                    return Ok(read_bw / 1024.0); // Convert KB/s to MB/s
-                                }
-                            }
-                            // Then write bandwidth
-                            if let Some(write_bw) = job["write"]["bw"].as_f64() {
-                                if write_bw > 0.0 {
-                                    return Ok(write_bw / 1024.0);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Fallback: look for bw= pattern
-            for line in logs.lines() {
-                if line.contains("bw=") && line.contains("KB/s") {
-                    if let Some(bw_start) = line.find("bw=") {
-                        let bw_part = &line[bw_start + 3..];
-                        if let Some(kb_pos) = bw_part.find("KB/s") {
-                            let bw_str = &bw_part[..kb_pos];
-                            if let Ok(bw) = bw_str.parse::<f64>() {
-                                return Ok(bw / 1024.0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Err(anyhow::anyhow!(
-        "Could not parse storage throughput from logs"
-    ))
+    None
 }
 
 async fn cleanup_storage_pods(tenant: &TenantClusterConfig, pod_count: u32) -> Result<()> {

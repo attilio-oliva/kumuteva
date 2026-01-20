@@ -50,10 +50,12 @@ impl Default for FairnessTestConfig {
 /// Metrics collected from a single tenant during a test phase
 #[derive(Debug, Clone)]
 pub struct TenantMetrics {
-    /// Primary performance metric (latency in ms, throughput in Mbps, etc.)
-    pub primary_metric: f64,
-    /// Optional secondary metrics for detailed analysis
-    pub secondary_metrics: Vec<(String, f64)>,
+    /// Average operation latency in milliseconds
+    pub avg_latency_ms: f64,
+    /// Standard deviation of latency in milliseconds
+    pub std_deviation_ms: f64,
+    /// Total number of operations performed
+    pub total_operations: u64,
     /// Error rate as a percentage (0.0 - 100.0)
     pub error_rate: f64,
 }
@@ -72,46 +74,33 @@ pub struct PhaseResults {
 pub struct FairnessResult {
     /// Name of the subsystem tested
     pub subsystem: String,
-    /// Unit of the primary metric (e.g., "ms", "Mbps", "IOPS")
-    pub metric_unit: String,
-    /// Whether higher metric values are better (true for throughput, false for latency)
-    pub higher_is_better: bool,
     /// Results from the baseline phase
     pub baseline: PhaseResults,
     /// Results from the unbalanced phase
     pub unbalanced: PhaseResults,
-    /// Performance fairness as degradation ratio for the regular tenant
-    /// 0.0 = perfect fairness, higher = worse fairness
-    pub performance_fairness_degradation: f64,
+    /// Performance fairness as latency degradation ratio for the regular tenant
+    /// 0.0 = perfect fairness (no latency increase), higher = worse fairness
+    pub latency_degradation: f64,
     /// Optional detailed description
     pub details: Option<String>,
 }
 
 impl FairnessResult {
-    /// Calculate performance fairness from baseline and unbalanced metrics
+    /// Calculate latency degradation from baseline and unbalanced metrics
     /// Returns the degradation ratio (0.0 = perfect fairness)
-    pub fn calculate_degradation(baseline: f64, unbalanced: f64, higher_is_better: bool) -> f64 {
-        if baseline == 0.0 {
+    ///
+    /// Formula: (unbalanced_latency - baseline_latency) / baseline_latency
+    /// Positive means latency increased (worse), negative means improved
+    pub fn calculate_latency_degradation(baseline_latency_ms: f64, unbalanced_latency_ms: f64) -> f64 {
+        if baseline_latency_ms == 0.0 {
             return 0.0;
         }
-
-        let degradation = if higher_is_better {
-            // For throughput: degradation = (baseline - unbalanced) / baseline
-            // Positive means worse performance
-            (baseline - unbalanced) / baseline
-        } else {
-            // For latency: degradation = (unbalanced - baseline) / baseline
-            // Positive means higher latency (worse)
-            (unbalanced - baseline) / baseline
-        };
-
-        // Clamp to reasonable range (can be negative if performance improved)
-        degradation.max(-1.0)
+        (unbalanced_latency_ms - baseline_latency_ms) / baseline_latency_ms
     }
 
     /// Returns a qualitative assessment of the fairness level
     pub fn fairness_level(&self) -> FairnessLevel {
-        let deg = self.performance_fairness_degradation;
+        let deg = self.latency_degradation;
         if deg <= 0.05 {
             FairnessLevel::Excellent
         } else if deg <= 0.15 {
@@ -170,43 +159,45 @@ impl Display for FairnessResult {
         writeln!(f, "\n{}", "Baseline Phase:".bold())?;
         writeln!(
             f,
-            "  Tenant 1: {:.2} {} (error rate: {:.1}%)",
-            self.baseline.tenant1.primary_metric,
-            self.metric_unit,
+            "  Tenant 1: {:.2} ms ± {:.2} ms ({} ops, {:.1}% errors)",
+            self.baseline.tenant1.avg_latency_ms,
+            self.baseline.tenant1.std_deviation_ms,
+            self.baseline.tenant1.total_operations,
             self.baseline.tenant1.error_rate
         )?;
         writeln!(
             f,
-            "  Tenant 2: {:.2} {} (error rate: {:.1}%)",
-            self.baseline.tenant2.primary_metric,
-            self.metric_unit,
+            "  Tenant 2: {:.2} ms ± {:.2} ms ({} ops, {:.1}% errors)",
+            self.baseline.tenant2.avg_latency_ms,
+            self.baseline.tenant2.std_deviation_ms,
+            self.baseline.tenant2.total_operations,
             self.baseline.tenant2.error_rate
         )?;
 
         writeln!(f, "\n{}", "Unbalanced Phase:".bold())?;
         writeln!(
             f,
-            "  Regular Tenant:   {:.2} {} (error rate: {:.1}%)",
-            self.unbalanced.tenant1.primary_metric,
-            self.metric_unit,
+            "  Regular:   {:.2} ms ± {:.2} ms ({} ops, {:.1}% errors)",
+            self.unbalanced.tenant1.avg_latency_ms,
+            self.unbalanced.tenant1.std_deviation_ms,
+            self.unbalanced.tenant1.total_operations,
             self.unbalanced.tenant1.error_rate
         )?;
         writeln!(
             f,
-            "  Malicious Tenant: {:.2} {} (error rate: {:.1}%)",
-            self.unbalanced.tenant2.primary_metric,
-            self.metric_unit,
+            "  Malicious: {:.2} ms ± {:.2} ms ({} ops, {:.1}% errors)",
+            self.unbalanced.tenant2.avg_latency_ms,
+            self.unbalanced.tenant2.std_deviation_ms,
+            self.unbalanced.tenant2.total_operations,
             self.unbalanced.tenant2.error_rate
         )?;
 
-        writeln!(f, "\n{}", "Performance Fairness:".bold())?;
-        let deg_str = if self.performance_fairness_degradation >= 0.0 {
-            format!("{:.2} degradation", self.performance_fairness_degradation)
+        writeln!(f, "\n{}", "Latency Fairness:".bold())?;
+        let deg_pct = self.latency_degradation * 100.0;
+        let deg_str = if self.latency_degradation >= 0.0 {
+            format!("+{:.1}% latency increase", deg_pct)
         } else {
-            format!(
-                "{:.2} improvement",
-                self.performance_fairness_degradation.abs()
-            )
+            format!("{:.1}% latency decrease", deg_pct)
         };
         writeln!(f, "  {} - {} ({})", level_icon, level, deg_str)?;
 
@@ -225,22 +216,19 @@ impl Display for FairnessResult {
 
 /// Trait for subsystem-specific fairness assessors
 ///
+/// All assessors measure operation latency as the primary metric.
 /// Implementors provide the subsystem-specific logic for:
 /// - Running baseline measurements with equal load on both tenants
 /// - Running unbalanced measurements with increased load on tenant2
-/// - Parsing and interpreting benchmark results
+/// - Measuring and reporting operation latencies
 #[async_trait]
 pub trait FairnessAssessor: Send + Sync {
     /// Name of the subsystem being assessed
     fn name(&self) -> &'static str;
 
-    /// Unit of the primary metric (e.g., "ms", "Mbps", "IOPS")
-    fn metric_unit(&self) -> &'static str;
-
-    /// Whether higher metric values indicate better performance
-    /// - `true` for throughput-based metrics (bandwidth, IOPS)
-    /// - `false` for latency-based metrics (response time)
-    fn higher_is_better(&self) -> bool;
+    /// Description of what operation latency is being measured
+    /// (e.g., "API request latency", "I/O operation latency", "Network RTT")
+    fn operation_description(&self) -> &'static str;
 
     /// Run baseline phase with both tenants under equal, normal load
     ///
@@ -275,7 +263,7 @@ pub trait FairnessAssessor: Send + Sync {
 /// 1. Baseline phase: Both tenants under equal load
 /// 2. Unbalanced phase: Tenant2 under heavy load, tenant1 normal
 ///
-/// Returns a `FairnessResult` with the calculated performance fairness degradation.
+/// Returns a `FairnessResult` with the calculated latency degradation.
 pub async fn run_fairness_assessment<A: FairnessAssessor>(
     assessor: &A,
     tenant1: Arc<TenantClusterConfig>,
@@ -283,9 +271,10 @@ pub async fn run_fairness_assessment<A: FairnessAssessor>(
     config: &FairnessTestConfig,
 ) -> Result<FairnessResult> {
     println!(
-        "\n{} Running {} fairness assessment...",
+        "\n{} Running {} fairness assessment ({})...",
         "▶".blue(),
-        assessor.name()
+        assessor.name(),
+        assessor.operation_description()
     );
 
     // Phase 1: Baseline measurement
@@ -299,11 +288,9 @@ pub async fn run_fairness_assessment<A: FairnessAssessor>(
         .await?;
 
     println!(
-        "    Tenant 1: {:.2} {}, Tenant 2: {:.2} {}",
-        baseline.tenant1.primary_metric,
-        assessor.metric_unit(),
-        baseline.tenant2.primary_metric,
-        assessor.metric_unit()
+        "    Tenant 1: {:.2} ms, Tenant 2: {:.2} ms",
+        baseline.tenant1.avg_latency_ms,
+        baseline.tenant2.avg_latency_ms
     );
 
     // Phase 2: Unbalanced measurement
@@ -316,34 +303,29 @@ pub async fn run_fairness_assessment<A: FairnessAssessor>(
     let unbalanced = assessor.run_unbalanced(tenant1, tenant2, config).await?;
 
     println!(
-        "    Regular: {:.2} {}, Malicious: {:.2} {}",
-        unbalanced.tenant1.primary_metric,
-        assessor.metric_unit(),
-        unbalanced.tenant2.primary_metric,
-        assessor.metric_unit()
+        "    Regular: {:.2} ms, Malicious: {:.2} ms",
+        unbalanced.tenant1.avg_latency_ms,
+        unbalanced.tenant2.avg_latency_ms
     );
 
-    // Calculate performance fairness degradation
-    let degradation = FairnessResult::calculate_degradation(
-        baseline.tenant1.primary_metric,
-        unbalanced.tenant1.primary_metric,
-        assessor.higher_is_better(),
+    // Calculate latency degradation for regular tenant
+    let degradation = FairnessResult::calculate_latency_degradation(
+        baseline.tenant1.avg_latency_ms,
+        unbalanced.tenant1.avg_latency_ms,
     );
 
     let result = FairnessResult {
         subsystem: assessor.name().to_string(),
-        metric_unit: assessor.metric_unit().to_string(),
-        higher_is_better: assessor.higher_is_better(),
         baseline,
         unbalanced,
-        performance_fairness_degradation: degradation,
+        latency_degradation: degradation,
         details: None,
     };
 
     println!(
-        "  {} Performance fairness: {:.2} degradation ({})",
+        "  {} Latency fairness: {:.1}% degradation ({})",
         "✓".green(),
-        degradation,
+        degradation * 100.0,
         result.fairness_level()
     );
 
@@ -363,7 +345,7 @@ pub struct FairnessReport {
 }
 
 impl FairnessReport {
-    /// Calculate the overall performance fairness as average degradation
+    /// Calculate the overall latency fairness as average degradation
     pub fn overall_degradation(&self) -> Option<f64> {
         let results: Vec<f64> = [
             self.control_plane.as_ref(),
@@ -371,7 +353,7 @@ impl FairnessReport {
             self.storage.as_ref(),
         ]
         .iter()
-        .filter_map(|r| r.map(|res| res.performance_fairness_degradation))
+        .filter_map(|r| r.map(|res| res.latency_degradation))
         .collect();
 
         if results.is_empty() {
@@ -391,8 +373,8 @@ impl FairnessReport {
         .iter()
         .filter_map(|r| *r)
         .max_by(|a, b| {
-            a.performance_fairness_degradation
-                .partial_cmp(&b.performance_fairness_degradation)
+            a.latency_degradation
+                .partial_cmp(&b.latency_degradation)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
     }
@@ -420,13 +402,13 @@ impl Display for FairnessReport {
             writeln!(f, "\n{}", "═".repeat(50))?;
             writeln!(f, "{}", "OVERALL SUMMARY".bold())?;
             writeln!(f, "{}", "─".repeat(50))?;
-            writeln!(f, "Average Performance Degradation: {:.2}", overall)?;
+            writeln!(f, "Average Latency Degradation: {:.1}%", overall * 100.0)?;
 
             if let Some(worst) = self.worst_fairness() {
                 writeln!(
                     f,
-                    "Worst Subsystem: {} ({:.2} degradation)",
-                    worst.subsystem, worst.performance_fairness_degradation
+                    "Worst Subsystem: {} ({:.1}% degradation)",
+                    worst.subsystem, worst.latency_degradation * 100.0
                 )?;
             }
         } else {

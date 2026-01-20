@@ -277,15 +277,15 @@ async fn main() -> anyhow::Result<()> {
             let config = FairnessTestConfig::default();
 
             // Control Plane
-            let cp_assessor =
-                ControlPlaneFairnessAssessor::new(ControlPlaneFairnessConfig::default());
-            let cp_result = run_fairness_assessment(
-                &cp_assessor,
-                tenant1_config.clone(),
-                tenant2_config.clone(),
-                &config,
-            )
-            .await?;
+            // let cp_assessor =
+            //     ControlPlaneFairnessAssessor::new(ControlPlaneFairnessConfig::default());
+            // let cp_result = run_fairness_assessment(
+            //     &cp_assessor,
+            //     tenant1_config.clone(),
+            //     tenant2_config.clone(),
+            //     &config,
+            // )
+            // .await?;
 
             // Network
             let net_assessor = NetworkFairnessAssessor::new(NetworkFairnessConfig::default());
@@ -298,27 +298,27 @@ async fn main() -> anyhow::Result<()> {
             .await?;
 
             // Storage
-            let storage_assessor = StorageFairnessAssessor::new(StorageFairnessConfig::default());
-            let storage_result = run_fairness_assessment(
-                &storage_assessor,
-                tenant1_config.clone(),
-                tenant2_config.clone(),
-                &config,
-            )
-            .await?;
+            // let storage_assessor = StorageFairnessAssessor::new(StorageFairnessConfig::default());
+            // let storage_result = run_fairness_assessment(
+            //     &storage_assessor,
+            //     tenant1_config.clone(),
+            //     tenant2_config.clone(),
+            //     &config,
+            // )
+            // .await?;
 
+            // println!(
+            //     "Control Plane degradation: {:.1}%",
+            //     cp_result.latency_degradation * 100.0
+            // );
             println!(
-                "Control Plane degradation: {:.1}",
-                cp_result.performance_fairness_degradation
+                "Network degradation: {:.1}%",
+                net_result.latency_degradation * 100.0
             );
-            println!(
-                "Network degradation: {:.1}",
-                net_result.performance_fairness_degradation
-            );
-            println!(
-                "Storage degradation: {:.1}",
-                storage_result.performance_fairness_degradation
-            );
+            // println!(
+            //     "Storage degradation: {:.1}%",
+            //     storage_result.latency_degradation * 100.0
+            // );
             // let report =
             //     assessment::assess_multitenancy(tenant1_config.clone(), tenant2_config.clone())
             //         .await

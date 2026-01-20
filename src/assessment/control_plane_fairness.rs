@@ -144,31 +144,15 @@ impl ControlPlaneFairnessAssessor {
 
         Ok(PhaseResults {
             tenant1: TenantMetrics {
-                primary_metric: metrics_t1.average_duration.as_secs_f64() * 1000.0, // Convert to ms
-                secondary_metrics: vec![
-                    (
-                        "std_deviation_ms".to_string(),
-                        metrics_t1.std_deviation.as_secs_f64() * 1000.0,
-                    ),
-                    (
-                        "total_requests".to_string(),
-                        metrics_t1.total_requests as f64,
-                    ),
-                ],
+                avg_latency_ms: metrics_t1.average_duration.as_secs_f64() * 1000.0, // Convert to ms
+                std_deviation_ms: metrics_t1.std_deviation.as_secs_f64() * 1000.0,
+                total_operations: metrics_t1.total_requests as u64,
                 error_rate: metrics_t1.error_rate * 100.0,
             },
             tenant2: TenantMetrics {
-                primary_metric: metrics_t2.average_duration.as_secs_f64() * 1000.0,
-                secondary_metrics: vec![
-                    (
-                        "std_deviation_ms".to_string(),
-                        metrics_t2.std_deviation.as_secs_f64() * 1000.0,
-                    ),
-                    (
-                        "total_requests".to_string(),
-                        metrics_t2.total_requests as f64,
-                    ),
-                ],
+                avg_latency_ms: metrics_t2.average_duration.as_secs_f64() * 1000.0,
+                std_deviation_ms: metrics_t2.std_deviation.as_secs_f64() * 1000.0,
+                total_operations: metrics_t2.total_requests as u64,
                 error_rate: metrics_t2.error_rate * 100.0,
             },
         })
@@ -181,12 +165,8 @@ impl FairnessAssessor for ControlPlaneFairnessAssessor {
         "Control Plane"
     }
 
-    fn metric_unit(&self) -> &'static str {
-        "ms"
-    }
-
-    fn higher_is_better(&self) -> bool {
-        false // Lower latency is better
+    fn operation_description(&self) -> &'static str {
+        "API request latency"
     }
 
     async fn run_baseline(
