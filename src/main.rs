@@ -18,6 +18,11 @@ use kube::{api::ListParams, Api, Client};
 use tracing::Level;
 use verifier::TenantClusterConfig;
 
+use crate::assessment::{
+    run_fairness_assessment, ControlPlaneFairnessAssessor, ControlPlaneFairnessConfig,
+    FairnessTestConfig, NetworkFairnessAssessor, NetworkFairnessConfig, StorageFairnessAssessor,
+    StorageFairnessConfig,
+};
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
 use crate::verifier::{
     ControlPlaneMultitenancyReport, NetworkFairnessTestConfig, NetworkFairnessTestResults,
@@ -268,15 +273,61 @@ async fn main() -> anyhow::Result<()> {
             let tenant1_config = Arc::new(tenant1_config);
             let tenant2_config = Arc::new(tenant2_config);
 
-            let report =
-                assessment::assess_multitenancy(tenant1_config.clone(), tenant2_config.clone())
-                    .await
-                    .context("Failed to run multitenancy assessment")?;
-            println!("{}", report.control_plane);
-            println!("{}", report.storage);
-            println!("{}", report.network);
-            println!("{}", report.workload);
-            println!("Multitenancy assessment report:\n{}", report);
+            // Common config
+            let config = FairnessTestConfig::default();
+
+            // Control Plane
+            let cp_assessor =
+                ControlPlaneFairnessAssessor::new(ControlPlaneFairnessConfig::default());
+            let cp_result = run_fairness_assessment(
+                &cp_assessor,
+                tenant1_config.clone(),
+                tenant2_config.clone(),
+                &config,
+            )
+            .await?;
+
+            // Network
+            let net_assessor = NetworkFairnessAssessor::new(NetworkFairnessConfig::default());
+            let net_result = run_fairness_assessment(
+                &net_assessor,
+                tenant1_config.clone(),
+                tenant2_config.clone(),
+                &config,
+            )
+            .await?;
+
+            // Storage
+            let storage_assessor = StorageFairnessAssessor::new(StorageFairnessConfig::default());
+            let storage_result = run_fairness_assessment(
+                &storage_assessor,
+                tenant1_config.clone(),
+                tenant2_config.clone(),
+                &config,
+            )
+            .await?;
+
+            println!(
+                "Control Plane degradation: {:.1}",
+                cp_result.performance_fairness_degradation
+            );
+            println!(
+                "Network degradation: {:.1}",
+                net_result.performance_fairness_degradation
+            );
+            println!(
+                "Storage degradation: {:.1}",
+                storage_result.performance_fairness_degradation
+            );
+            // let report =
+            //     assessment::assess_multitenancy(tenant1_config.clone(), tenant2_config.clone())
+            //         .await
+            //         .context("Failed to run multitenancy assessment")?;
+            // println!("{}", report.control_plane);
+            // println!("{}", report.storage);
+            // println!("{}", report.network);
+            // println!("{}", report.workload);
+            // println!("Multitenancy assessment report:\n{}", report);
 
             // let assessment = assessment::ControlPlaneAssessor {};
             // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)

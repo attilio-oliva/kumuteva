@@ -1,16 +1,23 @@
 mod control_plane;
+mod control_plane_fairness;
+mod fairness;
 mod network;
+mod network_fairness;
 mod storage;
+mod storage_fairness;
 mod workload;
 
 pub use control_plane::*;
-
+pub use control_plane_fairness::*;
+pub use fairness::*;
 pub use network::*;
+pub use network_fairness::*;
 pub use storage::*;
+pub use storage_fairness::*;
 pub use workload::*;
 
-use tabled::settings::object::{Columns, Rows};
-use tabled::settings::{Alignment, Border, Modify, Span, Style};
+use tabled::settings::object::Rows;
+use tabled::settings::{Alignment, Modify, Style};
 use tabled::{Table, Tabled};
 
 use std::collections::HashMap;
@@ -37,16 +44,6 @@ pub enum IsolationLevel {
     /// Hard isolation - operation fails as if system were single-tenant
     /// (e.g., NotFound error because resource doesn't exist in intruder's scope)
     Hard,
-}
-
-impl IsolationLevel {
-    pub fn is_isolated(&self) -> bool {
-        !matches!(self, IsolationLevel::None)
-    }
-
-    pub fn is_hard(&self) -> bool {
-        matches!(self, IsolationLevel::Hard)
-    }
 }
 
 impl PartialOrd for IsolationLevel {
@@ -114,10 +111,6 @@ pub struct AutonomyRatio {
 }
 
 impl AutonomyRatio {
-    pub fn new(allowed: usize, total: usize) -> Self {
-        Self { allowed, total }
-    }
-
     pub fn add(&mut self, other: &Self) {
         self.allowed += other.allowed;
         self.total += other.total;
@@ -278,9 +271,6 @@ pub async fn run_assessment<A: MultitenancyAssessor>(
 
             ops_map.insert(operation, assessment);
         }
-
-        // Determine overall autonomy for resource: all operations have Full autonomy
-        let is_autonomous = ops_map.values().all(|a| a.autonomy);
 
         // Determine isolation
         let overall_isolation = compute_overall_isolation_level(
@@ -691,7 +681,7 @@ fn format_ratio_with_icon(ratio: &AutonomyRatio) -> String {
 fn format_isolation(level: &IsolationLevel) -> String {
     match level {
         IsolationLevel::Hard => "✅ Hard".to_string(),
-        IsolationLevel::Soft(_reason) => format!("🟠 Soft"),
+        IsolationLevel::Soft(_reason) => "🟠 Soft".to_string(),
         IsolationLevel::None => "❌ None".to_string(),
         IsolationLevel::Unknown => "❓ Unknown".to_string(),
     }
