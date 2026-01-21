@@ -19,9 +19,9 @@ use tracing::Level;
 use verifier::TenantClusterConfig;
 
 use crate::assessment::{
-    run_fairness_assessment, ControlPlaneFairnessAssessor, ControlPlaneFairnessConfig,
-    FairnessTestConfig, NetworkFairnessAssessor, NetworkFairnessConfig, StorageFairnessAssessor,
-    StorageFairnessConfig,
+    run_detailed_fairness_assessment, run_fairness_assessment, ControlPlaneFairnessAssessor,
+    ControlPlaneFairnessConfig, FairnessTestConfig, NetworkFairnessAssessor, NetworkFairnessConfig,
+    StorageFairnessAssessor, StorageFairnessConfig,
 };
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
 use crate::verifier::{
@@ -289,11 +289,13 @@ async fn main() -> anyhow::Result<()> {
 
             // Network
             let net_assessor = NetworkFairnessAssessor::new(NetworkFairnessConfig::default());
-            let net_result = run_fairness_assessment(
+            let net_result = run_detailed_fairness_assessment(
                 &net_assessor,
                 tenant1_config.clone(),
                 tenant2_config.clone(),
                 &config,
+                true,
+                Some("results/net"),
             )
             .await?;
 
@@ -313,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
             // );
             println!(
                 "Network degradation: {:.1}%",
-                net_result.latency_degradation * 100.0
+                net_result.result.latency_degradation * 100.0
             );
             // println!(
             //     "Storage degradation: {:.1}%",

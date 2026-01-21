@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 
 use crate::assessment::fairness::{
-    FairnessAssessor, FairnessTestConfig, PhaseResults, TenantMetrics,
+    DetailedFairnessAssessor, DetailedPhaseResults, FairnessAssessor, FairnessTestConfig,
+    MetricDataPoint, PhaseResults, TenantMetrics,
 };
 use crate::verifier::TenantClusterConfig;
 
@@ -59,6 +60,27 @@ impl NetworkFairnessAssessor {
         tenant1_pod_pairs: u32,
         tenant2_pod_pairs: u32,
     ) -> Result<PhaseResults> {
+        let detailed = self
+            .run_phase_detailed(
+                tenant1,
+                tenant2,
+                duration,
+                tenant1_pod_pairs,
+                tenant2_pod_pairs,
+            )
+            .await?;
+        Ok(detailed.into())
+    }
+
+    /// Run a test phase and return detailed results with raw data for CSV export
+    async fn run_phase_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        duration: Duration,
+        tenant1_pod_pairs: u32,
+        tenant2_pod_pairs: u32,
+    ) -> Result<DetailedPhaseResults> {
         let duration_secs = duration.as_secs();
 
         // Create iperf3 pod pairs for both tenants
@@ -74,31 +96,36 @@ impl NetworkFairnessAssessor {
         // Wait for completion
         wait_for_pods_completion(&tenant1, &tenant2, tenant1_pod_pairs, tenant2_pod_pairs).await?;
 
-        // Collect RTT results from iperf3 JSON output
-        let (tenant1_rtts, tenant2_rtts) =
-            collect_rtt_results(&tenant1, &tenant2, tenant1_pod_pairs, tenant2_pod_pairs).await?;
+        // Collect RTT results from iperf3 JSON output (with raw data)
+        let (tenant1_raw, tenant2_raw) =
+            collect_rtt_results_detailed(&tenant1, &tenant2, tenant1_pod_pairs, tenant2_pod_pairs)
+                .await?;
 
         // Cleanup all pods
         cleanup_pods(&tenant1, tenant1_pod_pairs).await?;
         cleanup_pods(&tenant2, tenant2_pod_pairs).await?;
 
-        // Calculate statistics
-        let (t1_avg, t1_std, t1_count) = calculate_stats(&tenant1_rtts);
-        let (t2_avg, t2_std, t2_count) = calculate_stats(&tenant2_rtts);
+        // Calculate statistics from raw data
+        let (t1_avg, t1_std, t1_count) =
+            calculate_stats(&tenant1_raw.iter().map(|p| p.latency_ms).collect::<Vec<_>>());
+        let (t2_avg, t2_std, t2_count) =
+            calculate_stats(&tenant2_raw.iter().map(|p| p.latency_ms).collect::<Vec<_>>());
 
-        Ok(PhaseResults {
+        Ok(DetailedPhaseResults {
             tenant1: TenantMetrics {
                 avg_latency_ms: t1_avg,
                 std_deviation_ms: t1_std,
                 total_operations: t1_count,
-                error_rate: if tenant1_rtts.is_empty() { 100.0 } else { 0.0 },
+                error_rate: if tenant1_raw.is_empty() { 100.0 } else { 0.0 },
             },
             tenant2: TenantMetrics {
                 avg_latency_ms: t2_avg,
                 std_deviation_ms: t2_std,
                 total_operations: t2_count,
-                error_rate: if tenant2_rtts.is_empty() { 100.0 } else { 0.0 },
+                error_rate: if tenant2_raw.is_empty() { 100.0 } else { 0.0 },
             },
+            tenant1_raw,
+            tenant2_raw,
         })
     }
 }
@@ -141,6 +168,44 @@ impl FairnessAssessor for NetworkFairnessAssessor {
             (self.config.pod_pairs_per_tenant as f64 * config.malicious_load_multiplier) as u32;
 
         self.run_phase(
+            tenant1,
+            tenant2,
+            config.test_duration,
+            self.config.pod_pairs_per_tenant,
+            malicious_pod_pairs.max(1),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl DetailedFairnessAssessor for NetworkFairnessAssessor {
+    async fn run_baseline_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        config: &FairnessTestConfig,
+    ) -> Result<DetailedPhaseResults> {
+        self.run_phase_detailed(
+            tenant1,
+            tenant2,
+            config.baseline_duration,
+            self.config.pod_pairs_per_tenant,
+            self.config.pod_pairs_per_tenant,
+        )
+        .await
+    }
+
+    async fn run_unbalanced_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        config: &FairnessTestConfig,
+    ) -> Result<DetailedPhaseResults> {
+        let malicious_pod_pairs =
+            (self.config.pod_pairs_per_tenant as f64 * config.malicious_load_multiplier) as u32;
+
+        self.run_phase_detailed(
             tenant1,
             tenant2,
             config.test_duration,
@@ -365,8 +430,23 @@ async fn collect_rtt_results(
     tenant1_pod_pairs: u32,
     tenant2_pod_pairs: u32,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
-    let mut tenant1_rtts = Vec::new();
-    let mut tenant2_rtts = Vec::new();
+    let (t1_raw, t2_raw) =
+        collect_rtt_results_detailed(tenant1, tenant2, tenant1_pod_pairs, tenant2_pod_pairs)
+            .await?;
+    Ok((
+        t1_raw.iter().map(|p| p.latency_ms).collect(),
+        t2_raw.iter().map(|p| p.latency_ms).collect(),
+    ))
+}
+
+async fn collect_rtt_results_detailed(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    tenant1_pod_pairs: u32,
+    tenant2_pod_pairs: u32,
+) -> Result<(Vec<MetricDataPoint>, Vec<MetricDataPoint>)> {
+    let mut tenant1_data = Vec::new();
+    let mut tenant2_data = Vec::new();
 
     // Collect from tenant1 client pods
     for i in 0..tenant1_pod_pairs {
@@ -376,8 +456,8 @@ async fn collect_rtt_results(
             .get_pod_logs(&pod_name, &tenant1.namespace)
             .await?;
 
-        if let Some(rtt) = parse_iperf3_rtt(&logs) {
-            tenant1_rtts.push(rtt);
+        if let Some(rtt_data) = parse_iperf3_rtt_detailed(&logs, i) {
+            tenant1_data.extend(rtt_data);
         }
     }
 
@@ -389,12 +469,12 @@ async fn collect_rtt_results(
             .get_pod_logs(&pod_name, &tenant2.namespace)
             .await?;
 
-        if let Some(rtt) = parse_iperf3_rtt(&logs) {
-            tenant2_rtts.push(rtt);
+        if let Some(rtt_data) = parse_iperf3_rtt_detailed(&logs, i) {
+            tenant2_data.extend(rtt_data);
         }
     }
 
-    Ok((tenant1_rtts, tenant2_rtts))
+    Ok((tenant1_data, tenant2_data))
 }
 
 fn parse_iperf3_rtt(logs: &str) -> Option<f64> {
@@ -438,6 +518,63 @@ fn parse_iperf3_rtt(logs: &str) -> Option<f64> {
                 if mean_rtt > 0.0 {
                     return Some(mean_rtt / 1000.0);
                 }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_iperf3_rtt_detailed(logs: &str, pod_index: u32) -> Option<Vec<MetricDataPoint>> {
+    // Parse iperf3 JSON output to extract interval RTT data for CSV export
+    // JSON structure includes intervals array with per-second measurements
+
+    let json_start = logs.find('{');
+    let json_end = logs.rfind('}');
+
+    if let (Some(start), Some(end)) = (json_start, json_end) {
+        let json_str = &logs[start..=end];
+        if let Ok(iperf_result) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let mut data_points = Vec::new();
+
+            // Try to extract interval data for per-second measurements
+            if let Some(intervals) = iperf_result["intervals"].as_array() {
+                for (idx, interval) in intervals.iter().enumerate() {
+                    // Get timestamp from interval
+                    let timestamp = interval["sum"]["start"].as_f64().unwrap_or(idx as f64);
+
+                    // Try to get RTT from streams in this interval
+                    if let Some(streams) = interval["streams"].as_array() {
+                        for stream in streams {
+                            if let Some(rtt) = stream["rtt"].as_f64() {
+                                if rtt > 0.0 {
+                                    data_points.push(MetricDataPoint {
+                                        timestamp_secs: timestamp,
+                                        latency_ms: rtt / 1000.0, // microseconds to ms
+                                        is_error: false,
+                                        operation: Some(format!("iperf3-pod-{}", pod_index)),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If no interval data, fall back to summary mean_rtt
+            if data_points.is_empty() {
+                if let Some(mean_rtt) = parse_iperf3_rtt(logs) {
+                    data_points.push(MetricDataPoint {
+                        timestamp_secs: 0.0,
+                        latency_ms: mean_rtt,
+                        is_error: false,
+                        operation: Some(format!("iperf3-pod-{}-summary", pod_index)),
+                    });
+                }
+            }
+
+            if !data_points.is_empty() {
+                return Some(data_points);
             }
         }
     }

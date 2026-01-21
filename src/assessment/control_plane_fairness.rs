@@ -20,7 +20,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::assessment::fairness::{
-    FairnessAssessor, FairnessTestConfig, PhaseResults, TenantMetrics,
+    DetailedFairnessAssessor, DetailedPhaseResults, FairnessAssessor, FairnessTestConfig,
+    MetricDataPoint, PhaseResults, TenantMetrics,
 };
 use crate::verifier::TenantClusterConfig;
 
@@ -99,6 +100,32 @@ impl ControlPlaneFairnessAssessor {
         tenant2_requesters: usize,
         tenant2_rate: f64,
     ) -> Result<PhaseResults> {
+        let detailed = self
+            .run_phase_detailed(
+                tenant1,
+                tenant2,
+                duration,
+                tenant1_requesters,
+                tenant1_rate,
+                tenant2_requesters,
+                tenant2_rate,
+            )
+            .await?;
+        Ok(detailed.into())
+    }
+
+    /// Run a test phase and return detailed results with raw data for CSV export
+    #[allow(clippy::too_many_arguments)]
+    async fn run_phase_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        duration: Duration,
+        tenant1_requesters: usize,
+        tenant1_rate: f64,
+        tenant2_requesters: usize,
+        tenant2_rate: f64,
+    ) -> Result<DetailedPhaseResults> {
         let scenario = Self::create_scenario();
 
         // Create initiator pools for both tenants
@@ -133,18 +160,18 @@ impl ControlPlaneFairnessAssessor {
         let tenant2_overseer = Overseer::new(Role::Tenant2, tenant2_pool);
 
         // Run both tenants concurrently
-        let result_t1 = tenant1_overseer.run(tenant1.clone(), duration);
-        let result_t2 = tenant2_overseer.run(tenant2.clone(), duration);
+        let result_t1 = tenant1_overseer.run_detailed(tenant1.clone(), duration);
+        let result_t2 = tenant2_overseer.run_detailed(tenant2.clone(), duration);
 
-        let (metrics_t1, metrics_t2) = tokio::try_join!(result_t1, result_t2)?;
+        let ((metrics_t1, raw_t1), (metrics_t2, raw_t2)) = tokio::try_join!(result_t1, result_t2)?;
 
         // Cleanup resources
         let _ = cleanup(&tenant1).await;
         let _ = cleanup(&tenant2).await;
 
-        Ok(PhaseResults {
+        Ok(DetailedPhaseResults {
             tenant1: TenantMetrics {
-                avg_latency_ms: metrics_t1.average_duration.as_secs_f64() * 1000.0, // Convert to ms
+                avg_latency_ms: metrics_t1.average_duration.as_secs_f64() * 1000.0,
                 std_deviation_ms: metrics_t1.std_deviation.as_secs_f64() * 1000.0,
                 total_operations: metrics_t1.total_requests as u64,
                 error_rate: metrics_t1.error_rate * 100.0,
@@ -155,6 +182,8 @@ impl ControlPlaneFairnessAssessor {
                 total_operations: metrics_t2.total_requests as u64,
                 error_rate: metrics_t2.error_rate * 100.0,
             },
+            tenant1_raw: raw_t1,
+            tenant2_raw: raw_t2,
         })
     }
 }
@@ -206,6 +235,49 @@ impl FairnessAssessor for ControlPlaneFairnessAssessor {
             self.config.regular_requesters,
             self.config.regular_request_rate,
             malicious_requesters.max(1), // At least 1 requester
+            malicious_rate,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl DetailedFairnessAssessor for ControlPlaneFairnessAssessor {
+    async fn run_baseline_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        config: &FairnessTestConfig,
+    ) -> Result<DetailedPhaseResults> {
+        self.run_phase_detailed(
+            tenant1,
+            tenant2,
+            config.baseline_duration,
+            self.config.regular_requesters,
+            self.config.regular_request_rate,
+            self.config.regular_requesters,
+            self.config.regular_request_rate,
+        )
+        .await
+    }
+
+    async fn run_unbalanced_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        config: &FairnessTestConfig,
+    ) -> Result<DetailedPhaseResults> {
+        let malicious_requesters =
+            (self.config.regular_requesters as f64 * config.malicious_load_multiplier) as usize;
+        let malicious_rate = self.config.regular_request_rate * config.malicious_load_multiplier;
+
+        self.run_phase_detailed(
+            tenant1,
+            tenant2,
+            config.test_duration,
+            self.config.regular_requesters,
+            self.config.regular_request_rate,
+            malicious_requesters.max(1),
             malicious_rate,
         )
         .await
@@ -356,6 +428,15 @@ impl Overseer {
         tenant_config: Arc<TenantClusterConfig>,
         duration: Duration,
     ) -> Result<AverageMetrics> {
+        let (metrics, _raw) = self.run_detailed(tenant_config, duration).await?;
+        Ok(metrics)
+    }
+
+    async fn run_detailed(
+        &self,
+        tenant_config: Arc<TenantClusterConfig>,
+        duration: Duration,
+    ) -> Result<(AverageMetrics, Vec<MetricDataPoint>)> {
         let (metrics_tx, mut metrics_rx) = mpsc::channel(5);
         let (completion_tx, mut completion_rx) = mpsc::channel::<()>(self.pool.initiators.len());
         let initiator_count = self.pool.initiators.len();
@@ -416,16 +497,23 @@ impl Overseer {
 
         let tenant_metrics = metrics_collector.await?;
 
-        let metrics = tenant_metrics
+        let raw_metrics = tenant_metrics
             .get(&self.role.to_string())
-            .map(|m| AverageMetrics::calculate(m))
-            .unwrap_or_else(|| AverageMetrics {
-                average_duration: Duration::ZERO,
-                std_deviation: Duration::ZERO,
-                total_requests: 0,
-                error_count: 0,
-                error_rate: 0.0,
-            });
+            .cloned()
+            .unwrap_or_default();
+
+        let metrics = AverageMetrics::calculate(&raw_metrics);
+
+        // Convert raw metrics to MetricDataPoints for CSV export
+        let raw_data_points: Vec<MetricDataPoint> = raw_metrics
+            .iter()
+            .map(|m| MetricDataPoint {
+                timestamp_secs: m.start_time_seconds,
+                latency_ms: m.duration.as_secs_f64() * 1000.0,
+                is_error: m.is_error,
+                operation: Some(format!("{} {}", m.operation, m.request_type)),
+            })
+            .collect();
 
         println!(
             "    {} - Requests: {}, Avg: {:.2?}, StdDev: {:.2?}, Errors: {:.1}%",
@@ -436,7 +524,7 @@ impl Overseer {
             metrics.error_rate * 100.0
         );
 
-        Ok(metrics)
+        Ok((metrics, raw_data_points))
     }
 }
 

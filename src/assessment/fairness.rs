@@ -418,3 +418,351 @@ impl Display for FairnessReport {
         Ok(())
     }
 }
+
+// =============================================================================
+// CSV EXPORT DATA STRUCTURES
+// =============================================================================
+
+/// Raw metric data point for CSV export
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MetricDataPoint {
+    /// Timestamp relative to test start (seconds)
+    pub timestamp_secs: f64,
+    /// Latency of this operation in milliseconds
+    pub latency_ms: f64,
+    /// Whether this operation resulted in an error
+    pub is_error: bool,
+    /// Optional operation type description
+    pub operation: Option<String>,
+}
+
+/// Extended phase results that include raw data for CSV export
+#[derive(Debug, Clone)]
+pub struct DetailedPhaseResults {
+    /// Aggregated metrics for tenant 1
+    pub tenant1: TenantMetrics,
+    /// Aggregated metrics for tenant 2
+    pub tenant2: TenantMetrics,
+    /// Raw data points for tenant 1 (for CSV export)
+    pub tenant1_raw: Vec<MetricDataPoint>,
+    /// Raw data points for tenant 2 (for CSV export)
+    pub tenant2_raw: Vec<MetricDataPoint>,
+}
+
+impl From<DetailedPhaseResults> for PhaseResults {
+    fn from(detailed: DetailedPhaseResults) -> Self {
+        PhaseResults {
+            tenant1: detailed.tenant1,
+            tenant2: detailed.tenant2,
+        }
+    }
+}
+
+/// Extended fairness result with raw data for export
+#[derive(Debug, Clone)]
+pub struct DetailedFairnessResult {
+    /// The standard fairness result
+    pub result: FairnessResult,
+    /// Raw baseline data for CSV export (tenant1, tenant2)
+    pub baseline_raw: Option<(Vec<MetricDataPoint>, Vec<MetricDataPoint>)>,
+    /// Raw unbalanced data for CSV export (tenant1, tenant2)
+    pub unbalanced_raw: Option<(Vec<MetricDataPoint>, Vec<MetricDataPoint>)>,
+}
+
+// =============================================================================
+// DETAILED FAIRNESS ASSESSOR TRAIT
+// =============================================================================
+
+/// Extended trait for assessors that can provide raw data for CSV export
+#[async_trait]
+pub trait DetailedFairnessAssessor: FairnessAssessor {
+    /// Run baseline phase and return detailed results with raw data
+    async fn run_baseline_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        config: &FairnessTestConfig,
+    ) -> Result<DetailedPhaseResults>;
+
+    /// Run unbalanced phase and return detailed results with raw data
+    async fn run_unbalanced_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        config: &FairnessTestConfig,
+    ) -> Result<DetailedPhaseResults>;
+}
+
+// =============================================================================
+// DETAILED ASSESSMENT RUNNER WITH CSV EXPORT
+// =============================================================================
+
+/// Run a detailed fairness assessment with CSV export support
+pub async fn run_detailed_fairness_assessment<A: DetailedFairnessAssessor>(
+    assessor: &A,
+    tenant1: Arc<TenantClusterConfig>,
+    tenant2: Arc<TenantClusterConfig>,
+    config: &FairnessTestConfig,
+    export_csv: bool,
+    output_dir: Option<&str>,
+) -> Result<DetailedFairnessResult> {
+    println!(
+        "\n{} Running {} fairness assessment ({})...",
+        "▶".blue(),
+        assessor.name(),
+        assessor.operation_description()
+    );
+
+    // Phase 1: Baseline measurement
+    println!(
+        "  {} Phase 1: Baseline ({} seconds)...",
+        "→".dimmed(),
+        config.baseline_duration.as_secs()
+    );
+    let baseline_detailed = assessor
+        .run_baseline_detailed(tenant1.clone(), tenant2.clone(), config)
+        .await?;
+
+    println!(
+        "    Tenant 1: {:.2} ms ± {:.2} ms ({} ops)",
+        baseline_detailed.tenant1.avg_latency_ms,
+        baseline_detailed.tenant1.std_deviation_ms,
+        baseline_detailed.tenant1.total_operations
+    );
+    println!(
+        "    Tenant 2: {:.2} ms ± {:.2} ms ({} ops)",
+        baseline_detailed.tenant2.avg_latency_ms,
+        baseline_detailed.tenant2.std_deviation_ms,
+        baseline_detailed.tenant2.total_operations
+    );
+
+    // Phase 2: Unbalanced measurement
+    println!(
+        "  {} Phase 2: Unbalanced ({} seconds, {}x load on tenant2)...",
+        "→".dimmed(),
+        config.test_duration.as_secs(),
+        config.malicious_load_multiplier
+    );
+    let unbalanced_detailed = assessor
+        .run_unbalanced_detailed(tenant1, tenant2, config)
+        .await?;
+
+    println!(
+        "    Regular:   {:.2} ms ± {:.2} ms ({} ops, {:.1}% errors)",
+        unbalanced_detailed.tenant1.avg_latency_ms,
+        unbalanced_detailed.tenant1.std_deviation_ms,
+        unbalanced_detailed.tenant1.total_operations,
+        unbalanced_detailed.tenant1.error_rate
+    );
+    println!(
+        "    Malicious: {:.2} ms ± {:.2} ms ({} ops, {:.1}% errors)",
+        unbalanced_detailed.tenant2.avg_latency_ms,
+        unbalanced_detailed.tenant2.std_deviation_ms,
+        unbalanced_detailed.tenant2.total_operations,
+        unbalanced_detailed.tenant2.error_rate
+    );
+
+    // Calculate latency degradation for regular tenant
+    let latency_degradation = FairnessResult::calculate_latency_degradation(
+        baseline_detailed.tenant1.avg_latency_ms,
+        unbalanced_detailed.tenant1.avg_latency_ms,
+    );
+
+    let result = FairnessResult {
+        subsystem: assessor.name().to_string(),
+        baseline: PhaseResults {
+            tenant1: baseline_detailed.tenant1.clone(),
+            tenant2: baseline_detailed.tenant2.clone(),
+        },
+        unbalanced: PhaseResults {
+            tenant1: unbalanced_detailed.tenant1.clone(),
+            tenant2: unbalanced_detailed.tenant2.clone(),
+        },
+        latency_degradation,
+        details: None,
+    };
+
+    println!(
+        "  {} Latency fairness: {:+.1}% degradation ({})",
+        "✓".green(),
+        latency_degradation * 100.0,
+        result.fairness_level()
+    );
+
+    let detailed_result = DetailedFairnessResult {
+        result,
+        baseline_raw: Some((
+            baseline_detailed.tenant1_raw,
+            baseline_detailed.tenant2_raw,
+        )),
+        unbalanced_raw: Some((
+            unbalanced_detailed.tenant1_raw,
+            unbalanced_detailed.tenant2_raw,
+        )),
+    };
+
+    // Export CSV if requested
+    if export_csv {
+        let dir = output_dir.unwrap_or("fairness_results");
+        export_fairness_csv(&detailed_result, dir).await?;
+    }
+
+    Ok(detailed_result)
+}
+
+// =============================================================================
+// CSV EXPORT FUNCTIONALITY
+// =============================================================================
+
+/// Export fairness test results to CSV files
+pub async fn export_fairness_csv(result: &DetailedFairnessResult, output_dir: &str) -> Result<()> {
+    use tokio::fs;
+
+    // Create output directory if it doesn't exist
+    fs::create_dir_all(output_dir).await?;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let subsystem = result
+        .result
+        .subsystem
+        .to_lowercase()
+        .replace(' ', "_");
+
+    // Export baseline data if available
+    if let Some((tenant1_raw, tenant2_raw)) = &result.baseline_raw {
+        let baseline_t1_file = format!(
+            "{}/fairness_{}_baseline_tenant1_{}.csv",
+            output_dir, subsystem, timestamp
+        );
+        let baseline_t2_file = format!(
+            "{}/fairness_{}_baseline_tenant2_{}.csv",
+            output_dir, subsystem, timestamp
+        );
+
+        write_metrics_csv(&baseline_t1_file, tenant1_raw).await?;
+        write_metrics_csv(&baseline_t2_file, tenant2_raw).await?;
+
+        println!("    📁 Baseline CSV: {}", baseline_t1_file);
+        println!("    📁 Baseline CSV: {}", baseline_t2_file);
+    }
+
+    // Export unbalanced data if available
+    if let Some((tenant1_raw, tenant2_raw)) = &result.unbalanced_raw {
+        let unbalanced_t1_file = format!(
+            "{}/fairness_{}_unbalanced_regular_{}.csv",
+            output_dir, subsystem, timestamp
+        );
+        let unbalanced_t2_file = format!(
+            "{}/fairness_{}_unbalanced_malicious_{}.csv",
+            output_dir, subsystem, timestamp
+        );
+
+        write_metrics_csv(&unbalanced_t1_file, tenant1_raw).await?;
+        write_metrics_csv(&unbalanced_t2_file, tenant2_raw).await?;
+
+        println!("    📁 Unbalanced CSV: {}", unbalanced_t1_file);
+        println!("    📁 Unbalanced CSV: {}", unbalanced_t2_file);
+    }
+
+    // Export metadata as JSON
+    let metadata_file = format!(
+        "{}/fairness_{}_metadata_{}.json",
+        output_dir, subsystem, timestamp
+    );
+
+    let metadata = serde_json::json!({
+        "subsystem": result.result.subsystem,
+        "latency_degradation": result.result.latency_degradation,
+        "fairness_level": result.result.fairness_level().to_string(),
+        "baseline": {
+            "tenant1": {
+                "avg_latency_ms": result.result.baseline.tenant1.avg_latency_ms,
+                "std_deviation_ms": result.result.baseline.tenant1.std_deviation_ms,
+                "total_operations": result.result.baseline.tenant1.total_operations,
+                "error_rate": result.result.baseline.tenant1.error_rate
+            },
+            "tenant2": {
+                "avg_latency_ms": result.result.baseline.tenant2.avg_latency_ms,
+                "std_deviation_ms": result.result.baseline.tenant2.std_deviation_ms,
+                "total_operations": result.result.baseline.tenant2.total_operations,
+                "error_rate": result.result.baseline.tenant2.error_rate
+            }
+        },
+        "unbalanced": {
+            "regular": {
+                "avg_latency_ms": result.result.unbalanced.tenant1.avg_latency_ms,
+                "std_deviation_ms": result.result.unbalanced.tenant1.std_deviation_ms,
+                "total_operations": result.result.unbalanced.tenant1.total_operations,
+                "error_rate": result.result.unbalanced.tenant1.error_rate
+            },
+            "malicious": {
+                "avg_latency_ms": result.result.unbalanced.tenant2.avg_latency_ms,
+                "std_deviation_ms": result.result.unbalanced.tenant2.std_deviation_ms,
+                "total_operations": result.result.unbalanced.tenant2.total_operations,
+                "error_rate": result.result.unbalanced.tenant2.error_rate
+            }
+        }
+    });
+
+    fs::write(&metadata_file, serde_json::to_string_pretty(&metadata)?).await?;
+    println!("    📁 Metadata JSON: {}", metadata_file);
+
+    Ok(())
+}
+
+/// Helper function to write metric data points to a CSV file
+async fn write_metrics_csv(filename: &str, data: &[MetricDataPoint]) -> Result<()> {
+    use tokio::fs;
+
+    let mut csv_content = String::from("timestamp_secs,latency_ms,is_error,operation\n");
+
+    for point in data {
+        csv_content.push_str(&format!(
+            "{},{},{},{}\n",
+            point.timestamp_secs,
+            point.latency_ms,
+            point.is_error,
+            point.operation.as_deref().unwrap_or("")
+        ));
+    }
+
+    fs::write(filename, csv_content).await?;
+    Ok(())
+}
+
+/// Calculate TenantMetrics from raw data points
+pub fn calculate_tenant_metrics(data: &[MetricDataPoint]) -> TenantMetrics {
+    if data.is_empty() {
+        return TenantMetrics {
+            avg_latency_ms: 0.0,
+            std_deviation_ms: 0.0,
+            total_operations: 0,
+            error_rate: 0.0,
+        };
+    }
+
+    let total_operations = data.len() as u64;
+    let error_count = data.iter().filter(|p| p.is_error).count();
+    let error_rate = (error_count as f64 / total_operations as f64) * 100.0;
+
+    let latencies: Vec<f64> = data.iter().map(|p| p.latency_ms).collect();
+    let avg_latency_ms: f64 = latencies.iter().sum::<f64>() / latencies.len() as f64;
+
+    let variance: f64 = latencies
+        .iter()
+        .map(|l| (l - avg_latency_ms).powi(2))
+        .sum::<f64>()
+        / latencies.len() as f64;
+    let std_deviation_ms = variance.sqrt();
+
+    TenantMetrics {
+        avg_latency_ms,
+        std_deviation_ms,
+        total_operations,
+        error_rate,
+    }
+}

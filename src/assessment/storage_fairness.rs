@@ -16,7 +16,8 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 
 use crate::assessment::fairness::{
-    FairnessAssessor, FairnessTestConfig, PhaseResults, TenantMetrics,
+    DetailedFairnessAssessor, DetailedPhaseResults, FairnessAssessor, FairnessTestConfig,
+    MetricDataPoint, PhaseResults, TenantMetrics,
 };
 use crate::verifier::TenantClusterConfig;
 
@@ -76,6 +77,21 @@ impl StorageFairnessAssessor {
         tenant1_pods: u32,
         tenant2_pods: u32,
     ) -> Result<PhaseResults> {
+        let detailed = self
+            .run_phase_detailed(tenant1, tenant2, duration, tenant1_pods, tenant2_pods)
+            .await?;
+        Ok(detailed.into())
+    }
+
+    /// Run a test phase and return detailed results with raw data for CSV export
+    async fn run_phase_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        duration: Duration,
+        tenant1_pods: u32,
+        tenant2_pods: u32,
+    ) -> Result<DetailedPhaseResults> {
         let duration_secs = duration.as_secs();
 
         // Create benchmark pods for both tenants
@@ -94,39 +110,36 @@ impl StorageFairnessAssessor {
         // Wait for completion
         wait_for_storage_pods_completion(&tenant1, &tenant2, tenant1_pods, tenant2_pods).await?;
 
-        // Collect latency results
-        let (tenant1_latencies, tenant2_latencies) =
-            collect_storage_latency_results(&tenant1, &tenant2, tenant1_pods, tenant2_pods).await?;
+        // Collect latency results with raw data
+        let (tenant1_raw, tenant2_raw) =
+            collect_storage_latency_detailed(&tenant1, &tenant2, tenant1_pods, tenant2_pods)
+                .await?;
 
         // Cleanup
         cleanup_storage_pods(&tenant1, tenant1_pods).await?;
         cleanup_storage_pods(&tenant2, tenant2_pods).await?;
 
-        // Calculate statistics
-        let (t1_avg, t1_std, t1_count) = calculate_stats(&tenant1_latencies);
-        let (t2_avg, t2_std, t2_count) = calculate_stats(&tenant2_latencies);
+        // Calculate statistics from raw data
+        let (t1_avg, t1_std, t1_count) =
+            calculate_stats(&tenant1_raw.iter().map(|p| p.latency_ms).collect::<Vec<_>>());
+        let (t2_avg, t2_std, t2_count) =
+            calculate_stats(&tenant2_raw.iter().map(|p| p.latency_ms).collect::<Vec<_>>());
 
-        Ok(PhaseResults {
+        Ok(DetailedPhaseResults {
             tenant1: TenantMetrics {
                 avg_latency_ms: t1_avg,
                 std_deviation_ms: t1_std,
                 total_operations: t1_count,
-                error_rate: if tenant1_latencies.is_empty() {
-                    100.0
-                } else {
-                    0.0
-                },
+                error_rate: if tenant1_raw.is_empty() { 100.0 } else { 0.0 },
             },
             tenant2: TenantMetrics {
                 avg_latency_ms: t2_avg,
                 std_deviation_ms: t2_std,
                 total_operations: t2_count,
-                error_rate: if tenant2_latencies.is_empty() {
-                    100.0
-                } else {
-                    0.0
-                },
+                error_rate: if tenant2_raw.is_empty() { 100.0 } else { 0.0 },
             },
+            tenant1_raw,
+            tenant2_raw,
         })
     }
 }
@@ -169,6 +182,44 @@ impl FairnessAssessor for StorageFairnessAssessor {
             (self.config.pods_per_tenant as f64 * config.malicious_load_multiplier) as u32;
 
         self.run_phase(
+            tenant1,
+            tenant2,
+            config.test_duration,
+            self.config.pods_per_tenant,
+            malicious_pods.max(1),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl DetailedFairnessAssessor for StorageFairnessAssessor {
+    async fn run_baseline_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        config: &FairnessTestConfig,
+    ) -> Result<DetailedPhaseResults> {
+        self.run_phase_detailed(
+            tenant1,
+            tenant2,
+            config.baseline_duration,
+            self.config.pods_per_tenant,
+            self.config.pods_per_tenant,
+        )
+        .await
+    }
+
+    async fn run_unbalanced_detailed(
+        &self,
+        tenant1: Arc<TenantClusterConfig>,
+        tenant2: Arc<TenantClusterConfig>,
+        config: &FairnessTestConfig,
+    ) -> Result<DetailedPhaseResults> {
+        let malicious_pods =
+            (self.config.pods_per_tenant as f64 * config.malicious_load_multiplier) as u32;
+
+        self.run_phase_detailed(
             tenant1,
             tenant2,
             config.test_duration,
@@ -437,8 +488,22 @@ async fn collect_storage_latency_results(
     tenant1_pods: u32,
     tenant2_pods: u32,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
-    let mut tenant1_latencies = Vec::new();
-    let mut tenant2_latencies = Vec::new();
+    let (t1_raw, t2_raw) =
+        collect_storage_latency_detailed(tenant1, tenant2, tenant1_pods, tenant2_pods).await?;
+    Ok((
+        t1_raw.iter().map(|p| p.latency_ms).collect(),
+        t2_raw.iter().map(|p| p.latency_ms).collect(),
+    ))
+}
+
+async fn collect_storage_latency_detailed(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    tenant1_pods: u32,
+    tenant2_pods: u32,
+) -> Result<(Vec<MetricDataPoint>, Vec<MetricDataPoint>)> {
+    let mut tenant1_data = Vec::new();
+    let mut tenant2_data = Vec::new();
 
     // Collect from tenant1 pods
     for i in 0..tenant1_pods {
@@ -448,8 +513,8 @@ async fn collect_storage_latency_results(
             .get_pod_logs(&pod_name, &tenant1.namespace)
             .await?;
 
-        if let Some(latency) = parse_fio_latency(&logs) {
-            tenant1_latencies.push(latency);
+        if let Some(latency_data) = parse_fio_latency_detailed(&logs, i) {
+            tenant1_data.extend(latency_data);
         }
     }
 
@@ -461,12 +526,12 @@ async fn collect_storage_latency_results(
             .get_pod_logs(&pod_name, &tenant2.namespace)
             .await?;
 
-        if let Some(latency) = parse_fio_latency(&logs) {
-            tenant2_latencies.push(latency);
+        if let Some(latency_data) = parse_fio_latency_detailed(&logs, i) {
+            tenant2_data.extend(latency_data);
         }
     }
 
-    Ok((tenant1_latencies, tenant2_latencies))
+    Ok((tenant1_data, tenant2_data))
 }
 
 fn parse_fio_latency(logs: &str) -> Option<f64> {
@@ -537,6 +602,116 @@ fn parse_fio_latency(logs: &str) -> Option<f64> {
                         return Some(avg); // already ms
                     }
                 }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_fio_latency_detailed(logs: &str, pod_index: u32) -> Option<Vec<MetricDataPoint>> {
+    // Parse FIO JSON output to extract latency data with percentile breakdown for CSV export
+
+    let json_start = logs.find('{');
+    let json_end = logs.rfind('}');
+
+    if let (Some(start), Some(end)) = (json_start, json_end) {
+        let json_str = &logs[start..=end];
+        if let Ok(fio_result) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let mut data_points = Vec::new();
+
+            if let Some(jobs) = fio_result["jobs"].as_array() {
+                for (job_idx, job) in jobs.iter().enumerate() {
+                    // Extract read latencies
+                    if let Some(read_clat) = job.get("read").and_then(|r| r.get("clat_ns")) {
+                        if let Some(mean) = read_clat["mean"].as_f64() {
+                            if mean > 0.0 {
+                                data_points.push(MetricDataPoint {
+                                    timestamp_secs: job_idx as f64,
+                                    latency_ms: mean / 1_000_000.0,
+                                    is_error: false,
+                                    operation: Some(format!("fio-read-pod-{}", pod_index)),
+                                });
+                            }
+                        }
+
+                        // Also add percentile data points if available
+                        if let Some(percentile) = read_clat.get("percentile") {
+                            for (pct, val) in [
+                                ("50.000000", "p50"),
+                                ("95.000000", "p95"),
+                                ("99.000000", "p99"),
+                            ] {
+                                if let Some(lat) = percentile[pct].as_f64() {
+                                    if lat > 0.0 {
+                                        data_points.push(MetricDataPoint {
+                                            timestamp_secs: job_idx as f64,
+                                            latency_ms: lat / 1_000_000.0,
+                                            is_error: false,
+                                            operation: Some(format!(
+                                                "fio-read-{}-pod-{}",
+                                                val, pod_index
+                                            )),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Extract write latencies
+                    if let Some(write_clat) = job.get("write").and_then(|w| w.get("clat_ns")) {
+                        if let Some(mean) = write_clat["mean"].as_f64() {
+                            if mean > 0.0 {
+                                data_points.push(MetricDataPoint {
+                                    timestamp_secs: job_idx as f64,
+                                    latency_ms: mean / 1_000_000.0,
+                                    is_error: false,
+                                    operation: Some(format!("fio-write-pod-{}", pod_index)),
+                                });
+                            }
+                        }
+
+                        // Also add percentile data points if available
+                        if let Some(percentile) = write_clat.get("percentile") {
+                            for (pct, val) in [
+                                ("50.000000", "p50"),
+                                ("95.000000", "p95"),
+                                ("99.000000", "p99"),
+                            ] {
+                                if let Some(lat) = percentile[pct].as_f64() {
+                                    if lat > 0.0 {
+                                        data_points.push(MetricDataPoint {
+                                            timestamp_secs: job_idx as f64,
+                                            latency_ms: lat / 1_000_000.0,
+                                            is_error: false,
+                                            operation: Some(format!(
+                                                "fio-write-{}-pod-{}",
+                                                val, pod_index
+                                            )),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If no detailed data, fall back to summary
+            if data_points.is_empty() {
+                if let Some(latency) = parse_fio_latency(logs) {
+                    data_points.push(MetricDataPoint {
+                        timestamp_secs: 0.0,
+                        latency_ms: latency,
+                        is_error: false,
+                        operation: Some(format!("fio-summary-pod-{}", pod_index)),
+                    });
+                }
+            }
+
+            if !data_points.is_empty() {
+                return Some(data_points);
             }
         }
     }
