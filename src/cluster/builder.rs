@@ -26,6 +26,7 @@ pub enum ControlPlaneIsolation {
     None(String),
     /// Capsule with a tenant confined in the given namespace
     Capsule(String),
+    CapsuleProxy(String),
     /// vCluster virtual control plane in the given namespace
     VCluster(String),
     KubeVirt(String),
@@ -168,6 +169,9 @@ impl KubernetesClusterBuilder {
         match control_plane_isolation_technology {
             ControlPlaneIsolation::Capsule(namespace) => {
                 self.deploy_capsule_tenant(&namespace).await
+            }
+            ControlPlaneIsolation::CapsuleProxy(namespace) => {
+                self.deploy_capsule_proxy(&namespace).await
             }
 
             ControlPlaneIsolation::VCluster(namespace) => self.deploy_vcluster(&namespace).await,
@@ -325,6 +329,76 @@ impl KubernetesClusterBuilder {
         if !output.status.success() {
             return Err(terminal_stderr_to_error(output));
         }
+        Ok(())
+    }
+
+    fn install_capsule_proxy() -> anyhow::Result<()> {
+        let repo_name = "projectcapsule";
+        let repo_url = "https://projectcapsule.github.io/charts";
+        let chart = "capsule-proxy";
+        let chart_path = format!("{repo_name}/{chart}");
+
+        let capsule_namespace = "capsule-system";
+        let capsule_version = "0.7.0";
+
+        let output = Command::new("helm")
+            .arg("repo")
+            .arg("add")
+            .arg(repo_name)
+            .arg(repo_url)
+            .output()
+            .context("Failed to add capsule helm repo")?;
+
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        }
+
+        // Check if Capsule Proxy is already installed
+        let check_output = Command::new("helm")
+            .arg("list")
+            .arg("-n")
+            .arg(capsule_namespace)
+            .arg("--filter")
+            .arg(chart)
+            .output()
+            .context("Failed to check if capsule is installed")?;
+
+        let helm_list_output = String::from_utf8_lossy(&check_output.stdout);
+        if helm_list_output.contains(chart) {
+            println!("Capsule Proxy is already installed, skipping installation");
+            return Ok(());
+        }
+
+        let output = Command::new("helm")
+            .arg("install")
+            .arg(chart)
+            .arg(chart_path)
+            .arg("--version")
+            .arg(capsule_version)
+            .arg("-n")
+            .arg(capsule_namespace)
+            .arg("--create-namespace")
+            .arg("--set")
+            .arg("crds.install=true")
+            .arg("--set")
+            .arg("service.type=NodePort")
+            .arg("--set")
+            .arg("service.nodePort=30091")
+            .output()
+            .context("Failed to install capsule helm chart")?;
+
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        }
+        Ok(())
+    }
+
+    async fn deploy_capsule_proxy(&self, tenant_name: &str) -> anyhow::Result<()> {
+        Self::install_capsule()?;
+        Self::install_capsule_proxy()?;
+
+        self.deploy_capsule_tenant(tenant_name).await?;
+
         Ok(())
     }
 

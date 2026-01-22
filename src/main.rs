@@ -42,6 +42,8 @@ enum ClusterEnvironmentType {
     Native,
     #[clap(name = "capsule", alias = "cap", alias = "caps")]
     Capsule,
+    #[clap(name = "capsule-proxy", alias = "cap-proxy", alias = "cp")]
+    CapsuleProxy,
     #[clap(name = "kubezoo", alias = "kz")]
     KubeZoo,
     #[clap(name = "vcluster", alias = "vc")]
@@ -55,6 +57,7 @@ impl ClusterEnvironmentType {
         match self {
             ClusterEnvironmentType::Native => "native",
             ClusterEnvironmentType::Capsule => "capsule",
+            ClusterEnvironmentType::CapsuleProxy => "capsule-proxy",
             ClusterEnvironmentType::KubeZoo => "kubezoo",
             ClusterEnvironmentType::VCluster => "vcluster",
             ClusterEnvironmentType::KubeVirt => "kubevirt",
@@ -274,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
             let tenant2_config = Arc::new(tenant2_config);
 
             // Common config
-            let config = FairnessTestConfig::default();
+            // let config = FairnessTestConfig::default();
 
             // Control Plane
             // let cp_assessor =
@@ -288,16 +291,16 @@ async fn main() -> anyhow::Result<()> {
             // .await?;
 
             // Network
-            let net_assessor = NetworkFairnessAssessor::new(NetworkFairnessConfig::default());
-            let net_result = run_detailed_fairness_assessment(
-                &net_assessor,
-                tenant1_config.clone(),
-                tenant2_config.clone(),
-                &config,
-                true,
-                Some("results/net"),
-            )
-            .await?;
+            // let net_assessor = NetworkFairnessAssessor::new(NetworkFairnessConfig::default());
+            // let net_result = run_detailed_fairness_assessment(
+            //     &net_assessor,
+            //     tenant1_config.clone(),
+            //     tenant2_config.clone(),
+            //     &config,
+            //     true,
+            //     Some("results/net"),
+            // )
+            // .await?;
 
             // Storage
             // let storage_assessor = StorageFairnessAssessor::new(StorageFairnessConfig::default());
@@ -313,23 +316,24 @@ async fn main() -> anyhow::Result<()> {
             //     "Control Plane degradation: {:.1}%",
             //     cp_result.latency_degradation * 100.0
             // );
-            println!(
-                "Network degradation: {:.1}%",
-                net_result.result.latency_degradation * 100.0
-            );
+            // println!(
+            //     "Network degradation: {:.1}%",
+            //     net_result.result.latency_degradation * 100.0
+            // );
             // println!(
             //     "Storage degradation: {:.1}%",
             //     storage_result.latency_degradation * 100.0
             // );
-            // let report =
-            //     assessment::assess_multitenancy(tenant1_config.clone(), tenant2_config.clone())
-            //         .await
-            //         .context("Failed to run multitenancy assessment")?;
-            // println!("{}", report.control_plane);
-            // println!("{}", report.storage);
-            // println!("{}", report.network);
-            // println!("{}", report.workload);
-            // println!("Multitenancy assessment report:\n{}", report);
+
+            let report =
+                assessment::assess_multitenancy(tenant1_config.clone(), tenant2_config.clone())
+                    .await
+                    .context("Failed to run multitenancy assessment")?;
+            println!("{}", report.control_plane);
+            println!("{}", report.storage);
+            println!("{}", report.network);
+            println!("{}", report.workload);
+            println!("Multitenancy assessment report:\n{}", report);
 
             // let assessment = assessment::ControlPlaneAssessor {};
             // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
@@ -534,6 +538,13 @@ async fn get_or_create_tenant_cluster(
                 .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
                     tenant.to_string(),
                 ))
+                .with_kubeconfig_path(kubeconfig_path)
+                .build()
+                .await?
+        }
+        ClusterEnvironmentType::CapsuleProxy => {
+            KubernetesClusterBuilder::new(host_cluster.clone())
+                .with_isolation_technology(ControlPlaneIsolation::CapsuleProxy(tenant.to_string()))
                 .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
