@@ -51,6 +51,8 @@ enum ClusterEnvironmentType {
     VCluster,
     #[clap(name = "kubevirt", alias = "kv")]
     KubeVirt,
+    #[clap(name = "kamaji", alias = "kam")]
+    Kamaji,
 }
 
 impl ClusterEnvironmentType {
@@ -62,6 +64,7 @@ impl ClusterEnvironmentType {
             ClusterEnvironmentType::KubeZoo => "kubezoo",
             ClusterEnvironmentType::VCluster => "vcluster",
             ClusterEnvironmentType::KubeVirt => "kubevirt",
+            ClusterEnvironmentType::Kamaji => "kamaji",
         }
     }
 }
@@ -608,6 +611,13 @@ async fn get_or_create_tenant_cluster(
         ClusterEnvironmentType::KubeVirt => {
             KubernetesClusterBuilder::new(host_cluster.clone())
                 .with_isolation_technology(ControlPlaneIsolation::KubeVirt(tenant.to_string()))
+                .with_kubeconfig_path(kubeconfig_path)
+                .build()
+                .await?
+        }
+        ClusterEnvironmentType::Kamaji => {
+            KubernetesClusterBuilder::new(host_cluster.clone())
+                .with_isolation_technology(ControlPlaneIsolation::Kamaji(tenant.to_string()))
                 .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
