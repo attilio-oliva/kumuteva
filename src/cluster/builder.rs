@@ -284,7 +284,7 @@ impl KubernetesClusterBuilder {
         let chart_path = format!("{repo_name}/{chart}");
 
         let capsule_namespace = "capsule-system";
-        let capsule_version = "0.7.0";
+        let capsule_version = "0.10.0";
 
         let output = Command::new("helm")
             .arg("repo")
@@ -332,14 +332,14 @@ impl KubernetesClusterBuilder {
         Ok(())
     }
 
-    fn install_capsule_proxy() -> anyhow::Result<()> {
+    fn install_capsule_proxy(nodeport: u16) -> anyhow::Result<()> {
         let repo_name = "projectcapsule";
         let repo_url = "https://projectcapsule.github.io/charts";
         let chart = "capsule-proxy";
         let chart_path = format!("{repo_name}/{chart}");
 
         let capsule_namespace = "capsule-system";
-        let capsule_version = "0.7.0";
+        let capsule_version = "0.10.0";
 
         let output = Command::new("helm")
             .arg("repo")
@@ -383,7 +383,7 @@ impl KubernetesClusterBuilder {
             .arg("--set")
             .arg("service.type=NodePort")
             .arg("--set")
-            .arg("service.nodePort=30091")
+            .arg(format!("service.nodePort={}", nodeport))
             .output()
             .context("Failed to install capsule helm chart")?;
 
@@ -394,15 +394,97 @@ impl KubernetesClusterBuilder {
     }
 
     async fn deploy_capsule_proxy(&self, tenant_name: &str) -> anyhow::Result<()> {
-        Self::install_capsule()?;
-        Self::install_capsule_proxy()?;
+        // Use tenant1 port mapping: container_port for nodeport, host_port for kubeconfig
+        let tenant_mapping = &self.host_cluster.port_mappings().tenant1;
+        let nodeport = tenant_mapping.container_port;
+        let host_port = tenant_mapping.host_port;
 
-        self.deploy_capsule_tenant(tenant_name).await?;
+        Self::install_capsule()?;
+        Self::install_capsule_proxy(nodeport)?;
+
+        // Deploy tenant but skip namespace creation (we'll do it after adjusting kubeconfig)
+        self.deploy_capsule_tenant_without_namespace(tenant_name)
+            .await?;
+
+        // Modify the kubeconfig to use the correct port and skip TLS verification
+        self.adjust_capsule_proxy_kubeconfig(host_port)?;
+
+        // Now create the namespace using the adjusted kubeconfig
+        let tenant_cluster = KubernetesClient::load_with_retry(&self.kubeconfig_path, 10).await?;
+        tenant_cluster.create_namespace(tenant_name).await?;
+
+        Ok(())
+    }
+
+    fn adjust_capsule_proxy_kubeconfig(&self, host_port: u16) -> anyhow::Result<()> {
+        let kubeconfig = std::fs::read_to_string(&self.kubeconfig_path)?;
+
+        // Parse the kubeconfig as YAML to modify the server URL and add insecure-skip-tls-verify
+        let mut kubeconfig_yaml: serde_yaml::Value = serde_yaml::from_str(&kubeconfig)?;
+
+        if let Some(clusters) = kubeconfig_yaml
+            .get_mut("clusters")
+            .and_then(|c| c.as_sequence_mut())
+        {
+            for cluster_entry in clusters.iter_mut() {
+                if let Some(cluster) = cluster_entry
+                    .get_mut("cluster")
+                    .and_then(|c| c.as_mapping_mut())
+                {
+                    // Get the current server URL and replace the port
+                    if let Some(server) = cluster.get_mut("server").and_then(|s| s.as_str()) {
+                        // Extract the host part and replace with new port
+                        // Server URL format: https://host:port or https://host
+                        let new_server = if let Some(idx) = server.rfind(':') {
+                            // Check if there's a port after the last colon
+                            let after_colon = &server[idx + 1..];
+                            if after_colon.chars().all(|c| c.is_ascii_digit()) {
+                                format!("{}:{}", &server[..idx], host_port)
+                            } else {
+                                format!("{}:{}", server, host_port)
+                            }
+                        } else {
+                            format!("{}:{}", server, host_port)
+                        };
+                        cluster.insert(
+                            serde_yaml::Value::String("server".to_string()),
+                            serde_yaml::Value::String(new_server),
+                        );
+                    }
+
+                    // Remove certificate-authority-data and add insecure-skip-tls-verify
+                    cluster.remove(&serde_yaml::Value::String(
+                        "certificate-authority-data".to_string(),
+                    ));
+                    cluster.insert(
+                        serde_yaml::Value::String("insecure-skip-tls-verify".to_string()),
+                        serde_yaml::Value::Bool(true),
+                    );
+                }
+            }
+        }
+
+        let modified_kubeconfig = serde_yaml::to_string(&kubeconfig_yaml)?;
+        std::fs::write(&self.kubeconfig_path, modified_kubeconfig)?;
 
         Ok(())
     }
 
     async fn deploy_capsule_tenant(&self, tenant_name: &str) -> anyhow::Result<()> {
+        self.deploy_capsule_tenant_without_namespace(tenant_name)
+            .await?;
+
+        // create a namespace for the tenant
+        let tenant_cluster = KubernetesClient::load_with_retry(&self.kubeconfig_path, 5).await?;
+        tenant_cluster.create_namespace(tenant_name).await?;
+
+        Ok(())
+    }
+
+    async fn deploy_capsule_tenant_without_namespace(
+        &self,
+        tenant_name: &str,
+    ) -> anyhow::Result<()> {
         Self::install_capsule()?;
 
         let cluster = KubernetesClient::load(self.host_cluster.kubeconfig_path()).await?;
@@ -462,10 +544,6 @@ impl KubernetesClusterBuilder {
             std::fs::copy(&file, dest)?;
             std::fs::remove_file(&file)?;
         }
-
-        // create a namespace for the tenant
-        let tenant_cluster = KubernetesClient::load_with_retry(&self.kubeconfig_path, 5).await?;
-        tenant_cluster.create_namespace(tenant_name).await?;
 
         Ok(())
     }

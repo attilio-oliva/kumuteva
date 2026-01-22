@@ -1222,17 +1222,47 @@ impl KubernetesClient {
         command: &str,
     ) -> Result<String> {
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
-        let attached_process = pods_api
-            .exec(
-                pod_name,
-                vec!["sh", "-c", command],
-                &AttachParams::default().stderr(false),
-            )
-            .await?;
-        let output = get_output(attached_process).await;
 
-        Ok(output)
+        // Retry logic for exec - some proxies (like Capsule Proxy) need time to sync
+        let max_retries = 3;
+        let mut last_error = None;
+        let retry_wait_duration = tokio::time::Duration::from_secs(2);
+
+        for attempt in 1..=max_retries {
+            tracing::info!(
+                "exec attempt {}/{}: pod={}, namespace={}, command={}",
+                attempt,
+                max_retries,
+                pod_name,
+                namespace,
+                command
+            );
+
+            match pods_api
+                .exec(
+                    pod_name,
+                    vec!["sh", "-c", command],
+                    &AttachParams::default().stderr(false),
+                )
+                .await
+            {
+                Ok(attached_process) => {
+                    let output = get_output(attached_process).await;
+                    return Ok(output);
+                }
+                Err(e) => {
+                    tracing::error!("exec attempt {} failed: {:?}", attempt, e);
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        tokio::time::sleep(retry_wait_duration).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap().into())
     }
+
     pub async fn exec_command_in_container_with_status(
         &self,
         pod_name: &str,
@@ -1240,23 +1270,49 @@ impl KubernetesClient {
         command: &str,
     ) -> Result<Status> {
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
-        let mut attached_process = pods_api
-            .exec(
+
+        // Retry logic for exec - some proxies (like Capsule Proxy) need time to sync
+        let max_retries = 3;
+        let mut last_error = None;
+
+        for attempt in 1..=max_retries {
+            tracing::info!(
+                "exec_with_status attempt {}/{}: pod={}, namespace={}, command={}",
+                attempt,
+                max_retries,
                 pod_name,
-                vec!["sh", "-c", command],
-                &AttachParams::default().stderr(false),
-            )
-            .await?;
+                namespace,
+                command
+            );
+            match pods_api
+                .exec(
+                    pod_name,
+                    vec!["sh", "-c", command],
+                    &AttachParams::default().stderr(false),
+                )
+                .await
+            {
+                Ok(mut attached_process) => {
+                    let exit_status = attached_process
+                        .take_status()
+                        .ok_or(Error::msg(
+                            "Failed to get process status. The process might still be running.",
+                        ))?
+                        .await
+                        .ok_or(Error::msg("Failed to wait for process status"))?;
+                    return Ok(exit_status);
+                }
+                Err(e) => {
+                    tracing::error!("exec_with_status attempt {} failed: {:?}", attempt, e);
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
 
-        let exit_status = attached_process
-            .take_status()
-            .ok_or(Error::msg(
-                "Failed to get process status. The process might still be running.",
-            ))?
-            .await
-            .ok_or(Error::msg("Failed to wait for process status"))?;
-
-        Ok(exit_status)
+        Err(last_error.unwrap().into())
     }
 
     pub async fn dyn_object_exists(
