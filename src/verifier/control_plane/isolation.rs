@@ -602,16 +602,8 @@ pub fn create_minimal_object(
         }
 
         KubernetesObject::PersistentVolume => {
-            // Create a folder path for the PV here before creating the object
-
-            // DO a sort of mkdir
-            use std::fs;
-            let pv_path = format!("/tmp/test-pv-{}", object_name);
-            fs::create_dir_all(&pv_path).context(format!(
-                "Failed to create directory for PersistentVolume at {}",
-                pv_path
-            ))?;
-
+            // Use hostPath type - the path doesn't need to exist on the API server
+            // as we're just testing authorization, not actually mounting volumes
             base_object["spec"] = serde_json::json!({
                 "capacity": {
                     "storage": "1Gi"
@@ -793,19 +785,15 @@ pub fn create_minimal_object(
         KubernetesObject::StorageClass => {
             base_object["provisioner"] =
                 serde_json::Value::String("kubernetes.io/no-provisioner".to_string());
-            base_object["parameters"] = serde_json::json!({
-                "type": "kubernetes.io/no-provisioner"
-            });
+            // no-provisioner doesn't require any parameters
+            base_object["volumeBindingMode"] =
+                serde_json::Value::String("WaitForFirstConsumer".to_string());
         }
 
         KubernetesObject::IngressClass => {
+            // IngressClass only requires controller field
             base_object["spec"] = serde_json::json!({
-                "controller": "k8s.io/ingress-nginx",
-                "parameters": {
-                    "apiVersion": "networking.k8s.io/v1",
-                    "kind": "ConfigMap",
-                    "name": "nginx-configuration"
-                }
+                "controller": "k8s.io/ingress-nginx"
             });
         }
 

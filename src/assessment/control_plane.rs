@@ -315,14 +315,25 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
 // HELPER FUNCTIONS
 // =============================================================================
 
+/// Check if an error indicates the operation is not authorized/allowed
+/// This is conservative - only matches clear authorization failures
+fn is_authorization_error(error_msg: &str) -> bool {
+    // Standard Kubernetes Forbidden response (HTTP 403)
+    error_msg.contains("Forbidden") || error_msg.contains("forbidden") ||
+    // Unauthorized (HTTP 401)
+    error_msg.contains("Unauthorized") || error_msg.contains("unauthorized") ||
+    // Impossible errors triggered by some solution to filter requests (e.g. proxies like Capsule Proxy)
+    error_msg.contains("BadRequest") || error_msg.contains("not allowed")
+}
+
 /// Infer isolation level from an error message during cross-tenant operation
 fn infer_isolation_from_error(error_msg: &str) -> IsolationLevel {
     if error_msg.contains("NotFound") || error_msg.contains("not found") {
         // Resource not found in tenant2's scope - hard isolation
         // Intruder sees the same error as in a single-tenant system
         IsolationLevel::Hard
-    } else if error_msg.contains("Forbidden") || error_msg.contains("forbidden") {
-        // Operation forbidden - soft isolation
+    } else if is_authorization_error(error_msg) {
+        // Operation forbidden/not allowed - soft isolation
         // Intruder knows the resource exists but can't access it
         IsolationLevel::Soft("Access forbidden - reveals shared environment".to_string())
     } else if error_msg.contains("AlreadyExists") || error_msg.contains("already exists") {
@@ -366,6 +377,21 @@ fn get_namespace_param<'a>(object_kind: &KubernetesObject, namespace: &'a str) -
     } else {
         None
     }
+}
+
+/// Validate that a GET result actually contains valid data
+/// Some proxies (like Capsule) may return Ok with empty objects instead of errors
+fn is_valid_get_result(obj: &DynamicObject, expected_name: &str) -> bool {
+    // Check if the object has the expected name
+    match &obj.metadata.name {
+        Some(name) => name == expected_name,
+        None => false,
+    }
+}
+
+/// Validate that a GET result contains any valid object (for existing resources)
+fn is_valid_object(obj: &DynamicObject) -> bool {
+    obj.metadata.name.is_some()
 }
 
 // =============================================================================
@@ -425,7 +451,10 @@ async fn test_autonomy_get(
                 .cluster
                 .get_resource_dyn(object_kind, &name, None)
                 .await;
-            return Ok(get_result.is_ok());
+            // Validate that the returned object is actually valid
+            return Ok(get_result
+                .map(|obj| is_valid_get_result(&obj, &name))
+                .unwrap_or(false));
         }
         return Ok(false);
     }
@@ -446,7 +475,10 @@ async fn test_autonomy_get(
                     .cluster
                     .get_resource_dyn(object_kind, name, namespace)
                     .await;
-                return Ok(get_result.is_ok());
+                // Validate that the returned object is actually valid
+                return Ok(get_result
+                    .map(|obj| is_valid_get_result(&obj, name))
+                    .unwrap_or(false));
             }
         }
     }
@@ -470,7 +502,7 @@ async fn test_autonomy_get(
 
     if create_result.is_err() {
         // Can't create and no existing resources to test with
-        // Check if the LIST failed with Forbidden - if so, GET is also not allowed
+        // Check if the LIST is authorized - if not, GET is also not allowed
         let list_check = tenant
             .cluster
             .list_resources_dyn(object_kind, namespace)
@@ -484,8 +516,8 @@ async fn test_autonomy_get(
             }
             Err(e) => {
                 let err_str = e.to_string();
-                // If LIST is forbidden, GET is likely forbidden too
-                return Ok(!err_str.contains("Forbidden") && !err_str.contains("forbidden"));
+                // If LIST is forbidden/not allowed, GET is likely forbidden too
+                return Ok(!is_authorization_error(&err_str));
             }
         }
     }
@@ -502,7 +534,10 @@ async fn test_autonomy_get(
         .delete_resource_dyn(object_kind, &test_name, namespace)
         .await;
 
-    Ok(get_result.is_ok())
+    // Validate that the returned object is actually valid
+    Ok(get_result
+        .map(|obj| is_valid_get_result(&obj, &test_name))
+        .unwrap_or(false))
 }
 
 /// Test if tenant can actually LIST resources by attempting the operation
@@ -1175,15 +1210,30 @@ async fn test_cross_tenant_get(
         .await;
 
     let result = match get_result {
-        Ok(_) => {
-            // Tenant2 can read tenant1's object - no isolation
-            CrossTenantResult {
-                autonomy: true,
-                isolation: IsolationLevel::None,
-                details: format!(
-                    "Cross-tenant GET breach: {} readable by other tenant",
-                    object_kind.kind()
-                ),
+        Ok(obj) => {
+            // Check if the returned object is actually valid (has the expected name)
+            // Some proxies return Ok with empty objects instead of errors
+            if is_valid_get_result(&obj, &test_name) {
+                // Tenant2 can actually read tenant1's object - no isolation
+                CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::None,
+                    details: format!(
+                        "Cross-tenant GET breach: {} readable by other tenant",
+                        object_kind.kind()
+                    ),
+                }
+            } else {
+                // GET returned Ok but with empty/invalid object - this is hard isolation
+                // The proxy is hiding the resource from tenant2
+                CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::Hard,
+                    details: format!(
+                        "Cross-tenant GET blocked for {} - proxy returned empty object",
+                        object_kind.kind()
+                    ),
+                }
             }
         }
         Err(e) => {
@@ -1243,6 +1293,19 @@ async fn test_cross_tenant_get_for_existing_resource(
 
     match t2_get_result {
         Ok(t2_obj) => {
+            // Check if the returned object is actually valid
+            // Some proxies return Ok with empty objects instead of errors
+            if !is_valid_get_result(&t2_obj, &existing_name) {
+                return Ok(CrossTenantResult {
+                    autonomy: true,
+                    isolation: IsolationLevel::Hard,
+                    details: format!(
+                        "Cross-tenant GET blocked for {} - proxy returned empty object",
+                        object_kind.kind()
+                    ),
+                });
+            }
+
             // Both tenants can see the same resource
             // For cluster-scoped resources like nodes, this is expected
             // We need to check if it is the same object or not
@@ -1422,8 +1485,21 @@ async fn test_cross_tenant_list_for_existing_resource(
                 .filter_map(|n| n.metadata.name.clone())
                 .collect();
 
+            // If both lists are empty, we cannot verify isolation
+            // (can't tell if they share the same empty view or have separate empty views)
+            if t1_names.is_empty() && t2_names.is_empty() {
+                return Ok(CrossTenantResult {
+                    autonomy: true, // Both can LIST (just returns empty)
+                    isolation: IsolationLevel::Unknown,
+                    details: format!(
+                        "Cannot verify {} LIST isolation - both tenants see 0 items and cannot create test resources",
+                        object_kind.kind()
+                    ),
+                });
+            }
+
             if t1_names == t2_names {
-                // Identical view
+                // Identical non-empty view - this is a shared view (no isolation)
                 Ok(CrossTenantResult {
                     autonomy: true,
                     isolation: IsolationLevel::None,
@@ -1438,8 +1514,10 @@ async fn test_cross_tenant_list_for_existing_resource(
                     autonomy: true,
                     isolation: IsolationLevel::Hard,
                     details: format!(
-                        "LIST has hard isolation for {} - no shared items",
+                        "LIST has hard isolation for {} - different views (tenant1: {}, tenant2: {})",
                         object_kind.kind(),
+                        t1_names.len(),
+                        t2_names.len()
                     ),
                 })
             }
@@ -1865,4 +1943,482 @@ impl Display for ControlPlaneOperation {
             Self::Delete => write!(f, "DELETE"),
         }
     }
+}
+
+// =============================================================================
+// MANUAL TESTING UTILITIES
+// =============================================================================
+
+/// Manual test helper for debugging cross-tenant isolation issues.
+/// This function creates test objects and leaves them in place for manual inspection.
+///
+/// # Arguments
+/// * `tenant1` - First tenant configuration (the "victim" tenant)
+/// * `tenant2` - Second tenant configuration (the "attacker" tenant)  
+/// * `resource` - The control plane resource to test
+/// * `operation` - The operation to test
+/// * `cleanup` - Whether to cleanup created resources after the test
+///
+/// # Returns
+/// A tuple of (test_object_name, namespace) for manual inspection
+pub async fn manual_test_cross_tenant_operation(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    resource: &ControlPlaneResource,
+    operation: &ControlPlaneOperation,
+    cleanup: bool,
+) -> anyhow::Result<()> {
+    let k8s_obj = resource.to_kubernetes_object();
+
+    println!("=======================================================");
+    println!("MANUAL CROSS-TENANT TEST");
+    println!("=======================================================");
+    println!("Resource: {} ({})", k8s_obj.kind(), k8s_obj.api_version());
+    println!("Operation: {:?}", operation);
+    println!("Tenant1 namespace: {}", tenant1.namespace);
+    println!("Tenant2 namespace: {}", tenant2.namespace);
+    println!("Is namespaced: {}", k8s_obj.is_namespaced());
+    println!("Cleanup: {}", cleanup);
+    println!("-------------------------------------------------------");
+
+    let test_name = format!(
+        "manual-test-{}",
+        uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
+    );
+
+    let namespace = get_namespace_param(&k8s_obj, &tenant1.namespace);
+
+    println!("\n[STEP 1] Creating test object as Tenant1...");
+    println!("  Object name: {}", test_name);
+    println!("  Namespace: {:?}", namespace);
+
+    // Create minimal object
+    let obj = match create_minimal_object(&k8s_obj, &test_name, &tenant1.namespace) {
+        Ok(o) => o,
+        Err(e) => {
+            println!("  ERROR creating minimal object spec: {}", e);
+            return Err(e);
+        }
+    };
+
+    let dynamic_obj = create_dynamic_object(&k8s_obj, &test_name, obj.clone(), "tenant1");
+
+    let create_result = tenant1
+        .cluster
+        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+        .await;
+
+    match &create_result {
+        Ok(_) => {
+            println!("  SUCCESS: Object created by Tenant1");
+        }
+        Err(e) => {
+            println!("  FAILED: {}", e);
+            println!("\n[INFO] Cannot proceed with cross-tenant test - Tenant1 creation failed");
+            return Ok(());
+        }
+    }
+
+    println!("\n[STEP 2] Tenant2 attempting {} operation...", operation);
+
+    match operation {
+        ControlPlaneOperation::Create => {
+            println!("  Tenant2 trying to CREATE with same name in tenant1's namespace...");
+            let t2_obj = create_dynamic_object(&k8s_obj, &test_name, obj, "tenant2");
+            let result = tenant2
+                .cluster
+                .create_resource_dyn(&k8s_obj, &t2_obj, namespace)
+                .await;
+            print_operation_result("CREATE", &result);
+        }
+        ControlPlaneOperation::Get => {
+            println!("  Tenant2 trying to GET tenant1's object...");
+            let result = tenant2
+                .cluster
+                .get_resource_dyn(&k8s_obj, &test_name, namespace)
+                .await;
+
+            match &result {
+                Ok(obj) => {
+                    println!("  [DETAILS] Object retrieved:");
+                    println!("    Name: {:?}", obj.metadata.name);
+                    println!("    Namespace: {:?}", obj.metadata.namespace);
+                    println!("    Annotations: {:?}", obj.metadata.annotations);
+
+                    // Validate if the object is actually valid
+                    if is_valid_get_result(obj, &test_name) {
+                        println!("  RESULT: GET SUCCEEDED with valid object - ISOLATION BREACH!");
+                    } else {
+                        println!("  RESULT: GET returned Ok but with EMPTY/INVALID object - GOOD ISOLATION");
+                        println!("    (Proxy returned empty object instead of error - this is hard isolation)");
+                    }
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if is_authorization_error(&err_str) {
+                        println!("  RESULT: GET BLOCKED (Forbidden/NotAllowed) - GOOD ISOLATION");
+                    } else if err_str.contains("NotFound") || err_str.contains("not found") {
+                        println!("  RESULT: GET BLOCKED (NotFound) - HARD ISOLATION");
+                    } else {
+                        println!("  RESULT: GET FAILED: {}", err_str);
+                    }
+                }
+            }
+        }
+        ControlPlaneOperation::List => {
+            println!("  Tenant2 trying to LIST in tenant1's namespace...");
+            let result = tenant2
+                .cluster
+                .list_resources_dyn(&k8s_obj, namespace)
+                .await;
+
+            match &result {
+                Ok(list) => {
+                    println!("  SUCCESS: LIST returned {} items", list.items.len());
+                    for item in &list.items {
+                        let name = item.metadata.name.as_deref().unwrap_or("<unnamed>");
+                        let created_by = item
+                            .metadata
+                            .annotations
+                            .as_ref()
+                            .and_then(|a| a.get("kumuteva.io/created-by-tenant"))
+                            .map(|s| s.as_str())
+                            .unwrap_or("<unknown>");
+                        println!("    - {} (created by: {})", name, created_by);
+
+                        // Check if our test object is visible
+                        if name == test_name {
+                            println!("      ^^^ THIS IS TENANT1's TEST OBJECT - ISOLATION BREACH!");
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  BLOCKED: {}", e);
+                }
+            }
+        }
+        ControlPlaneOperation::Update => {
+            println!("  Tenant2 trying to UPDATE tenant1's object...");
+            let patch = kube::api::Patch::Merge(serde_json::json!({
+                "metadata": {
+                    "labels": {
+                        "malicious-update": "tenant2-was-here"
+                    }
+                }
+            }));
+            let result = tenant2
+                .cluster
+                .patch_resource_dyn(&k8s_obj, &test_name, &patch, namespace)
+                .await;
+            print_operation_result("UPDATE", &result);
+
+            // Verify if update took effect
+            if result.is_ok() {
+                println!("  [VERIFICATION] Checking if update was applied...");
+                let verify = tenant1
+                    .cluster
+                    .get_resource_dyn(&k8s_obj, &test_name, namespace)
+                    .await;
+                if let Ok(obj) = verify {
+                    let has_malicious_label = obj
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|l| l.get("malicious-update"))
+                        .is_some();
+                    if has_malicious_label {
+                        println!("    ISOLATION BREACH: Update was applied!");
+                    } else {
+                        println!(
+                            "    Update call succeeded but label not found (might be filtered)"
+                        );
+                    }
+                }
+            }
+        }
+        ControlPlaneOperation::Delete => {
+            println!("  Tenant2 trying to DELETE tenant1's object...");
+            let result = tenant2
+                .cluster
+                .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                .await;
+            print_operation_result("DELETE", &result);
+
+            // Verify if delete took effect
+            if result.is_ok() {
+                println!("  [VERIFICATION] Checking if object still exists...");
+                sleep(Duration::from_millis(500)).await;
+                let verify = tenant1
+                    .cluster
+                    .get_resource_dyn(&k8s_obj, &test_name, namespace)
+                    .await;
+                match verify {
+                    Ok(_) => println!("    Object still exists (delete might have been blocked)"),
+                    Err(e) if e.to_string().contains("NotFound") => {
+                        println!("    ISOLATION BREACH: Object was deleted!");
+                    }
+                    Err(e) => println!("    Verification error: {}", e),
+                }
+            }
+        }
+    }
+
+    println!("\n-------------------------------------------------------");
+    println!("MANUAL INSPECTION COMMANDS:");
+    println!("-------------------------------------------------------");
+
+    let kubectl_ns = namespace.map(|n| format!("-n {}", n)).unwrap_or_default();
+    let resource_kind = k8s_obj.kind().to_lowercase();
+
+    println!("# As Tenant1:");
+    println!(
+        "  kubectl get {} {} {} -o yaml",
+        resource_kind, test_name, kubectl_ns
+    );
+    println!();
+    println!("# As Tenant2 (to verify cross-tenant access):");
+    println!(
+        "  kubectl get {} {} {} -o yaml",
+        resource_kind, test_name, kubectl_ns
+    );
+    println!();
+
+    if !k8s_obj.is_namespaced() {
+        println!("# NOTE: This is a cluster-scoped resource (no namespace)");
+        println!("  kubectl get {} {} -o yaml", resource_kind, test_name);
+    }
+
+    if cleanup {
+        println!("\n[CLEANUP] Deleting test object...");
+        let del_result = tenant1
+            .cluster
+            .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+            .await;
+        match del_result {
+            Ok(_) => println!("  Cleanup successful"),
+            Err(e) => println!("  Cleanup failed: {}", e),
+        }
+    } else {
+        println!("\n[NO CLEANUP] Test object left in place for manual inspection:");
+        println!("  Resource: {}", k8s_obj.kind());
+        println!("  Name: {}", test_name);
+        println!("  Namespace: {:?}", namespace);
+        println!("\nTo cleanup manually:");
+        println!(
+            "  kubectl delete {} {} {}",
+            resource_kind, test_name, kubectl_ns
+        );
+    }
+
+    println!("=======================================================\n");
+
+    Ok(())
+}
+
+/// Helper to print operation results consistently
+fn print_operation_result<T: std::fmt::Debug, E: std::fmt::Display>(
+    op: &str,
+    result: &Result<T, E>,
+) {
+    match result {
+        Ok(_) => {
+            println!("  RESULT: {} SUCCEEDED (potential isolation breach!)", op);
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            if is_authorization_error(&err_str) {
+                println!(
+                    "  RESULT: {} BLOCKED (Forbidden/NotAllowed) - GOOD ISOLATION",
+                    op
+                );
+            } else if err_str.contains("NotFound") || err_str.contains("not found") {
+                println!("  RESULT: {} BLOCKED (NotFound) - HARD ISOLATION", op);
+            } else {
+                println!("  RESULT: {} FAILED: {}", op, err_str);
+            }
+        }
+    }
+}
+
+/// Quick test for a specific resource - tests all operations
+pub async fn manual_test_resource(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+    resource: &ControlPlaneResource,
+) -> anyhow::Result<()> {
+    for op in resource.applicable_operations() {
+        manual_test_cross_tenant_operation(tenant1, tenant2, resource, &op, true).await?;
+    }
+    Ok(())
+}
+
+/// Manual test for autonomy (single tenant) - checks if tenant can perform operation
+pub async fn manual_test_autonomy(
+    tenant: &TenantClusterConfig,
+    resource: &ControlPlaneResource,
+    operation: &ControlPlaneOperation,
+    cleanup: bool,
+) -> anyhow::Result<()> {
+    let k8s_obj = resource.to_kubernetes_object();
+
+    println!("=======================================================");
+    println!("MANUAL AUTONOMY TEST");
+    println!("=======================================================");
+    println!("Resource: {} ({})", k8s_obj.kind(), k8s_obj.api_version());
+    println!("Operation: {:?}", operation);
+    println!("Tenant namespace: {}", tenant.namespace);
+    println!("Is namespaced: {}", k8s_obj.is_namespaced());
+    println!("-------------------------------------------------------");
+
+    let namespace = get_namespace_param(&k8s_obj, &tenant.namespace);
+
+    match operation {
+        ControlPlaneOperation::List => {
+            println!("\n[TEST] Attempting LIST...");
+            let result = tenant.cluster.list_resources_dyn(&k8s_obj, namespace).await;
+
+            match &result {
+                Ok(list) => {
+                    println!("  SUCCESS: LIST returned {} items", list.items.len());
+                    for item in list.items.iter().take(10) {
+                        println!(
+                            "    - {}",
+                            item.metadata.name.as_deref().unwrap_or("<unnamed>")
+                        );
+                    }
+                    if list.items.len() > 10 {
+                        println!("    ... and {} more", list.items.len() - 10);
+                    }
+                }
+                Err(e) => {
+                    println!("  FAILED: {}", e);
+                }
+            }
+        }
+        _ => {
+            let test_name = format!(
+                "autonomy-test-{}",
+                uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
+            );
+
+            println!("\n[SETUP] Creating test object...");
+            println!("  Name: {}", test_name);
+
+            let obj = create_minimal_object(&k8s_obj, &test_name, &tenant.namespace)?;
+            let dynamic_obj = create_dynamic_object(&k8s_obj, &test_name, obj, "autonomy-test");
+
+            match operation {
+                ControlPlaneOperation::Create => {
+                    println!("\n[TEST] Attempting CREATE...");
+                    let result = tenant
+                        .cluster
+                        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+                        .await;
+                    print_operation_result("CREATE", &result);
+
+                    if result.is_ok() && cleanup {
+                        let _ = tenant
+                            .cluster
+                            .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                            .await;
+                    }
+                }
+                ControlPlaneOperation::Get => {
+                    // First create, then GET
+                    let create_result = tenant
+                        .cluster
+                        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+                        .await;
+
+                    if create_result.is_err() {
+                        println!("  Cannot create test object, trying to GET existing...");
+                        let list = tenant.cluster.list_resources_dyn(&k8s_obj, namespace).await;
+                        if let Ok(l) = list {
+                            if let Some(item) = l.items.first() {
+                                if let Some(name) = &item.metadata.name {
+                                    println!("\n[TEST] Attempting GET on existing '{}'...", name);
+                                    let result = tenant
+                                        .cluster
+                                        .get_resource_dyn(&k8s_obj, name, namespace)
+                                        .await;
+                                    print_operation_result("GET", &result);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        println!("  No existing resources to test GET");
+                        return Ok(());
+                    }
+
+                    println!("\n[TEST] Attempting GET...");
+                    let result = tenant
+                        .cluster
+                        .get_resource_dyn(&k8s_obj, &test_name, namespace)
+                        .await;
+                    print_operation_result("GET", &result);
+
+                    if cleanup {
+                        let _ = tenant
+                            .cluster
+                            .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                            .await;
+                    }
+                }
+                ControlPlaneOperation::Update => {
+                    let create_result = tenant
+                        .cluster
+                        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+                        .await;
+
+                    if create_result.is_err() {
+                        println!("  Cannot create test object: {:?}", create_result.err());
+                        return Ok(());
+                    }
+
+                    println!("\n[TEST] Attempting UPDATE...");
+                    let patch = kube::api::Patch::Merge(serde_json::json!({
+                        "metadata": {
+                            "labels": {
+                                "autonomy-test": "updated"
+                            }
+                        }
+                    }));
+                    let result = tenant
+                        .cluster
+                        .patch_resource_dyn(&k8s_obj, &test_name, &patch, namespace)
+                        .await;
+                    print_operation_result("UPDATE", &result);
+
+                    if cleanup {
+                        let _ = tenant
+                            .cluster
+                            .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                            .await;
+                    }
+                }
+                ControlPlaneOperation::Delete => {
+                    let create_result = tenant
+                        .cluster
+                        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+                        .await;
+
+                    if create_result.is_err() {
+                        println!("  Cannot create test object: {:?}", create_result.err());
+                        return Ok(());
+                    }
+
+                    println!("\n[TEST] Attempting DELETE...");
+                    let result = tenant
+                        .cluster
+                        .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                        .await;
+                    print_operation_result("DELETE", &result);
+                }
+                ControlPlaneOperation::List => unreachable!(),
+            }
+        }
+    }
+
+    println!("=======================================================\n");
+    Ok(())
 }

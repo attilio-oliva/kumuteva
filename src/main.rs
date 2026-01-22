@@ -19,9 +19,10 @@ use tracing::Level;
 use verifier::TenantClusterConfig;
 
 use crate::assessment::{
-    run_detailed_fairness_assessment, run_fairness_assessment, AssessmentConfig,
-    ControlPlaneFairnessAssessor, ControlPlaneFairnessConfig, FairnessTestConfig,
-    NetworkFairnessAssessor, NetworkFairnessConfig, StorageFairnessAssessor, StorageFairnessConfig,
+    manual_test_cross_tenant_operation, run_detailed_fairness_assessment, run_fairness_assessment,
+    AssessmentConfig, ControlPlaneFairnessAssessor, ControlPlaneFairnessConfig,
+    ControlPlaneOperation, ControlPlaneResource, FairnessTestConfig, NetworkFairnessAssessor,
+    NetworkFairnessConfig, StorageFairnessAssessor, StorageFairnessConfig,
 };
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
 use crate::verifier::{
@@ -347,6 +348,15 @@ async fn main() -> anyhow::Result<()> {
             //     "Storage degradation: {:.1}%",
             //     storage_result.latency_degradation * 100.0
             // );
+
+            // manual_test_cross_tenant_operation(
+            //     &tenant1_config,
+            //     &tenant2_config,
+            //     &ControlPlaneResource::StorageClass,
+            //     &ControlPlaneOperation::Get,
+            //     false, // Don't cleanup - leave objects for inspection
+            // )
+            // .await?;
 
             let report = assessment::assess_multitenancy(
                 tenant1_config.clone(),
