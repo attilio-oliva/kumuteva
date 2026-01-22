@@ -299,6 +299,29 @@ async fn main() -> anyhow::Result<()> {
             let tenant1_config = Arc::new(tenant1_config);
             let tenant2_config = Arc::new(tenant2_config);
 
+            let report = assessment::assess_multitenancy(
+                tenant1_config.clone(),
+                tenant2_config.clone(),
+                &assessment_config,
+            )
+            .await
+            .context("Failed to run multitenancy assessment")?;
+
+            // Print individual subsystem reports if available
+            if let Some(cp) = &report.control_plane {
+                println!("{}", cp);
+            }
+            if let Some(storage) = &report.storage {
+                println!("{}", storage);
+            }
+            if let Some(network) = &report.network {
+                println!("{}", network);
+            }
+            if let Some(workload) = &report.workload {
+                println!("{}", workload);
+            }
+            println!("Multitenancy assessment report:\n{}", report);
+
             // Common config
             // let config = FairnessTestConfig::default();
 
@@ -356,198 +379,6 @@ async fn main() -> anyhow::Result<()> {
             //     false, // Don't cleanup - leave objects for inspection
             // )
             // .await?;
-
-            let report = assessment::assess_multitenancy(
-                tenant1_config.clone(),
-                tenant2_config.clone(),
-                &assessment_config,
-            )
-            .await
-            .context("Failed to run multitenancy assessment")?;
-
-            // Print individual subsystem reports if available
-            if let Some(cp) = &report.control_plane {
-                println!("{}", cp);
-            }
-            if let Some(storage) = &report.storage {
-                println!("{}", storage);
-            }
-            if let Some(network) = &report.network {
-                println!("{}", network);
-            }
-            if let Some(workload) = &report.workload {
-                println!("{}", workload);
-            }
-            println!("Multitenancy assessment report:\n{}", report);
-
-            // let assessment = assessment::ControlPlaneAssessor {};
-            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
-            //     .await
-            //     .context("Failed to run control plane assessment")?;
-            // println!("Control plane isolation assessment report:\n{}", report);
-            // let assessment = assessment::WorkloadAssessor {};
-            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
-            //     .await
-            //     .context("Failed to run workload assessment")?;
-            // println!("Workload isolation assessment report:\n{}", report);
-
-            // let assessment = assessment::StorageAssessor {};
-            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
-            //     .await
-            //     .context("Failed to run storage assessment")?;
-            // println!("Storage isolation assessment report:\n{}", report);
-
-            // let assessment = assessment::NetworkAssessor {};
-            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
-            //     .await
-            //     .context("Failed to run network assessment")?;
-            // println!("Network isolation assessment report:\n{}", report);
-
-            // let assessment = assessment::ControlPlaneAssessor {};
-            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
-            //     .await
-            //     .context("Failed to run control plane assessment")?;
-            // println!("Control plane isolation assessment report:\n{}", report);
-
-            // let autonomy_result =
-            //     verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
-
-            // match autonomy_result {
-            //     Ok(report) => {
-            //         println!("{}", report.autonomy_level);
-            //         println!("Detailed autonomy report:\n{}", report);
-            //     }
-            //     Err(e) => eprintln!("Control plane autonomy could not complete: {}", e),
-            // }
-
-            // let obj_isolation_result =
-            //     verifier::check_object_isolation(&tenant1_config, &tenant2_config).await;
-
-            // match obj_isolation_result {
-            //     Ok(report) => {
-            //         if report.overall_isolation_success {
-            //             println!("Object isolation test passed");
-            //         } else {
-            //             println!("Object isolation test failed: {}", report);
-            //         }
-
-            //         println!("Detailed report:\n{}", report);
-            //     }
-            //     Err(e) => eprintln!("Object isolation could not complete: {}", e),
-            // }
-
-            /*
-            let fairness = verifier::check_fairness(
-                Arc::new(tenant1_config),
-                Arc::new(tenant2_config),
-                FairnessTestConfig {
-                    test_duration: std::time::Duration::from_secs(5),
-                    ..Default::default()
-                },
-            )
-            .await;
-
-            if autonomy_result.is_ok() && obj_isolation_result.is_ok() && fairness.is_ok() {
-                println!("Control plane autonomy and object isolation tests passed");
-                let report = ControlPlaneMultitenancyReport {
-                    autonomy: autonomy_result.unwrap(),
-                    isolation: obj_isolation_result.unwrap(),
-                    fairness: fairness.unwrap(),
-                };
-
-                println!("{}", report.format_as(ReportFormat::Dashboard));
-            } else {
-                println!("Tests failed:");
-                if let Err(e) = autonomy_result {
-                    eprintln!("Control plane autonomy test failed: {}", e);
-                }
-                if let Err(e) = obj_isolation_result {
-                    eprintln!("Object isolation test failed: {}", e);
-                }
-                if let Err(e) = fairness {
-                    eprintln!("Fairness test failed: {}", e);
-                }
-            }
-            */
-
-            /* This will do the same as above, but formatted in a nice way
-            let report = verifier::check_control_plane_isolation(&tenant1_config, &tenant2_config)
-                .await
-                .context("Failed to verify control plane isolation")?;
-
-            println!("Control plane isolation test results:\n{}", report);
-            */
-
-            // let network_fairness = verifier::check_network_fairness(
-            //     Arc::new(tenant1_config),
-            //     Arc::new(tenant2_config),
-            //     NetworkFairnessTestConfig::remote_iperf3_test(
-            //         "iperf3.moji.fr",
-            //         (5201, 5209),
-            //         1,
-            //         2,
-            //         30,
-            //         20.0,
-            //     ),
-            // )
-            // .await;
-
-            // match network_fairness {
-            //     Ok(results) => {
-            //         println!("Network fairness test results:");
-            //         println!(
-            //             "  - Regular bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
-            //             results.regular_bandwidths.0.iter().sum::<f64>(),
-            //             results.regular_bandwidths.1.iter().sum::<f64>()
-            //         );
-            //         println!(
-            //             "  - Unequal bandwidths: Tenant1 = {:.2} Mbps, Tenant2 = {:.2} Mbps",
-            //             results.unequal_bandwidths.0.iter().sum::<f64>(),
-            //             results.unequal_bandwidths.1.iter().sum::<f64>()
-            //         );
-            //         println!(
-            //             "  - Acceptable deviation: {:.2}%",
-            //             results.acceptable_deviation_percent
-            //         );
-            //         println!(
-            //             "  - Fairness test passed: {}",
-            //             if results.fairness_passed {
-            //                 "✅ YES"
-            //             } else {
-            //                 "❌ NO"
-            //             }
-            //         );
-            //     }
-            //     Err(e) => eprintln!("Network fairness test failed: {}", e),
-            // }
-
-            // let network_report =
-            //     verifier::check_network_multitenancy(&tenant1_config, &tenant2_config).await?;
-
-            // let storage_isolation =
-            //     verifier::check_storage_isolation(&tenant1_config, &tenant2_config)
-            //         .await
-            //         .context("Failed to verify storage isolation")?;
-            // println!("{}", storage_isolation);
-
-            // let storage_fairness = verifier::check_storage_fairness(
-            //     Arc::new(tenant1_config),
-            //     Arc::new(tenant2_config),
-            //     StorageFairnessTestConfig::default(),
-            // )
-            // .await
-            // .context("Failed to verify storage fairness")?;
-            // println!("{}", storage_fairness);
-
-            //println!("{}", network_report);
-            // println!("Storage autonomy test passed: {}", storage_automony);
-            // println!("{}", storage_isolation);
-
-            // let workload_isolation =
-            //     verifier::check_workload_isolation(&tenant1_config, &tenant2_config)
-            //         .await
-            //         .context("Failed to verify workload isolation")?;
-            // println!("{}", workload_isolation);
         }
     }
 
