@@ -1,19 +1,14 @@
 mod control_plane;
-mod control_plane_fairness;
-mod fairness;
+
+mod fairness_framework;
 mod network;
-mod network_fairness;
 mod storage;
-mod storage_fairness;
 mod workload;
 
 pub use control_plane::*;
-pub use control_plane_fairness::*;
-pub use fairness::*;
+pub use fairness_framework::*;
 pub use network::*;
-pub use network_fairness::*;
 pub use storage::*;
-pub use storage_fairness::*;
 pub use workload::*;
 
 use tabled::settings::object::Rows;

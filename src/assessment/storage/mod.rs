@@ -1,10 +1,12 @@
+mod fairness;
+pub use fairness::*;
+
 use std::fmt::Display;
 
 use async_trait::async_trait;
 use k8s_openapi::api::{
     apps::v1::StatefulSet,
-    core::v1::{PersistentVolume, PersistentVolumeClaim, Pod},
-    storage::v1::StorageClass,
+    core::v1::{PersistentVolume, PersistentVolumeClaim},
 };
 use serde::Serialize;
 use tracing::info;

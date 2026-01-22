@@ -16,15 +16,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 
-use crate::assessment::fairness::{
+use crate::assessment::fairness_framework::{
     DetailedFairnessAssessor, DetailedPhaseResults, FairnessAssessor, FairnessTestConfig,
     MetricDataPoint, PhaseResults, TenantMetrics,
 };
 use crate::verifier::TenantClusterConfig;
-
-// =============================================================================
-// NETWORK FAIRNESS ASSESSOR
-// =============================================================================
 
 /// Network fairness assessor configuration
 #[derive(Debug, Clone)]

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::assessment::fairness::{
+use crate::assessment::fairness_framework::{
     DetailedFairnessAssessor, DetailedPhaseResults, FairnessAssessor, FairnessTestConfig,
     MetricDataPoint, PhaseResults, TenantMetrics,
 };

@@ -1,3 +1,6 @@
+mod fairness;
+pub use fairness::*;
+
 use std::fmt::Display;
 
 use async_trait::async_trait;
