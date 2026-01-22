@@ -201,11 +201,9 @@ async fn test_service_creation_authorization(tenant: &TenantClusterConfig) -> an
 }
 
 async fn test_nodeport_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
-    let test_service = create_nodeport_service(
-        &tenant.namespace,
-        "auth-test-nodeport",
-        AUTONOMY_TEST_NODE_PORT,
-    );
+    // Use auto-assigned nodePort (0 or omit) to test if tenant can create NodePort services at all,
+    // rather than testing if a specific port is available
+    let test_service = create_nodeport_service_auto_port(&tenant.namespace, "auth-test-nodeport");
     let result = tenant
         .cluster
         .create_namespaced_resource::<Service>(&test_service, &tenant.namespace)
@@ -459,7 +457,7 @@ async fn test_nodeport_autonomy(
         .create_namespaced_resource::<Service>(&tenant2_service, &tenant2.namespace)
         .await;
 
-    let autonomy_success = tenant2_result.is_ok();
+    let hard_isolation = tenant2_result.is_ok();
 
     // Cleanup
     let _ = tenant1
@@ -467,7 +465,7 @@ async fn test_nodeport_autonomy(
         .delete_resource_in_namespace::<Service>(AUTONOMY_TEST_SERVICE_NAME, &tenant1.namespace)
         .await;
 
-    if autonomy_success {
+    if hard_isolation {
         let _ = tenant2
             .cluster
             .delete_resource_in_namespace::<Service>(AUTONOMY_TEST_SERVICE_NAME, &tenant2.namespace)
@@ -483,7 +481,7 @@ async fn test_nodeport_autonomy(
         )
         .await;
 
-    if autonomy_success {
+    if hard_isolation {
         let _ = tenant2
             .cluster
             .wait_for_namespaced_resource_deletion::<Service>(
@@ -493,7 +491,7 @@ async fn test_nodeport_autonomy(
             .await;
     }
 
-    if autonomy_success {
+    if hard_isolation {
         // Both tenants can create NodePort on same port - full isolation (separate network namespaces)
         Ok(CrossTenantResult {
             isolation: IsolationLevel::Hard,
@@ -521,7 +519,7 @@ async fn test_nodeport_autonomy(
                     "NodePort {} shared across tenants",
                     AUTONOMY_TEST_NODE_PORT
                 )),
-                autonomy: false, // Partial autonomy - can use NodePorts but may conflict
+                autonomy: true, // They can still create services, just not on the same port (soft isolation)
                 details: format!(
                     "NodePort {} collision detected - Tenants share NodePort space, may conflict with each other",
                     AUTONOMY_TEST_NODE_PORT
@@ -544,57 +542,74 @@ async fn test_dns_isolation(
 ) -> anyhow::Result<CrossTenantResult> {
     // Create pod in tenant1 and service in tenant2
     let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
-    let service = create_webserver_service(&tenant2.namespace);
+    let service = create_webserver_service(&tenant1.namespace);
 
     tenant1
         .cluster
-        .create_pod_in_namespace(&pod, &tenant1.namespace)
+        .create_namespaced_resource::<Service>(&service, &tenant1.namespace)
+        .await?;
+    tenant1
+        .cluster
+        .wait_for_resource_creation::<Service>(WEBSERVER_SERVICE_NAME, &tenant1.namespace)
         .await?;
 
     tenant2
         .cluster
-        .create_namespaced_resource::<Service>(&service, &tenant2.namespace)
+        .create_pod_in_namespace(&pod, &tenant2.namespace)
         .await?;
-
-    tenant1
-        .cluster
-        .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
-        .await?;
-
     tenant2
         .cluster
-        .wait_for_resource_creation::<Service>(WEBSERVER_SERVICE_NAME, &tenant2.namespace)
+        .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
         .await?;
 
-    // Try to resolve tenant2's service DNS from tenant1
-    let dns_result = tenant1
+    // Try to resolve tenant1's service DNS from tenant2
+    let dns_query = format!(
+        "nslookup {}.{}.svc.cluster.local",
+        WEBSERVER_SERVICE_NAME, tenant1.namespace
+    );
+    info!("DNS isolation test: querying '{}' from tenant2", dns_query);
+
+    // Capture the output and check if an IP address was resolved
+    let dns_output = tenant2
         .cluster
-        .exec_command_in_container_with_status(
+        .exec_command_in_container(
             NETWORK_MULTITOOL_POD_NAME,
-            &tenant1.namespace,
-            format!(
-                "nslookup {}.{}.svc.cluster.local",
-                WEBSERVER_SERVICE_NAME, tenant2.namespace
-            )
-            .as_str(),
+            &tenant2.namespace,
+            &format!("{} 2>&1 || true", dns_query),
         )
-        .await?;
+        .await
+        .unwrap_or_else(|e| format!("Failed to get output: {}", e));
 
-    let can_resolve_dns = dns_result.code == Some(0);
+    info!("DNS query output: {}", dns_output);
+
+    // Check if the output contains "Address:" after the "Name:" line (indicating successful resolution)
+    // nslookup output format when successful:
+    //   Server: ...
+    //   Address: ... (DNS server address)
+    //   Name: service.namespace.svc.cluster.local
+    //   Address: ... (resolved IP - this is what we're looking for)
+    let can_resolve_dns = dns_output.contains("Name:") && {
+        // Find the part after "Name:" and check if there's an "Address:" line after it
+        if let Some(name_pos) = dns_output.find("Name:") {
+            dns_output[name_pos..].contains("Address:")
+        } else {
+            false
+        }
+    };
 
     // Cleanup
     let _ = tenant1
         .cluster
-        .delete_pod_in_namespace(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
+        .delete_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant1.namespace)
         .await;
     let _ = tenant2
         .cluster
-        .delete_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant2.namespace)
+        .delete_pod_in_namespace(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
         .await;
 
-    let _ = tenant1
+    let _ = tenant2
         .cluster
-        .wait_for_pod_deletion(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
+        .wait_for_pod_deletion(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
         .await;
 
     if can_resolve_dns {
@@ -705,6 +720,37 @@ fn create_nodeport_service(namespace: &str, name: &str, node_port: i32) -> Servi
                 "port": AUTONOMY_TEST_PORT,
                 "targetPort": AUTONOMY_TEST_PORT,
                 "nodePort": node_port
+            }],
+            "type": "NodePort"
+        }
+    }))
+    .unwrap()
+}
+
+/// Creates a NodePort service with auto-assigned port (Kubernetes chooses the port).
+/// This is useful for authorization tests where we only care if NodePort services
+/// can be created, not whether a specific port is available.
+fn create_nodeport_service_auto_port(namespace: &str, name: &str) -> Service {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {
+                "test": "network-authorization"
+            }
+        },
+        "spec": {
+            "selector": {
+                "app": "auth-test"
+            },
+            "ports": [{
+                "name": "http",
+                "protocol": "TCP",
+                "port": AUTONOMY_TEST_PORT,
+                "targetPort": AUTONOMY_TEST_PORT
+                // nodePort omitted - Kubernetes will auto-assign from available range
             }],
             "type": "NodePort"
         }
