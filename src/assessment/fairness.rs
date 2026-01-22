@@ -78,36 +78,39 @@ pub struct FairnessResult {
     pub baseline: PhaseResults,
     /// Results from the unbalanced phase
     pub unbalanced: PhaseResults,
-    /// Performance fairness as latency degradation ratio for the regular tenant
-    /// 0.0 = perfect fairness (no latency increase), higher = worse fairness
+    /// Performance degradation as ratio of unbalanced to baseline latency
+    /// 1.0 = no change, 1.5 = 50% increase, 2.0 = doubled latency
     pub latency_degradation: f64,
     /// Optional detailed description
     pub details: Option<String>,
 }
 
 impl FairnessResult {
-    /// Calculate latency degradation from baseline and unbalanced metrics
-    /// Returns the degradation ratio (0.0 = perfect fairness)
+    /// Calculate latency degradation as ratio of unbalanced to baseline
+    /// Returns the degradation ratio (1.0 = no change, higher = worse)
     ///
-    /// Formula: (unbalanced_latency - baseline_latency) / baseline_latency
-    /// Positive means latency increased (worse), negative means improved
-    pub fn calculate_latency_degradation(baseline_latency_ms: f64, unbalanced_latency_ms: f64) -> f64 {
+    /// Formula: unbalanced_latency / baseline_latency
+    /// 1.0 = no degradation, 1.5 = 50% increase, 2.0 = doubled
+    pub fn calculate_latency_degradation(
+        baseline_latency_ms: f64,
+        unbalanced_latency_ms: f64,
+    ) -> f64 {
         if baseline_latency_ms == 0.0 {
-            return 0.0;
+            return 1.0;
         }
-        (unbalanced_latency_ms - baseline_latency_ms) / baseline_latency_ms
+        unbalanced_latency_ms / baseline_latency_ms
     }
 
     /// Returns a qualitative assessment of the fairness level
     pub fn fairness_level(&self) -> FairnessLevel {
-        let deg = self.latency_degradation;
-        if deg <= 0.05 {
+        let ratio = self.latency_degradation;
+        if ratio <= 1.05 {
             FairnessLevel::Excellent
-        } else if deg <= 0.15 {
+        } else if ratio <= 1.15 {
             FairnessLevel::Good
-        } else if deg <= 0.30 {
+        } else if ratio <= 1.30 {
             FairnessLevel::Moderate
-        } else if deg <= 0.50 {
+        } else if ratio <= 1.50 {
             FairnessLevel::Poor
         } else {
             FairnessLevel::Critical
@@ -118,15 +121,15 @@ impl FairnessResult {
 /// Qualitative fairness levels for display purposes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FairnessLevel {
-    /// <= 5% degradation
+    /// ratio <= 1.05 (≤5% increase)
     Excellent,
-    /// <= 15% degradation
+    /// ratio <= 1.15 (≤15% increase)
     Good,
-    /// <= 30% degradation
+    /// ratio <= 1.30 (≤30% increase)
     Moderate,
-    /// <= 50% degradation
+    /// ratio <= 1.50 (≤50% increase)
     Poor,
-    /// > 50% degradation
+    /// ratio > 1.50 (>50% increase)
     Critical,
 }
 
@@ -193,11 +196,11 @@ impl Display for FairnessResult {
         )?;
 
         writeln!(f, "\n{}", "Latency Fairness:".bold())?;
-        let deg_pct = self.latency_degradation * 100.0;
-        let deg_str = if self.latency_degradation >= 0.0 {
-            format!("+{:.1}% latency increase", deg_pct)
+        let ratio = self.latency_degradation;
+        let deg_str = if ratio >= 1.0 {
+            format!("{:.2}x latency multiplier", ratio)
         } else {
-            format!("{:.1}% latency decrease", deg_pct)
+            format!("{:.2}x latency multiplier (improved)", ratio)
         };
         writeln!(f, "  {} - {} ({})", level_icon, level, deg_str)?;
 
@@ -289,8 +292,7 @@ pub async fn run_fairness_assessment<A: FairnessAssessor>(
 
     println!(
         "    Tenant 1: {:.2} ms, Tenant 2: {:.2} ms",
-        baseline.tenant1.avg_latency_ms,
-        baseline.tenant2.avg_latency_ms
+        baseline.tenant1.avg_latency_ms, baseline.tenant2.avg_latency_ms
     );
 
     // Phase 2: Unbalanced measurement
@@ -304,8 +306,7 @@ pub async fn run_fairness_assessment<A: FairnessAssessor>(
 
     println!(
         "    Regular: {:.2} ms, Malicious: {:.2} ms",
-        unbalanced.tenant1.avg_latency_ms,
-        unbalanced.tenant2.avg_latency_ms
+        unbalanced.tenant1.avg_latency_ms, unbalanced.tenant2.avg_latency_ms
     );
 
     // Calculate latency degradation for regular tenant
@@ -323,9 +324,9 @@ pub async fn run_fairness_assessment<A: FairnessAssessor>(
     };
 
     println!(
-        "  {} Latency fairness: {:.1}% degradation ({})",
+        "  {} Latency fairness: {:.2}x multiplier ({})",
         "✓".green(),
-        degradation * 100.0,
+        degradation,
         result.fairness_level()
     );
 
@@ -402,13 +403,13 @@ impl Display for FairnessReport {
             writeln!(f, "\n{}", "═".repeat(50))?;
             writeln!(f, "{}", "OVERALL SUMMARY".bold())?;
             writeln!(f, "{}", "─".repeat(50))?;
-            writeln!(f, "Average Latency Degradation: {:.1}%", overall * 100.0)?;
+            writeln!(f, "Average Latency Degradation: {:.2}x", overall)?;
 
             if let Some(worst) = self.worst_fairness() {
                 writeln!(
                     f,
-                    "Worst Subsystem: {} ({:.1}% degradation)",
-                    worst.subsystem, worst.latency_degradation * 100.0
+                    "Worst Subsystem: {} ({:.2}x degradation)",
+                    worst.subsystem, worst.latency_degradation
                 )?;
             }
         } else {
@@ -583,18 +584,15 @@ pub async fn run_detailed_fairness_assessment<A: DetailedFairnessAssessor>(
     };
 
     println!(
-        "  {} Latency fairness: {:+.1}% degradation ({})",
+        "  {} Latency fairness: {:.2}x degradation ({})",
         "✓".green(),
-        latency_degradation * 100.0,
+        latency_degradation,
         result.fairness_level()
     );
 
     let detailed_result = DetailedFairnessResult {
         result,
-        baseline_raw: Some((
-            baseline_detailed.tenant1_raw,
-            baseline_detailed.tenant2_raw,
-        )),
+        baseline_raw: Some((baseline_detailed.tenant1_raw, baseline_detailed.tenant2_raw)),
         unbalanced_raw: Some((
             unbalanced_detailed.tenant1_raw,
             unbalanced_detailed.tenant2_raw,
@@ -626,11 +624,7 @@ pub async fn export_fairness_csv(result: &DetailedFairnessResult, output_dir: &s
         .unwrap()
         .as_secs();
 
-    let subsystem = result
-        .result
-        .subsystem
-        .to_lowercase()
-        .replace(' ', "_");
+    let subsystem = result.result.subsystem.to_lowercase().replace(' ', "_");
 
     // Export baseline data if available
     if let Some((tenant1_raw, tenant2_raw)) = &result.baseline_raw {
