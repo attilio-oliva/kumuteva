@@ -43,8 +43,10 @@ pub enum StorageResource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StorageOperation {
-    /// Create a volume and mount it to a pod
+    /// Create a volume and mount it to a pod (without setting reclaim policy)
     CreateAndMountVolume,
+    /// Create a volume and mount it to a pod with Retain reclaim policy
+    CreateAndMountVolumeWithRetainPolicy,
     /// Create a volume mapping to a host path (in the node filesystem)
     UseHostPath,
 }
@@ -60,6 +62,7 @@ impl AssessableResource for StorageResource {
         match self {
             StorageResource::Volume => vec![
                 StorageOperation::CreateAndMountVolume,
+                StorageOperation::CreateAndMountVolumeWithRetainPolicy,
                 StorageOperation::UseHostPath,
             ],
         }
@@ -87,7 +90,8 @@ impl MultitenancyAssessor for StorageAssessor {
         operation: &StorageOperation,
     ) -> anyhow::Result<bool> {
         match (resource, operation) {
-            (StorageResource::Volume, StorageOperation::CreateAndMountVolume) => {
+            (StorageResource::Volume, StorageOperation::CreateAndMountVolume)
+            | (StorageResource::Volume, StorageOperation::CreateAndMountVolumeWithRetainPolicy) => {
                 let can_create_pv = test_pv_creation_authorization(tenant).await;
                 let can_mount_pv = test_pv_mount_authorization(tenant).await;
                 Ok(can_create_pv.unwrap_or(false) && can_mount_pv.unwrap_or(false))
@@ -109,7 +113,10 @@ impl MultitenancyAssessor for StorageAssessor {
     ) -> anyhow::Result<CrossTenantResult> {
         match (resource, operation) {
             (StorageResource::Volume, StorageOperation::CreateAndMountVolume) => {
-                test_pv_cross_tenant_access(tenant1, tenant2).await
+                test_pv_cross_tenant_access(tenant1, tenant2, false).await
+            }
+            (StorageResource::Volume, StorageOperation::CreateAndMountVolumeWithRetainPolicy) => {
+                test_pv_cross_tenant_access(tenant1, tenant2, true).await
             }
             (StorageResource::Volume, StorageOperation::UseHostPath) => {
                 test_hostpath_cross_tenant_access(tenant1, tenant2).await
@@ -142,7 +149,7 @@ async fn test_pv_creation_authorization(tenant: &TenantClusterConfig) -> anyhow:
 
 async fn test_pv_mount_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
     let test_commands = vec!["sleep", "1"];
-    let result = create_stateful_set(tenant, &test_commands, None, false).await;
+    let result = create_stateful_set(tenant, &test_commands, None, false, false).await;
 
     // Cleanup
     let _ = tenant
@@ -175,7 +182,7 @@ async fn test_hostpath_creation_authorization(
 
 async fn test_hostpath_mount_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
     let test_commands = vec!["sleep", "10"];
-    let result = create_stateful_set(tenant, &test_commands, None, true).await;
+    let result = create_stateful_set(tenant, &test_commands, None, true, false).await;
 
     // Cleanup
     let _ = tenant
@@ -193,8 +200,9 @@ async fn test_hostpath_mount_authorization(tenant: &TenantClusterConfig) -> anyh
 async fn test_pv_cross_tenant_access(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
+    use_retain_policy: bool,
 ) -> anyhow::Result<CrossTenantResult> {
-    match attempt_other_tenant_file_access(tenant1, tenant2).await {
+    match attempt_other_tenant_file_access(tenant1, tenant2, use_retain_policy).await {
         Ok(AccessResult::Isolated) => Ok(CrossTenantResult {
             isolation: IsolationLevel::Hard,
             autonomy: true,
@@ -278,7 +286,7 @@ async fn test_hostpath_data_isolation(
     let tenant2_commands = hostpath_read_commands();
 
     // Create hostPath volume and write data in tenant1
-    let create_result = create_stateful_set(tenant1, &tenant1_commands, None, true).await;
+    let create_result = create_stateful_set(tenant1, &tenant1_commands, None, true, false).await;
     if let Err(e) = create_result {
         // Cleanup attempt
         let _ = tenant1
@@ -304,7 +312,7 @@ async fn test_hostpath_data_isolation(
     info!("Tenant1 has written data to hostPath volume.");
 
     // Try to read data from tenant2
-    let create_result2 = create_stateful_set(tenant2, &tenant2_commands, None, true).await;
+    let create_result2 = create_stateful_set(tenant2, &tenant2_commands, None, true, false).await;
     if let Err(e) = create_result2 {
         // Cleanup tenant1
         let _ = tenant1
@@ -355,13 +363,15 @@ async fn test_hostpath_data_isolation(
 async fn attempt_other_tenant_file_access(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
+    use_retain_policy: bool,
 ) -> anyhow::Result<AccessResult> {
     let tenant1_commands = tenant1_commands();
     let tenant2_commands = tenant2_commands();
 
     // Step 1: Create StatefulSet in tenant1 with PVC
     info!("Creating a StatefulSet in tenant1");
-    let create_result = create_and_wait_stateful_set(tenant1, &tenant1_commands, None).await;
+    let create_result =
+        create_and_wait_stateful_set(tenant1, &tenant1_commands, None, use_retain_policy).await;
 
     let (created_pvc_name, dynamic_pv_name) = match create_result {
         Ok(info) => info,
@@ -404,8 +414,14 @@ async fn attempt_other_tenant_file_access(
 
     // Step 3: Try to create StatefulSet in tenant2 that uses the released PV
     info!("Creating a StatefulSet in tenant2");
-    let mount_attempt =
-        create_stateful_set(tenant2, &tenant2_commands, Some(&dynamic_pv_name), false).await;
+    let mount_attempt = create_stateful_set(
+        tenant2,
+        &tenant2_commands,
+        Some(&dynamic_pv_name),
+        false,
+        use_retain_policy,
+    )
+    .await;
 
     if let Err(e) = mount_attempt {
         info!(
@@ -508,8 +524,10 @@ async fn create_stateful_set<T: AsRef<str> + Serialize>(
     commands: &[T],
     pv_name: Option<&str>,
     use_hostpath: bool,
+    use_retain_policy: bool,
 ) -> anyhow::Result<()> {
-    let tenant_set = create_tenant_statefulset_manifest(commands, pv_name, use_hostpath)?;
+    let tenant_set =
+        create_tenant_statefulset_manifest(commands, pv_name, use_hostpath, use_retain_policy)?;
 
     tenant
         .cluster
@@ -522,6 +540,7 @@ fn create_tenant_statefulset_manifest<T: AsRef<str> + Serialize>(
     commands: &[T],
     pv_name: Option<&str>,
     use_hostpath: bool,
+    use_retain_policy: bool,
 ) -> anyhow::Result<StatefulSet> {
     let pvc_name = if use_hostpath {
         HOSTPATH_PVC_NAME
@@ -566,17 +585,18 @@ fn create_tenant_statefulset_manifest<T: AsRef<str> + Serialize>(
             }))?]);
             spec.template.spec = Some(pod_spec);
         }
-    } else {
-        if let Some(spec) = pod_manifest.spec.as_mut() {
-            spec.volume_claim_templates = Some(vec![serde_json::from_value(serde_json::json!({
-                "metadata": { "name": pvc_name },
-                "spec": {
-                    "accessModes": ["ReadWriteOnce"],
-                    "resources": { "requests": { "storage": STORAGE_SIZE } },
-                    "persistentVolumeReclaimPolicy": "Retain",
-                },
-            }))?]);
+    } else if let Some(spec) = pod_manifest.spec.as_mut() {
+        let mut pvc_spec = serde_json::json!({
+            "accessModes": ["ReadWriteOnce"],
+            "resources": { "requests": { "storage": STORAGE_SIZE } },
+        });
+        if use_retain_policy {
+            pvc_spec["persistentVolumeReclaimPolicy"] = serde_json::json!("Retain");
         }
+        spec.volume_claim_templates = Some(vec![serde_json::from_value(serde_json::json!({
+            "metadata": { "name": pvc_name },
+            "spec": pvc_spec,
+        }))?]);
     }
 
     if let Some(pv_name) = pv_name {
@@ -670,8 +690,9 @@ async fn create_and_wait_stateful_set<T: AsRef<str> + Serialize>(
     tenant: &TenantClusterConfig,
     commands: &[T],
     pv_name: Option<&str>,
+    use_retain_policy: bool,
 ) -> anyhow::Result<(String, String)> {
-    create_stateful_set(tenant, commands, pv_name, false).await?;
+    create_stateful_set(tenant, commands, pv_name, false, use_retain_policy).await?;
     wait_and_get_volume_info(tenant).await
 }
 
@@ -916,7 +937,12 @@ impl Display for StorageResource {
 impl Display for StorageOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StorageOperation::CreateAndMountVolume => write!(f, "Create And Mount Volume"),
+            StorageOperation::CreateAndMountVolume => {
+                write!(f, "Create And Mount Volume (unsetted Reclaim Policy)")
+            }
+            StorageOperation::CreateAndMountVolumeWithRetainPolicy => {
+                write!(f, "Create And Mount Volume with Retain Reclaim Policy")
+            }
             StorageOperation::UseHostPath => write!(f, "Use HostPath in a Volume"),
         }
     }
