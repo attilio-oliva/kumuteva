@@ -1,11 +1,12 @@
+mod assessment;
 mod cluster;
 mod external_crds;
-mod verifier;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
+use assessment::TenantClusterConfig;
 use clap::{Parser, Subcommand, ValueEnum};
 use cluster::TenantsPortMapping;
 use cluster::{
@@ -14,13 +15,16 @@ use cluster::{
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
-use verifier::TenantClusterConfig;
+use tracing::Level;
+
+use crate::assessment::{
+    manual_test_cross_tenant_operation, run_detailed_fairness_assessment, run_fairness_assessment,
+    AssessmentConfig, ControlPlaneFairnessAssessor, ControlPlaneFairnessConfig,
+    ControlPlaneOperation, ControlPlaneResource, FairnessTestConfig, NetworkFairnessAssessor,
+    NetworkFairnessConfig, StorageFairnessAssessor, StorageFairnessConfig,
+};
 
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
-use crate::verifier::{
-    ControlPlaneMultitenancyReport, NetworkFairnessTestConfig, NetworkFairnessTestResults,
-    ReportFormat, StorageFairnessTestConfig,
-};
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
@@ -35,12 +39,16 @@ enum ClusterEnvironmentType {
     Native,
     #[clap(name = "capsule", alias = "cap", alias = "caps")]
     Capsule,
+    #[clap(name = "capsule-proxy", alias = "cap-proxy", alias = "cp")]
+    CapsuleProxy,
     #[clap(name = "kubezoo", alias = "kz")]
     KubeZoo,
     #[clap(name = "vcluster", alias = "vc")]
     VCluster,
     #[clap(name = "kubevirt", alias = "kv")]
     KubeVirt,
+    #[clap(name = "kamaji", alias = "kam")]
+    Kamaji,
 }
 
 impl ClusterEnvironmentType {
@@ -48,9 +56,11 @@ impl ClusterEnvironmentType {
         match self {
             ClusterEnvironmentType::Native => "native",
             ClusterEnvironmentType::Capsule => "capsule",
+            ClusterEnvironmentType::CapsuleProxy => "capsule-proxy",
             ClusterEnvironmentType::KubeZoo => "kubezoo",
             ClusterEnvironmentType::VCluster => "vcluster",
             ClusterEnvironmentType::KubeVirt => "kubevirt",
+            ClusterEnvironmentType::Kamaji => "kamaji",
         }
     }
 }
@@ -79,6 +89,10 @@ impl ChosenClusterProvider {
 enum Commands {
     /// Setup test environment with two tenants given a cluster environment type
     Setup {
+        /// Enable verbose output
+        #[clap(long, default_value = "false")]
+        verbose: bool,
+        /// Use an existing cluster instead of creating a new one
         #[clap(long, short, default_value = "false")]
         existing_cluster: bool,
         /// Name of the cluster to use or create.
@@ -97,6 +111,8 @@ enum Commands {
     },
     /// Verify isolation between two clusters
     Verify {
+        #[clap(long, default_value = "false")]
+        verbose: bool,
         #[clap(short = 'f', long = "tenant1-kubeconfig")]
         tenant1_kubeconfig_path: PathBuf,
         #[clap(short = 's', long = "tenant2-kubeconfig")]
@@ -106,6 +122,19 @@ enum Commands {
         tenant1_namespace: String,
         #[clap(long = "tenant2-ns", default_value = "tenant2")]
         tenant2_namespace: String,
+
+        /// Assess control plane isolation (exclusive if any system is specified)
+        #[clap(long = "control-plane", alias = "cp")]
+        control_plane: bool,
+        /// Assess storage isolation (exclusive if any system is specified)
+        #[clap(long = "storage", alias = "st")]
+        storage: bool,
+        /// Assess network isolation (exclusive if any system is specified)
+        #[clap(long = "network", alias = "net")]
+        network: bool,
+        /// Assess workload isolation (exclusive if any system is specified)
+        #[clap(long = "workload", alias = "wl")]
+        workload: bool,
     },
 }
 
@@ -216,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Commands::Setup {
+            verbose,
             existing_cluster,
             cluster_name,
             kind,
@@ -223,6 +253,8 @@ async fn main() -> anyhow::Result<()> {
             tenant1,
             tenant2,
         } => {
+            setup_logging(verbose)?;
+
             println!("Setting up test environment...");
             let cluster_name = format!("{}-{}", cluster_name, kind.as_str());
             setup_test_environment(
@@ -237,12 +269,24 @@ async fn main() -> anyhow::Result<()> {
             println!("Test environment setup complete");
         }
         Commands::Verify {
+            verbose,
             tenant1_kubeconfig_path,
             tenant2_kubeconfig_path,
             tenant1_namespace,
             tenant2_namespace,
+            control_plane,
+            storage,
+            network,
+            workload,
         } => {
+            setup_logging(verbose)?;
             println!("Verifying cluster isolation...");
+
+            // Build assessment config: if no flags specified, run all; otherwise only specified ones
+            let assessment_config =
+                AssessmentConfig::from_flags(control_plane, storage, network, workload);
+            println!("Assessment config: {}", assessment_config);
+
             let tenant1_config = TenantClusterConfig {
                 cluster: KubernetesClient::load_with_retry(&tenant1_kubeconfig_path, 5).await?,
                 namespace: tenant1_namespace,
@@ -251,6 +295,120 @@ async fn main() -> anyhow::Result<()> {
                 cluster: KubernetesClient::load_with_retry(&tenant2_kubeconfig_path, 5).await?,
                 namespace: tenant2_namespace,
             };
+
+            let tenant1_config = Arc::new(tenant1_config);
+            let tenant2_config = Arc::new(tenant2_config);
+
+            // Common config
+            // let config = FairnessTestConfig::default();
+
+            // Control Plane
+            // let cp_assessor =
+            //     ControlPlaneFairnessAssessor::new(ControlPlaneFairnessConfig::default());
+            // let cp_result = run_fairness_assessment(
+            //     &cp_assessor,
+            //     tenant1_config.clone(),
+            //     tenant2_config.clone(),
+            //     &config,
+            // )
+            // .await?;
+
+            // Network
+            // let net_assessor = NetworkFairnessAssessor::new(NetworkFairnessConfig::default());
+            // let net_result = run_detailed_fairness_assessment(
+            //     &net_assessor,
+            //     tenant1_config.clone(),
+            //     tenant2_config.clone(),
+            //     &config,
+            //     true,
+            //     Some("results/net"),
+            // )
+            // .await?;
+
+            // Storage
+            // let storage_assessor = StorageFairnessAssessor::new(StorageFairnessConfig::default());
+            // let storage_result = run_fairness_assessment(
+            //     &storage_assessor,
+            //     tenant1_config.clone(),
+            //     tenant2_config.clone(),
+            //     &config,
+            // )
+            // .await?;
+
+            // println!(
+            //     "Control Plane degradation: {:.1}%",
+            //     cp_result.latency_degradation * 100.0
+            // );
+            // println!(
+            //     "Network degradation: {:.1}%",
+            //     net_result.result.latency_degradation * 100.0
+            // );
+            // println!(
+            //     "Storage degradation: {:.1}%",
+            //     storage_result.latency_degradation * 100.0
+            // );
+
+            // manual_test_cross_tenant_operation(
+            //     &tenant1_config,
+            //     &tenant2_config,
+            //     &ControlPlaneResource::StorageClass,
+            //     &ControlPlaneOperation::Get,
+            //     false, // Don't cleanup - leave objects for inspection
+            // )
+            // .await?;
+
+            let report = assessment::assess_multitenancy(
+                tenant1_config.clone(),
+                tenant2_config.clone(),
+                &assessment_config,
+            )
+            .await
+            .context("Failed to run multitenancy assessment")?;
+
+            // Print individual subsystem reports if available
+            if let Some(cp) = &report.control_plane {
+                println!("{}", cp);
+            }
+            if let Some(storage) = &report.storage {
+                println!("{}", storage);
+            }
+            if let Some(network) = &report.network {
+                println!("{}", network);
+            }
+            if let Some(workload) = &report.workload {
+                println!("{}", workload);
+            }
+            println!("Multitenancy assessment report:\n{}", report);
+
+            // let assessment = assessment::ControlPlaneAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run control plane assessment")?;
+            // println!("Control plane isolation assessment report:\n{}", report);
+            // let assessment = assessment::WorkloadAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run workload assessment")?;
+            // println!("Workload isolation assessment report:\n{}", report);
+
+            // let assessment = assessment::StorageAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run storage assessment")?;
+            // println!("Storage isolation assessment report:\n{}", report);
+
+            // let assessment = assessment::NetworkAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run network assessment")?;
+            // println!("Network isolation assessment report:\n{}", report);
+
+            // let assessment = assessment::ControlPlaneAssessor {};
+            // let report = assessment::run_assessment(&assessment, &tenant1_config, &tenant2_config)
+            //     .await
+            //     .context("Failed to run control plane assessment")?;
+            // println!("Control plane isolation assessment report:\n{}", report);
+
             // let autonomy_result =
             //     verifier::check_control_plane_autonomy(&tenant1_config, &tenant2_config).await;
 
@@ -372,14 +530,14 @@ async fn main() -> anyhow::Result<()> {
             //         .context("Failed to verify storage isolation")?;
             // println!("{}", storage_isolation);
 
-            let storage_fairness = verifier::check_storage_fairness(
-                Arc::new(tenant1_config),
-                Arc::new(tenant2_config),
-                StorageFairnessTestConfig::default(),
-            )
-            .await
-            .context("Failed to verify storage fairness")?;
-            println!("{}", storage_fairness);
+            // let storage_fairness = verifier::check_storage_fairness(
+            //     Arc::new(tenant1_config),
+            //     Arc::new(tenant2_config),
+            //     StorageFairnessTestConfig::default(),
+            // )
+            // .await
+            // .context("Failed to verify storage fairness")?;
+            // println!("{}", storage_fairness);
 
             //println!("{}", network_report);
             // println!("Storage autonomy test passed: {}", storage_automony);
@@ -422,9 +580,16 @@ async fn get_or_create_tenant_cluster(
         ClusterEnvironmentType::Capsule => {
             KubernetesClusterBuilder::new(host_cluster.clone())
                 .with_isolation_technology(ControlPlaneIsolation::Capsule(tenant.to_string()))
-                .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
-                    tenant.to_string(),
-                ))
+                // .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
+                //     tenant.to_string(),
+                // ))
+                .with_kubeconfig_path(kubeconfig_path)
+                .build()
+                .await?
+        }
+        ClusterEnvironmentType::CapsuleProxy => {
+            KubernetesClusterBuilder::new(host_cluster.clone())
+                .with_isolation_technology(ControlPlaneIsolation::CapsuleProxy(tenant.to_string()))
                 .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
@@ -442,6 +607,13 @@ async fn get_or_create_tenant_cluster(
         ClusterEnvironmentType::KubeVirt => {
             KubernetesClusterBuilder::new(host_cluster.clone())
                 .with_isolation_technology(ControlPlaneIsolation::KubeVirt(tenant.to_string()))
+                .with_kubeconfig_path(kubeconfig_path)
+                .build()
+                .await?
+        }
+        ClusterEnvironmentType::Kamaji => {
+            KubernetesClusterBuilder::new(host_cluster.clone())
+                .with_isolation_technology(ControlPlaneIsolation::Kamaji(tenant.to_string()))
                 .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
@@ -575,4 +747,14 @@ fn parse_mapping(s: &str) -> anyhow::Result<(u16, u16)> {
     let container = parts[0].parse().context("Invalid container port")?;
     let host = parts[1].parse().context("Invalid host port")?;
     Ok((container, host))
+}
+
+fn setup_logging(verbose: bool) -> anyhow::Result<()> {
+    let filter_level = if verbose { Level::INFO } else { Level::ERROR };
+
+    tracing_subscriber::fmt()
+        .with_max_level(filter_level)
+        .init();
+
+    Ok(())
 }

@@ -32,7 +32,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::verifier::KubernetesObject;
+use crate::assessment::KubernetesObject;
 
 use super::DummyCRD;
 
@@ -661,6 +661,44 @@ impl KubernetesClient {
         }
     }
 
+    pub async fn wait_for_namespaced_resource_deletion<R>(
+        &self,
+        resource_name: &str,
+        namespace: &str,
+    ) -> Result<()>
+    where
+        R: Resource<Scope = NamespaceResourceScope>
+            + Metadata<Ty = ObjectMeta>
+            + Clone
+            + std::fmt::Debug
+            + serde::de::DeserializeOwned,
+    {
+        let api: Api<R> = Api::namespaced(self.client.clone(), namespace);
+
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", resource_name))
+            .timeout(290); // upper bound of how long we watch for
+
+        let resource_exists = api.get(resource_name).await.is_ok();
+
+        if !resource_exists {
+            return Ok(());
+        }
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(status) = stream.try_next().await? {
+            if let WatchEvent::Deleted(_) = status {
+                return Ok(());
+            } else {
+                if api.get(resource_name).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow!("Resource was not deleted in time"))
+    }
+
     /*
     pub async fn wait_for_resource_to_be_ready<R>(
         &self,
@@ -1184,17 +1222,47 @@ impl KubernetesClient {
         command: &str,
     ) -> Result<String> {
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
-        let attached_process = pods_api
-            .exec(
-                pod_name,
-                vec!["sh", "-c", command],
-                &AttachParams::default().stderr(false),
-            )
-            .await?;
-        let output = get_output(attached_process).await;
 
-        Ok(output)
+        // Retry logic for exec - some proxies (like Capsule Proxy) need time to sync
+        let max_retries = 3;
+        let mut last_error = None;
+        let retry_wait_duration = tokio::time::Duration::from_secs(2);
+
+        for attempt in 1..=max_retries {
+            tracing::info!(
+                "exec attempt {}/{}: pod={}, namespace={}, command={}",
+                attempt,
+                max_retries,
+                pod_name,
+                namespace,
+                command
+            );
+
+            match pods_api
+                .exec(
+                    pod_name,
+                    vec!["sh", "-c", command],
+                    &AttachParams::default().stderr(false),
+                )
+                .await
+            {
+                Ok(attached_process) => {
+                    let output = get_output(attached_process).await;
+                    return Ok(output);
+                }
+                Err(e) => {
+                    tracing::error!("exec attempt {} failed: {:?}", attempt, e);
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        tokio::time::sleep(retry_wait_duration).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap().into())
     }
+
     pub async fn exec_command_in_container_with_status(
         &self,
         pod_name: &str,
@@ -1202,23 +1270,49 @@ impl KubernetesClient {
         command: &str,
     ) -> Result<Status> {
         let pods_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
-        let mut attached_process = pods_api
-            .exec(
+
+        // Retry logic for exec - some proxies (like Capsule Proxy) need time to sync
+        let max_retries = 3;
+        let mut last_error = None;
+
+        for attempt in 1..=max_retries {
+            tracing::info!(
+                "exec_with_status attempt {}/{}: pod={}, namespace={}, command={}",
+                attempt,
+                max_retries,
                 pod_name,
-                vec!["sh", "-c", command],
-                &AttachParams::default().stderr(false),
-            )
-            .await?;
+                namespace,
+                command
+            );
+            match pods_api
+                .exec(
+                    pod_name,
+                    vec!["sh", "-c", command],
+                    &AttachParams::default().stderr(false),
+                )
+                .await
+            {
+                Ok(mut attached_process) => {
+                    let exit_status = attached_process
+                        .take_status()
+                        .ok_or(Error::msg(
+                            "Failed to get process status. The process might still be running.",
+                        ))?
+                        .await
+                        .ok_or(Error::msg("Failed to wait for process status"))?;
+                    return Ok(exit_status);
+                }
+                Err(e) => {
+                    tracing::error!("exec_with_status attempt {} failed: {:?}", attempt, e);
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
 
-        let exit_status = attached_process
-            .take_status()
-            .ok_or(Error::msg(
-                "Failed to get process status. The process might still be running.",
-            ))?
-            .await
-            .ok_or(Error::msg("Failed to wait for process status"))?;
-
-        Ok(exit_status)
+        Err(last_error.unwrap().into())
     }
 
     pub async fn dyn_object_exists(
