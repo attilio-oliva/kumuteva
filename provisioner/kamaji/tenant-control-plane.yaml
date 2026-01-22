@@ -1,0 +1,44 @@
+# Sample Kamaji TenantControlPlane configuration
+# This file serves as a reference for customizing tenant control planes
+#
+# For full documentation, see: https://kamaji.clastix.io/
+
+apiVersion: kamaji.clastix.io/v1alpha1
+kind: TenantControlPlane
+metadata:
+  name: tcp-sample
+  namespace: tenant-namespace
+spec:
+  # Datastore configuration - uses the default datastore
+  dataStore: default
+  
+  controlPlane:
+    deployment:
+      # Number of replicas for the control plane
+      replicas: 1
+    service:
+      # Service type for exposing the API server
+      # Options: ClusterIP, NodePort, LoadBalancer
+      serviceType: LoadBalancer
+      additionalMetadata:
+        labels:
+          tenant: sample
+  
+  kubernetes:
+    # Kubernetes version for the tenant control plane
+    version: "v1.30.0"
+    kubelet:
+      cgroupfs: systemd
+    admissionControllers:
+      - ResourceQuota
+      - LimitRanger
+  
+  networkProfile:
+    # Port for the API server
+    port: 6443
+  
+  addons:
+    # CoreDNS addon configuration
+    coreDNS: {}
+    # kube-proxy addon configuration
+    kubeProxy: {}
