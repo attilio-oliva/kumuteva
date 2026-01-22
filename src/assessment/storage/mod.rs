@@ -15,7 +15,7 @@ use crate::assessment::{
     run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
     SubsystemReport,
 };
-use crate::verifier::TenantClusterConfig;
+use crate::assessment::TenantClusterConfig;
 
 // =============================================================================
 // CONSTANTS

@@ -19,7 +19,7 @@ use crate::assessment::fairness_framework::{
     DetailedFairnessAssessor, DetailedPhaseResults, FairnessAssessor, FairnessTestConfig,
     MetricDataPoint, PhaseResults, TenantMetrics,
 };
-use crate::verifier::TenantClusterConfig;
+use crate::assessment::TenantClusterConfig;
 
 /// Storage fairness assessor configuration
 #[derive(Debug, Clone)]

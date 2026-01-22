@@ -24,8 +24,15 @@ use anyhow::Result;
 use async_trait::async_trait;
 use colored::Colorize;
 
-use crate::verifier::TenantClusterConfig;
+use crate::cluster::KubernetesClient;
 
+/// All the configuration needed to test a tenant cluster isolation.
+#[derive(Clone)]
+pub struct TenantClusterConfig {
+    pub cluster: KubernetesClient,
+    /// The namespace to use for the tenant's resources created during the tests.
+    pub namespace: String,
+}
 /// Configuration for which assessment systems to run.
 /// By default, all systems are enabled. If any flag is explicitly set,
 /// only the specified systems will be assessed.

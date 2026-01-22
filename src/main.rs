@@ -1,12 +1,12 @@
 mod assessment;
 mod cluster;
 mod external_crds;
-mod verifier;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
+use assessment::TenantClusterConfig;
 use clap::{Parser, Subcommand, ValueEnum};
 use cluster::TenantsPortMapping;
 use cluster::{
@@ -16,7 +16,6 @@ use cluster::{
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
 use tracing::Level;
-use verifier::TenantClusterConfig;
 
 use crate::assessment::{
     manual_test_cross_tenant_operation, run_detailed_fairness_assessment, run_fairness_assessment,
@@ -24,11 +23,8 @@ use crate::assessment::{
     ControlPlaneOperation, ControlPlaneResource, FairnessTestConfig, NetworkFairnessAssessor,
     NetworkFairnessConfig, StorageFairnessAssessor, StorageFairnessConfig,
 };
+
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
-use crate::verifier::{
-    ControlPlaneMultitenancyReport, NetworkFairnessTestConfig, NetworkFairnessTestResults,
-    ReportFormat, StorageFairnessTestConfig,
-};
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]

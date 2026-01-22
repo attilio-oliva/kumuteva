@@ -6,13 +6,13 @@ use kube::ResourceExt;
 use crate::{
     assessment::{
         control_plane::{
-            cleanup_test_resource, create_dynamic_object, get_existing_object_for_testing,
-            get_namespace_param, infer_isolation_from_error, is_valid_get_result,
-            requires_existing_object,
+            cleanup_test_resource, create_dynamic_object, create_minimal_object,
+            get_existing_object_for_testing, get_namespace_param, infer_isolation_from_error,
+            is_valid_get_result, requires_existing_object,
         },
-        CrossTenantResult, IsolationLevel,
+        CrossTenantResult, IsolationLevel, KubernetesObject,
     },
-    verifier::{create_minimal_object, KubernetesObject, TenantClusterConfig},
+    TenantClusterConfig,
 };
 
 /// Test cross-tenant CREATE isolation

@@ -7,11 +7,11 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use tracing::info;
 
+use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
     run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
     SubsystemReport,
 };
-use crate::verifier::TenantClusterConfig;
 
 // =============================================================================
 // CONSTANTS

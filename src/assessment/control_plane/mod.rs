@@ -2,9 +2,13 @@ mod autonomy;
 mod fairness;
 mod isolation;
 
+mod objects;
+mod utils;
+
 use autonomy::*;
 pub use fairness::*;
 use isolation::*;
+pub use objects::*;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
@@ -16,12 +20,13 @@ use kube::api::{DeleteParams, DynamicObject, ObjectMeta, TypeMeta};
 use kube::Api;
 use tokio::time::sleep;
 
+use crate::assessment::control_plane::utils::create_minimal_object;
 use crate::assessment::{
     AssessableResource, AutonomyRatio, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
     OperationAssessment, SubsystemReport,
 };
-use crate::verifier::TenantClusterConfig;
-use crate::verifier::{create_minimal_object, KubernetesObject};
+
+use crate::assessment::TenantClusterConfig;
 
 pub type ControlPlaneIsolationReport = SubsystemReport<ControlPlaneResource>;
 
