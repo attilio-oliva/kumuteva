@@ -390,15 +390,23 @@ async fn attempt_other_tenant_file_access(
         Ok(_) => info!("Released PV {} from tenant1", dynamic_pv_name),
         Err(e) => {
             let error_msg = e.to_string();
+            // Check for various forms of access denial:
+            // - "cannot patch resource" / "forbidden" - standard RBAC denial
+            // - "not found" - Capsule proxy hides cluster-scoped resources from tenants
+            // - "not allowed" - Capsule proxy explicit denial
+            // - deserialization errors with "Status" - kube client failing to parse error response
             if error_msg.contains("cannot patch resource \"persistentvolumes\"")
                 || error_msg.contains("forbidden")
+                || error_msg.contains("not found")
+                || error_msg.contains("not allowed")
+                || (error_msg.contains("Status") && error_msg.contains("deserializ"))
             {
                 info!(
-                    "PV {} patch operation is forbidden for tenant1. Storage is isolated by RBAC.",
+                    "PV {} access is blocked for tenant1 (proxy/RBAC restriction). Storage is isolated.",
                     dynamic_pv_name
                 );
                 return Ok(AccessResult::IsolatedByPolicy(
-                    "Cannot patch PersistentVolume - RBAC restriction".to_string(),
+                    "Cannot access PersistentVolume - cluster-scoped resource blocked by proxy/RBAC".to_string(),
                 ));
             }
             info!(
