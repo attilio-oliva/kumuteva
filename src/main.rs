@@ -581,9 +581,9 @@ async fn get_or_create_tenant_cluster(
         ClusterEnvironmentType::Capsule => {
             KubernetesClusterBuilder::new(host_cluster.clone())
                 .with_isolation_technology(ControlPlaneIsolation::Capsule(tenant.to_string()))
-                .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
-                    tenant.to_string(),
-                ))
+                // .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
+                //     tenant.to_string(),
+                // ))
                 .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
@@ -744,7 +744,7 @@ fn parse_mapping(s: &str) -> anyhow::Result<(u16, u16)> {
 }
 
 fn setup_logging(verbose: bool) -> anyhow::Result<()> {
-    let filter_level = if verbose { Level::INFO } else { Level::WARN };
+    let filter_level = if verbose { Level::INFO } else { Level::ERROR };
 
     tracing_subscriber::fmt()
         .with_max_level(filter_level)

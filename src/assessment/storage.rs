@@ -27,7 +27,7 @@ const FILE_CONTENT: &str = "Hello, this is a tenant1 using Kumuteva!";
 const MOUNT_PATH: &str = "/usr/share/nginx/html";
 const HOSTPATH_MOUNT_PATH: &str = "/tmp/kumuteva-hostpath";
 const STORAGE_SIZE: &str = "1Gi";
-const POD_CREATION_TIMEOUT: u32 = 30;
+const POD_CREATION_TIMEOUT: u32 = 60;
 
 // =============================================================================
 // RESOURCE AND OPERATION DEFINITIONS

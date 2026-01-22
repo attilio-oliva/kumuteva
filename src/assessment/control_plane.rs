@@ -3,9 +3,9 @@ use std::fmt::Display;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::Pod;
-use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
-use kube::ResourceExt;
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use kube::api::{DeleteParams, DynamicObject, ObjectMeta, TypeMeta};
+use kube::{Api, ResourceExt};
 use tokio::time::sleep;
 
 use crate::assessment::{
@@ -394,6 +394,35 @@ fn is_valid_object(obj: &DynamicObject) -> bool {
     obj.metadata.name.is_some()
 }
 
+/// Delete a test resource and clean up any associated resources (like PVCs for StatefulSets)
+async fn cleanup_test_resource(
+    tenant: &TenantClusterConfig,
+    object_kind: &KubernetesObject,
+    test_name: &str,
+    namespace: Option<&str>,
+) {
+    // Delete the main resource
+    let _ = tenant
+        .cluster
+        .delete_resource_dyn(object_kind, test_name, namespace)
+        .await;
+
+    // For StatefulSets, also delete the PVCs created by volumeClaimTemplates
+    // PVC naming pattern: <volumeClaimTemplate-name>-<statefulset-name>-<ordinal>
+    // Since our volumeClaimTemplate name equals the StatefulSet name, pattern is: <name>-<name>-0
+    if *object_kind == KubernetesObject::StatefulSet {
+        if let Some(ns) = namespace {
+            // The PVC name follows the pattern: <volumeClaimTemplate-name>-<statefulset-name>-<ordinal>
+            // Our template uses the same name as the StatefulSet, so: <test_name>-<test_name>-0
+            let pvc_name = format!("{}-{}-0", test_name, test_name);
+            let _ = tenant
+                .cluster
+                .delete_resource_in_namespace::<PersistentVolumeClaim>(&pvc_name, ns)
+                .await;
+        }
+    }
+}
+
 // =============================================================================
 // AUTONOMY TESTS (Actual operation attempts)
 // =============================================================================
@@ -428,10 +457,7 @@ async fn test_autonomy_create(
 
     // Cleanup regardless of result
     if create_result.is_ok() {
-        let _ = tenant
-            .cluster
-            .delete_resource_dyn(object_kind, &test_name, namespace)
-            .await;
+        cleanup_test_resource(tenant, object_kind, &test_name, namespace).await;
     }
 
     Ok(create_result.is_ok())
@@ -529,10 +555,7 @@ async fn test_autonomy_get(
         .await;
 
     // Cleanup
-    let _ = tenant
-        .cluster
-        .delete_resource_dyn(object_kind, &test_name, namespace)
-        .await;
+    cleanup_test_resource(tenant, object_kind, &test_name, namespace).await;
 
     // Validate that the returned object is actually valid
     Ok(get_result
@@ -688,10 +711,7 @@ async fn test_autonomy_update(
         .await;
 
     // Cleanup
-    let _ = tenant
-        .cluster
-        .delete_resource_dyn(object_kind, &test_name, namespace)
-        .await;
+    cleanup_test_resource(tenant, object_kind, &test_name, namespace).await;
 
     Ok(update_result.is_ok())
 }
@@ -744,6 +764,17 @@ async fn test_autonomy_delete(
         .cluster
         .delete_resource_dyn(object_kind, &test_name, namespace)
         .await;
+
+    // For StatefulSets, also clean up the PVC (even if delete failed, PVC might exist)
+    if *object_kind == KubernetesObject::StatefulSet {
+        if let Some(ns) = namespace {
+            let pvc_name = format!("{}-{}-0", test_name, test_name);
+            let _ = tenant
+                .cluster
+                .delete_resource_in_namespace::<PersistentVolumeClaim>(&pvc_name, ns)
+                .await;
+        }
+    }
 
     Ok(delete_result.is_ok())
 }
@@ -860,10 +891,7 @@ async fn test_cross_tenant_create(
     };
 
     // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_resource_dyn(object_kind, &test_name, t1_namespace)
-        .await;
+    cleanup_test_resource(tenant1, object_kind, &test_name, t1_namespace).await;
 
     Ok(result)
 }
@@ -1016,10 +1044,7 @@ async fn test_cross_tenant_update(
     };
 
     // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_resource_dyn(object_kind, &test_name, namespace)
-        .await;
+    cleanup_test_resource(tenant1, object_kind, &test_name, namespace).await;
 
     Ok(result)
 }
@@ -1249,10 +1274,7 @@ async fn test_cross_tenant_get(
     };
 
     // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_resource_dyn(object_kind, &test_name, namespace)
-        .await;
+    cleanup_test_resource(tenant1, object_kind, &test_name, namespace).await;
 
     Ok(result)
 }
@@ -1449,10 +1471,7 @@ async fn test_cross_tenant_list(
     };
 
     // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_resource_dyn(object_kind, &test_name, namespace)
-        .await;
+    cleanup_test_resource(tenant1, object_kind, &test_name, namespace).await;
 
     Ok(result)
 }
@@ -1629,6 +1648,16 @@ async fn test_cross_tenant_delete(
 
             if !exists {
                 // Object was deleted - no isolation
+                // Still need to clean up PVC if it was a StatefulSet
+                if *object_kind == KubernetesObject::StatefulSet {
+                    if let Some(ns) = namespace {
+                        let pvc_name = format!("{}-{}-0", test_name, test_name);
+                        let _ = tenant1
+                            .cluster
+                            .delete_resource_in_namespace::<PersistentVolumeClaim>(&pvc_name, ns)
+                            .await;
+                    }
+                }
                 CrossTenantResult {
                     autonomy: true,
                     isolation: IsolationLevel::None,
@@ -1639,6 +1668,8 @@ async fn test_cross_tenant_delete(
                 }
             } else {
                 // Object still exists - delete was silently ignored (soft isolation)
+                // Clean up the object since it wasn't actually deleted
+                cleanup_test_resource(tenant1, object_kind, &test_name, namespace).await;
                 CrossTenantResult {
                     autonomy: true,
                     isolation: IsolationLevel::Soft(
@@ -1656,10 +1687,7 @@ async fn test_cross_tenant_delete(
             let isolation = infer_isolation_from_error(&error_msg);
 
             // Cleanup since delete failed
-            let _ = tenant1
-                .cluster
-                .delete_resource_dyn(object_kind, &test_name, namespace)
-                .await;
+            cleanup_test_resource(tenant1, object_kind, &test_name, namespace).await;
 
             CrossTenantResult {
                 autonomy: true,
@@ -2198,6 +2226,16 @@ pub async fn manual_test_cross_tenant_operation(
             Ok(_) => println!("  Cleanup successful"),
             Err(e) => println!("  Cleanup failed: {}", e),
         }
+        // Also cleanup PVC for StatefulSets
+        if k8s_obj.kind() == "StatefulSet" {
+            if let Some(ns) = namespace {
+                let pvc_name = format!("{}-{}-0", test_name, test_name);
+                let pvc_api = tenant1
+                    .cluster
+                    .delete_resource_in_namespace::<PersistentVolumeClaim>(&pvc_name, ns)
+                    .await;
+            }
+        }
     } else {
         println!("\n[NO CLEANUP] Test object left in place for manual inspection:");
         println!("  Resource: {}", k8s_obj.kind());
@@ -2321,6 +2359,15 @@ pub async fn manual_test_autonomy(
                             .cluster
                             .delete_resource_dyn(&k8s_obj, &test_name, namespace)
                             .await;
+                        // Also cleanup PVC for StatefulSets
+                        if k8s_obj.kind() == "StatefulSet" {
+                            if let Some(ns) = namespace {
+                                let pvc_name = format!("{}-{}-0", test_name, test_name);
+                                let pvc_api: Api<PersistentVolumeClaim> =
+                                    Api::namespaced(tenant.cluster.client().clone(), ns);
+                                let _ = pvc_api.delete(&pvc_name, &DeleteParams::default()).await;
+                            }
+                        }
                     }
                 }
                 ControlPlaneOperation::Get => {
@@ -2362,6 +2409,15 @@ pub async fn manual_test_autonomy(
                             .cluster
                             .delete_resource_dyn(&k8s_obj, &test_name, namespace)
                             .await;
+                        // Also cleanup PVC for StatefulSets
+                        if k8s_obj.kind() == "StatefulSet" {
+                            if let Some(ns) = namespace {
+                                let pvc_name = format!("{}-{}-0", test_name, test_name);
+                                let pvc_api: Api<PersistentVolumeClaim> =
+                                    Api::namespaced(tenant.cluster.client().clone(), ns);
+                                let _ = pvc_api.delete(&pvc_name, &DeleteParams::default()).await;
+                            }
+                        }
                     }
                 }
                 ControlPlaneOperation::Update => {
@@ -2394,6 +2450,15 @@ pub async fn manual_test_autonomy(
                             .cluster
                             .delete_resource_dyn(&k8s_obj, &test_name, namespace)
                             .await;
+                        // Also cleanup PVC for StatefulSets
+                        if k8s_obj.kind() == "StatefulSet" {
+                            if let Some(ns) = namespace {
+                                let pvc_name = format!("{}-{}-0", test_name, test_name);
+                                let pvc_api: Api<PersistentVolumeClaim> =
+                                    Api::namespaced(tenant.cluster.client().clone(), ns);
+                                let _ = pvc_api.delete(&pvc_name, &DeleteParams::default()).await;
+                            }
+                        }
                     }
                 }
                 ControlPlaneOperation::Delete => {
@@ -2413,6 +2478,16 @@ pub async fn manual_test_autonomy(
                         .delete_resource_dyn(&k8s_obj, &test_name, namespace)
                         .await;
                     print_operation_result("DELETE", &result);
+
+                    // For DELETE test, also cleanup PVC for StatefulSets since the delete is the test
+                    if k8s_obj.kind() == "StatefulSet" {
+                        if let Some(ns) = namespace {
+                            let pvc_name = format!("{}-{}-0", test_name, test_name);
+                            let pvc_api: Api<PersistentVolumeClaim> =
+                                Api::namespaced(tenant.cluster.client().clone(), ns);
+                            let _ = pvc_api.delete(&pvc_name, &DeleteParams::default()).await;
+                        }
+                    }
                 }
                 ControlPlaneOperation::List => unreachable!(),
             }

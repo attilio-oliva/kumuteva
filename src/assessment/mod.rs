@@ -113,7 +113,7 @@ impl Display for AssessmentConfig {
         if systems.is_empty() {
             write!(f, "No systems enabled")
         } else {
-            write!(f, "Assessing: {}", systems.join(", "))
+            write!(f, "Assessing {}", systems.join(", "))
         }
     }
 }
@@ -744,7 +744,8 @@ pub async fn assess_multitenancy(
     let (control_plane, control_plane_autonomy_levels) = if config.control_plane {
         let cp = run_assessment(&ControlPlaneAssessor, &tenant1, &tenant2).await?;
         let levels = calculate_control_plane_autonomy_levels(&cp.assessments);
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Allow cluster to recover after intensive control plane tests
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         (Some(cp), Some(levels))
     } else {
         (None, None)
