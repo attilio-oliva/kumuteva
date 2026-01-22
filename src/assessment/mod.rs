@@ -31,6 +31,93 @@ use colored::Colorize;
 
 use crate::verifier::TenantClusterConfig;
 
+/// Configuration for which assessment systems to run.
+/// By default, all systems are enabled. If any flag is explicitly set,
+/// only the specified systems will be assessed.
+#[derive(Debug, Clone, Default)]
+pub struct AssessmentConfig {
+    pub control_plane: bool,
+    pub storage: bool,
+    pub network: bool,
+    pub workload: bool,
+}
+
+impl AssessmentConfig {
+    /// Create a new config with all systems enabled
+    pub fn all() -> Self {
+        Self {
+            control_plane: true,
+            storage: true,
+            network: true,
+            workload: true,
+        }
+    }
+
+    /// Create a new config with no systems enabled
+    pub fn none() -> Self {
+        Self {
+            control_plane: false,
+            storage: false,
+            network: false,
+            workload: false,
+        }
+    }
+
+    /// Create config from CLI flags.
+    /// If no flags are set, all systems are enabled (default behavior).
+    /// If any flag is set, only those systems are enabled (exclusive mode).
+    pub fn from_flags(control_plane: bool, storage: bool, network: bool, workload: bool) -> Self {
+        let any_specified = control_plane || storage || network || workload;
+
+        if any_specified {
+            // Exclusive mode: only run what was explicitly specified
+            Self {
+                control_plane,
+                storage,
+                network,
+                workload,
+            }
+        } else {
+            // Default mode: run all assessments
+            Self::all()
+        }
+    }
+
+    /// Check if any system is enabled
+    pub fn has_any(&self) -> bool {
+        self.control_plane || self.storage || self.network || self.workload
+    }
+
+    /// Get a list of enabled system names
+    pub fn enabled_systems(&self) -> Vec<&'static str> {
+        let mut systems = Vec::new();
+        if self.control_plane {
+            systems.push("control-plane");
+        }
+        if self.storage {
+            systems.push("storage");
+        }
+        if self.network {
+            systems.push("network");
+        }
+        if self.workload {
+            systems.push("workload");
+        }
+        systems
+    }
+}
+
+impl Display for AssessmentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let systems = self.enabled_systems();
+        if systems.is_empty() {
+            write!(f, "No systems enabled")
+        } else {
+            write!(f, "Assessing: {}", systems.join(", "))
+        }
+    }
+}
+
 /// Isolation level for cross-tenant operations
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IsolationLevel {
@@ -578,29 +665,47 @@ impl<R: AssessableResource> Display for SubsystemReport<R> {
 }
 
 pub struct MultitenancyReport {
-    pub control_plane: SubsystemReport<ControlPlaneResource>,
-    pub control_plane_autonomy_levels: ControlPlaneAutonomyLevels,
-    pub storage: SubsystemReport<StorageResource>,
-    pub network: SubsystemReport<NetworkResource>,
-    pub workload: SubsystemReport<WorkloadResource>,
+    pub control_plane: Option<SubsystemReport<ControlPlaneResource>>,
+    pub control_plane_autonomy_levels: Option<ControlPlaneAutonomyLevels>,
+    pub storage: Option<SubsystemReport<StorageResource>>,
+    pub network: Option<SubsystemReport<NetworkResource>>,
+    pub workload: Option<SubsystemReport<WorkloadResource>>,
 }
 
 impl MultitenancyReport {
     pub fn overall_isolation(&self) -> IsolationLevel {
-        compute_overall_isolation_level(&[
-            self.control_plane.isolation_level.clone(),
-            self.storage.isolation_level.clone(),
-            self.network.isolation_level.clone(),
-            self.workload.isolation_level.clone(),
-        ])
+        let levels: Vec<IsolationLevel> = [
+            self.control_plane
+                .as_ref()
+                .map(|r| r.isolation_level.clone()),
+            self.storage.as_ref().map(|r| r.isolation_level.clone()),
+            self.network.as_ref().map(|r| r.isolation_level.clone()),
+            self.workload.as_ref().map(|r| r.isolation_level.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        if levels.is_empty() {
+            return IsolationLevel::Unknown;
+        }
+        compute_overall_isolation_level(&levels)
     }
 
     pub fn overall_autonomy_ratio(&self) -> AutonomyRatio {
         let mut total = AutonomyRatio::default();
-        total.add(&self.control_plane.autonomy_ratio);
-        total.add(&self.storage.autonomy_ratio);
-        total.add(&self.network.autonomy_ratio);
-        total.add(&self.workload.autonomy_ratio);
+        if let Some(cp) = &self.control_plane {
+            total.add(&cp.autonomy_ratio);
+        }
+        if let Some(s) = &self.storage {
+            total.add(&s.autonomy_ratio);
+        }
+        if let Some(n) = &self.network {
+            total.add(&n.autonomy_ratio);
+        }
+        if let Some(w) = &self.workload {
+            total.add(&w.autonomy_ratio);
+        }
         total
     }
 }
@@ -634,17 +739,38 @@ fn calculate_control_plane_autonomy_levels(
 pub async fn assess_multitenancy(
     tenant1: Arc<TenantClusterConfig>,
     tenant2: Arc<TenantClusterConfig>,
+    config: &AssessmentConfig,
 ) -> Result<MultitenancyReport> {
-    let control_plane = run_assessment(&ControlPlaneAssessor, &tenant1, &tenant2).await?;
-    let control_plane_autonomy_levels =
-        calculate_control_plane_autonomy_levels(&control_plane.assessments);
-    // sleep after every major assessment to allow resources to settle
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let storage = run_assessment(&StorageAssessor, &tenant1, &tenant2).await?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let network = run_assessment(&NetworkAssessor, &tenant1, &tenant2).await?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let workload = run_assessment(&WorkloadAssessor, &tenant1, &tenant2).await?;
+    let (control_plane, control_plane_autonomy_levels) = if config.control_plane {
+        let cp = run_assessment(&ControlPlaneAssessor, &tenant1, &tenant2).await?;
+        let levels = calculate_control_plane_autonomy_levels(&cp.assessments);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        (Some(cp), Some(levels))
+    } else {
+        (None, None)
+    };
+
+    let storage = if config.storage {
+        let s = run_assessment(&StorageAssessor, &tenant1, &tenant2).await?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        Some(s)
+    } else {
+        None
+    };
+
+    let network = if config.network {
+        let n = run_assessment(&NetworkAssessor, &tenant1, &tenant2).await?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        Some(n)
+    } else {
+        None
+    };
+
+    let workload = if config.workload {
+        Some(run_assessment(&WorkloadAssessor, &tenant1, &tenant2).await?)
+    } else {
+        None
+    };
 
     Ok(MultitenancyReport {
         control_plane,
@@ -689,90 +815,110 @@ fn format_isolation(level: &IsolationLevel) -> String {
 
 impl Display for MultitenancyReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let rows = vec![
-            // Control Plane section
-            ReportRow {
+        let mut rows = Vec::new();
+        let mut first_section = true;
+
+        // Helper to add separator if not first section
+        let add_separator = |rows: &mut Vec<ReportRow>, is_first: &mut bool| {
+            if !*is_first {
+                rows.push(ReportRow {
+                    system: "─────────────".to_string(),
+                    property: "─────────────────".to_string(),
+                    value: "─────────────────".to_string(),
+                });
+            }
+            *is_first = false;
+        };
+
+        // Control Plane section
+        if let Some(control_plane) = &self.control_plane {
+            add_separator(&mut rows, &mut first_section);
+            rows.push(ReportRow {
                 system: "Control Plane".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(&self.control_plane.isolation_level),
-            },
-            ReportRow {
+                value: format_isolation(&control_plane.isolation_level),
+            });
+            rows.push(ReportRow {
                 system: "".to_string(),
                 property: "Autonomy".to_string(),
-                value: format_ratio_with_icon(&self.control_plane.autonomy_ratio),
-            },
-            ReportRow {
-                system: "".to_string(),
-                property: "  ├─ Workload".to_string(),
-                value: format_ratio_with_icon(&self.control_plane_autonomy_levels.workload),
-            },
-            ReportRow {
-                system: "".to_string(),
-                property: "  ├─ Scope".to_string(),
-                value: format_ratio_with_icon(&self.control_plane_autonomy_levels.scope),
-            },
-            ReportRow {
-                system: "".to_string(),
-                property: "  ├─ Infrastructure".to_string(),
-                value: format_ratio_with_icon(&self.control_plane_autonomy_levels.infrastructure),
-            },
-            ReportRow {
-                system: "".to_string(),
-                property: "  └─ Cluster".to_string(),
-                value: format_ratio_with_icon(&self.control_plane_autonomy_levels.cluster),
-            },
-            // Separator row
-            ReportRow {
-                system: "─────────────".to_string(),
-                property: "─────────────────".to_string(),
-                value: "─────────────────".to_string(),
-            },
-            // Storage section
-            ReportRow {
+                value: format_ratio_with_icon(&control_plane.autonomy_ratio),
+            });
+
+            if let Some(levels) = &self.control_plane_autonomy_levels {
+                rows.push(ReportRow {
+                    system: "".to_string(),
+                    property: "  ├─ Workload".to_string(),
+                    value: format_ratio_with_icon(&levels.workload),
+                });
+                rows.push(ReportRow {
+                    system: "".to_string(),
+                    property: "  ├─ Scope".to_string(),
+                    value: format_ratio_with_icon(&levels.scope),
+                });
+                rows.push(ReportRow {
+                    system: "".to_string(),
+                    property: "  ├─ Infrastructure".to_string(),
+                    value: format_ratio_with_icon(&levels.infrastructure),
+                });
+                rows.push(ReportRow {
+                    system: "".to_string(),
+                    property: "  └─ Cluster".to_string(),
+                    value: format_ratio_with_icon(&levels.cluster),
+                });
+            }
+        }
+
+        // Storage section
+        if let Some(storage) = &self.storage {
+            add_separator(&mut rows, &mut first_section);
+            rows.push(ReportRow {
                 system: "Storage".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(&self.storage.isolation_level),
-            },
-            ReportRow {
+                value: format_isolation(&storage.isolation_level),
+            });
+            rows.push(ReportRow {
                 system: "".to_string(),
                 property: "Autonomy".to_string(),
-                value: format_ratio_with_icon(&self.storage.autonomy_ratio),
-            },
-            // Separator row
-            ReportRow {
-                system: "─────────────".to_string(),
-                property: "─────────────────".to_string(),
-                value: "─────────────────".to_string(),
-            },
-            // Network section
-            ReportRow {
+                value: format_ratio_with_icon(&storage.autonomy_ratio),
+            });
+        }
+
+        // Network section
+        if let Some(network) = &self.network {
+            add_separator(&mut rows, &mut first_section);
+            rows.push(ReportRow {
                 system: "Network".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(&self.network.isolation_level),
-            },
-            ReportRow {
+                value: format_isolation(&network.isolation_level),
+            });
+            rows.push(ReportRow {
                 system: "".to_string(),
                 property: "Autonomy".to_string(),
-                value: format_ratio_with_icon(&self.network.autonomy_ratio),
-            },
-            // Separator row
-            ReportRow {
-                system: "─────────────".to_string(),
-                property: "─────────────────".to_string(),
-                value: "─────────────────".to_string(),
-            },
-            // Workload section
-            ReportRow {
+                value: format_ratio_with_icon(&network.autonomy_ratio),
+            });
+        }
+
+        // Workload section
+        if let Some(workload) = &self.workload {
+            add_separator(&mut rows, &mut first_section);
+            rows.push(ReportRow {
                 system: "Workload".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(&self.workload.isolation_level),
-            },
-            ReportRow {
+                value: format_isolation(&workload.isolation_level),
+            });
+            rows.push(ReportRow {
                 system: "".to_string(),
                 property: "Autonomy".to_string(),
-                value: format_ratio_with_icon(&self.workload.autonomy_ratio),
-            },
-        ];
+                value: format_ratio_with_icon(&workload.autonomy_ratio),
+            });
+        }
+
+        if rows.is_empty() {
+            writeln!(f, "\n📊 Multi-Tenancy Assessment Report")?;
+            writeln!(f, "══════════════════════════════════\n")?;
+            writeln!(f, "No assessments were run.")?;
+            return Ok(());
+        }
 
         let table = Table::new(rows)
             .with(Style::rounded())

@@ -19,9 +19,9 @@ use tracing::Level;
 use verifier::TenantClusterConfig;
 
 use crate::assessment::{
-    run_detailed_fairness_assessment, run_fairness_assessment, ControlPlaneFairnessAssessor,
-    ControlPlaneFairnessConfig, FairnessTestConfig, NetworkFairnessAssessor, NetworkFairnessConfig,
-    StorageFairnessAssessor, StorageFairnessConfig,
+    run_detailed_fairness_assessment, run_fairness_assessment, AssessmentConfig,
+    ControlPlaneFairnessAssessor, ControlPlaneFairnessConfig, FairnessTestConfig,
+    NetworkFairnessAssessor, NetworkFairnessConfig, StorageFairnessAssessor, StorageFairnessConfig,
 };
 use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
 use crate::verifier::{
@@ -122,6 +122,19 @@ enum Commands {
         tenant1_namespace: String,
         #[clap(long = "tenant2-ns", default_value = "tenant2")]
         tenant2_namespace: String,
+
+        /// Assess control plane isolation (exclusive if any system is specified)
+        #[clap(long = "control-plane", alias = "cp")]
+        control_plane: bool,
+        /// Assess storage isolation (exclusive if any system is specified)
+        #[clap(long = "storage", alias = "st")]
+        storage: bool,
+        /// Assess network isolation (exclusive if any system is specified)
+        #[clap(long = "network", alias = "net")]
+        network: bool,
+        /// Assess workload isolation (exclusive if any system is specified)
+        #[clap(long = "workload", alias = "wl")]
+        workload: bool,
     },
 }
 
@@ -261,9 +274,19 @@ async fn main() -> anyhow::Result<()> {
             tenant2_kubeconfig_path,
             tenant1_namespace,
             tenant2_namespace,
+            control_plane,
+            storage,
+            network,
+            workload,
         } => {
             setup_logging(verbose)?;
             println!("Verifying cluster isolation...");
+
+            // Build assessment config: if no flags specified, run all; otherwise only specified ones
+            let assessment_config =
+                AssessmentConfig::from_flags(control_plane, storage, network, workload);
+            println!("Assessment config: {}", assessment_config);
+
             let tenant1_config = TenantClusterConfig {
                 cluster: KubernetesClient::load_with_retry(&tenant1_kubeconfig_path, 5).await?,
                 namespace: tenant1_namespace,
@@ -325,14 +348,27 @@ async fn main() -> anyhow::Result<()> {
             //     storage_result.latency_degradation * 100.0
             // );
 
-            let report =
-                assessment::assess_multitenancy(tenant1_config.clone(), tenant2_config.clone())
-                    .await
-                    .context("Failed to run multitenancy assessment")?;
-            println!("{}", report.control_plane);
-            println!("{}", report.storage);
-            println!("{}", report.network);
-            println!("{}", report.workload);
+            let report = assessment::assess_multitenancy(
+                tenant1_config.clone(),
+                tenant2_config.clone(),
+                &assessment_config,
+            )
+            .await
+            .context("Failed to run multitenancy assessment")?;
+
+            // Print individual subsystem reports if available
+            if let Some(cp) = &report.control_plane {
+                println!("{}", cp);
+            }
+            if let Some(storage) = &report.storage {
+                println!("{}", storage);
+            }
+            if let Some(network) = &report.network {
+                println!("{}", network);
+            }
+            if let Some(workload) = &report.workload {
+                println!("{}", workload);
+            }
             println!("Multitenancy assessment report:\n{}", report);
 
             // let assessment = assessment::ControlPlaneAssessor {};
