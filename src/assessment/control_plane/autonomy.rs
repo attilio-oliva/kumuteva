@@ -1,4 +1,5 @@
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+use tracing::info;
 
 use crate::assessment::control_plane::{
     cleanup_test_resource, create_dynamic_object, create_minimal_object,
@@ -11,11 +12,7 @@ pub(super) async fn test_autonomy_create(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> anyhow::Result<bool> {
-    // Special handling for resources that can't be created
-    if requires_existing_object(object_kind) {
-        // For resources like Node, CREATE is never allowed by tenants
-        return Ok(false);
-    }
+    // We try to create a resource even though requires_existing_object may be true
 
     let test_name = format!(
         "autonomy-create-{}",
@@ -61,32 +58,16 @@ pub(super) async fn test_autonomy_get(
                 .map(|obj| is_valid_get_result(&obj, &name))
                 .unwrap_or(false));
         }
+
+        info!(
+            "No existing resource found for {:?} to test GET {:?}",
+            object_kind, existing_name
+        );
+
         return Ok(false);
     }
 
     let namespace = get_namespace_param(object_kind, &tenant.namespace);
-
-    // First, try to LIST to see if there are existing resources we can GET
-    let list_result = tenant
-        .cluster
-        .list_resources_dyn(object_kind, namespace)
-        .await;
-
-    if let Ok(list) = list_result {
-        // If there are existing resources, try to GET one of them
-        if let Some(item) = list.items.first() {
-            if let Some(name) = &item.metadata.name {
-                let get_result = tenant
-                    .cluster
-                    .get_resource_dyn(object_kind, name, namespace)
-                    .await;
-                // Validate that the returned object is actually valid
-                return Ok(get_result
-                    .map(|obj| is_valid_get_result(&obj, name))
-                    .unwrap_or(false));
-            }
-        }
-    }
 
     // No existing resources - try to create one to test GET
     let test_name = format!(
@@ -106,23 +87,25 @@ pub(super) async fn test_autonomy_get(
         .await;
 
     if create_result.is_err() {
-        // Can't create and no existing resources to test with
-        // Check if the LIST is authorized - if not, GET is also not allowed
-        let list_check = tenant
+        // Check if the LIST is authorized and use it instead to get an object name
+        let list_result = tenant
             .cluster
             .list_resources_dyn(object_kind, namespace)
             .await;
 
-        match list_check {
-            Ok(_) => {
-                // LIST works but is empty and can't create - assume GET would work
-                // since LIST typically requires GET permissions
-                return Ok(true);
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                // If LIST is forbidden/not allowed, GET is likely forbidden too
-                return Ok(!is_authorization_error(&err_str));
+        if let Ok(list) = list_result {
+            // If there are existing resources, try to GET one of them
+            if let Some(item) = list.items.first() {
+                if let Some(name) = &item.metadata.name {
+                    let get_result = tenant
+                        .cluster
+                        .get_resource_dyn(object_kind, name, namespace)
+                        .await;
+                    // Validate that the returned object is actually valid
+                    return Ok(get_result
+                        .map(|obj| is_valid_get_result(&obj, name))
+                        .unwrap_or(false));
+                }
             }
         }
     }
@@ -204,49 +187,6 @@ pub(super) async fn test_autonomy_update(
 
     let namespace = get_namespace_param(object_kind, &tenant.namespace);
 
-    // First, try to find an existing resource to update
-    let list_result = tenant
-        .cluster
-        .list_resources_dyn(object_kind, namespace)
-        .await;
-
-    if let Ok(list) = list_result {
-        if let Some(item) = list.items.first() {
-            if let Some(name) = &item.metadata.name {
-                // Try to update an existing resource
-                let patch = kube::api::Patch::Merge(serde_json::json!({
-                    "metadata": {
-                        "labels": {
-                            "kumuteva-autonomy-update-test": "true"
-                        }
-                    }
-                }));
-
-                let update_result = tenant
-                    .cluster
-                    .patch_resource_dyn(object_kind, name, &patch, namespace)
-                    .await;
-
-                // Try to revert if successful
-                if update_result.is_ok() {
-                    let revert_patch = kube::api::Patch::Merge(serde_json::json!({
-                        "metadata": {
-                            "labels": {
-                                "kumuteva-autonomy-update-test": null
-                            }
-                        }
-                    }));
-                    let _ = tenant
-                        .cluster
-                        .patch_resource_dyn(object_kind, name, &revert_patch, namespace)
-                        .await;
-                }
-
-                return Ok(update_result.is_ok());
-            }
-        }
-    }
-
     // No existing resources - create one to test UPDATE
     let test_name = format!(
         "autonomy-update-{}",
@@ -265,7 +205,49 @@ pub(super) async fn test_autonomy_update(
         .await;
 
     if create_result.is_err() {
-        // Can't create and no existing resources - cannot test UPDATE
+        let list_result = tenant
+            .cluster
+            .list_resources_dyn(object_kind, namespace)
+            .await;
+
+        if let Ok(list) = list_result {
+            if let Some(item) = list.items.first() {
+                if let Some(name) = &item.metadata.name {
+                    // Try to update an existing resource
+                    let patch = kube::api::Patch::Merge(serde_json::json!({
+                        "metadata": {
+                            "labels": {
+                                "kumuteva-autonomy-update-test": "true"
+                            }
+                        }
+                    }));
+
+                    let update_result = tenant
+                        .cluster
+                        .patch_resource_dyn(object_kind, name, &patch, namespace)
+                        .await;
+
+                    // Try to revert if successful
+                    if update_result.is_ok() {
+                        let revert_patch = kube::api::Patch::Merge(serde_json::json!({
+                            "metadata": {
+                                "labels": {
+                                    "kumuteva-autonomy-update-test": null
+                                }
+                            }
+                        }));
+                        let _ = tenant
+                            .cluster
+                            .patch_resource_dyn(object_kind, name, &revert_patch, namespace)
+                            .await;
+                    }
+
+                    return Ok(update_result.is_ok());
+                }
+            }
+        }
+
+        // Can't create and no existing resources to test with
         return Ok(false);
     }
 
