@@ -745,21 +745,34 @@ pub(super) async fn test_cross_tenant_list_for_existing_resource(
 
     match (tenant1_list, tenant2_list) {
         (Ok(t1_items), Ok(t2_items)) => {
-            let t1_names: std::collections::HashSet<_> = t1_items
+            let t1_id_tuples: std::collections::HashSet<_> = t1_items
                 .items
                 .iter()
-                .filter_map(|n| n.metadata.name.clone())
+                .filter_map(|n| {
+                    let name = n.metadata.name.clone()?;
+                    let uid = n.metadata.uid.clone()?;
+                    Some((uid, name))
+                })
                 .collect();
 
-            let t2_names: std::collections::HashSet<_> = t2_items
+            let t2_id_tuples: std::collections::HashSet<_> = t2_items
                 .items
                 .iter()
-                .filter_map(|n| n.metadata.name.clone())
+                .filter_map(|n| {
+                    let name = n.metadata.name.clone()?;
+                    let uid = n.metadata.uid.clone()?;
+                    Some((uid, name))
+                })
                 .collect();
+
+            let t1_names: std::collections::HashSet<_> =
+                t1_id_tuples.iter().map(|(_, name)| name.clone()).collect();
+            let t2_names: std::collections::HashSet<_> =
+                t2_id_tuples.iter().map(|(_, name)| name.clone()).collect();
 
             // If both lists are empty, we cannot verify isolation
             // (can't tell if they share the same empty view or have separate empty views)
-            if t1_names.is_empty() && t2_names.is_empty() {
+            if t1_id_tuples.is_empty() && t2_id_tuples.is_empty() {
                 return Ok(CrossTenantResult {
                     autonomy: true, // Both can LIST (just returns empty)
                     isolation: IsolationLevel::Unknown,
@@ -770,15 +783,22 @@ pub(super) async fn test_cross_tenant_list_for_existing_resource(
                 });
             }
 
-            if t1_names == t2_names {
+            let same_names_warning = if t1_names == t2_names && t1_id_tuples != t2_id_tuples {
+                String::from("- WARNING: same names but different object UIDs detected")
+            } else {
+                String::new()
+            };
+
+            if t1_id_tuples == t2_id_tuples {
                 // Identical non-empty view - this is a shared view (no isolation)
                 Ok(CrossTenantResult {
                     autonomy: true,
                     isolation: IsolationLevel::None,
                     details: format!(
-                        "LIST shows shared {} view - both tenants see same {} items",
+                        "LIST shows shared {} view - both tenants see same {} items {}",
                         object_kind.kind(),
-                        t1_names.len()
+                        t1_id_tuples.len(),
+                        same_names_warning
                     ),
                 })
             } else {
@@ -786,10 +806,9 @@ pub(super) async fn test_cross_tenant_list_for_existing_resource(
                     autonomy: true,
                     isolation: IsolationLevel::Hard,
                     details: format!(
-                        "LIST has hard isolation for {} - different views (tenant1: {}, tenant2: {})",
+                        "LIST has hard isolation for {} - different views by comparing pair (UID, name)  {}",
                         object_kind.kind(),
-                        t1_names.len(),
-                        t2_names.len()
+                        same_names_warning
                     ),
                 })
             }
