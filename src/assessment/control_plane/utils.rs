@@ -26,7 +26,17 @@ pub(super) fn create_minimal_object(
             base_object["spec"] = serde_json::json!({
                 "containers": [{
                     "name": "test-container",
-                    "image": "nginx:latest"
+                    "image": "nginx:latest",
+                    "resources": {
+                        "requests": {
+                            "memory": "64Mi",
+                            "cpu": "250m"
+                        },
+                        "limits": {
+                            "memory": "128Mi",
+                            "cpu": "500m"
+                        }
+                    }
                 }]
             });
         }
@@ -169,7 +179,17 @@ pub(super) fn create_minimal_object(
                     "spec": {
                         "containers": [{
                             "name": "test-container",
-                            "image": "nginx:latest"
+                            "image": "nginx:latest",
+                            "resources": {
+                                "requests": {
+                                    "memory": "64Mi",
+                                    "cpu": "250m"
+                                },
+                                "limits": {
+                                    "memory": "128Mi",
+                                    "cpu": "500m"
+                                }
+                            }
                         }]
                     }
                 },

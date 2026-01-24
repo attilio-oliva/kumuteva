@@ -11,11 +11,11 @@ use k8s_openapi::api::{
 use serde::Serialize;
 use tracing::info;
 
+use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
     run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
     SubsystemReport,
 };
-use crate::assessment::TenantClusterConfig;
 
 // =============================================================================
 // CONSTANTS
@@ -577,6 +577,16 @@ fn create_tenant_statefulset_manifest<T: AsRef<str> + Serialize>(
                         "image": "nginx",
                         "command": commands,
                         "volumeMounts": [{ "mountPath": mount_path, "name": pvc_name }],
+                        "resources": {
+                            "requests": {
+                                "memory": "64Mi",
+                                "cpu": "250m"
+                            },
+                            "limits": {
+                                "memory": "128Mi",
+                                "cpu": "500m"
+                            }
+                        }
                     }],
                 },
             },

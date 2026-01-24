@@ -649,7 +649,17 @@ fn create_network_multitool_pod(name: &str) -> Pod {
             "containers": [{
                 "name": "multitool",
                 "image": "praqma/network-multitool",
-                "ports": [{ "containerPort": 80 }]
+                "ports": [{ "containerPort": 80 }],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }]
         }
     }))

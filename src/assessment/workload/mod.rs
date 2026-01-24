@@ -3,11 +3,11 @@ use k8s_openapi::api::core::v1::Pod;
 use std::fmt::Display;
 use tracing::info;
 
+use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
     run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
     SubsystemReport,
 };
-use crate::assessment::TenantClusterConfig;
 
 // Re-export for backward compatibility
 pub type WorkloadIsolationReport = SubsystemReport<WorkloadResource>;
@@ -1031,7 +1031,17 @@ fn create_privileged_escape_pod(pod_name: &str, node_name: &str) -> Pod {
                 "command": [
                     "sh", "-c",
                     script
-                ]
+                ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1075,7 +1085,17 @@ fn create_non_privileged_target_pod(pod_name: &str) -> Pod {
                     echo \"SECRET_DATA: $secret_data\" && \
                     mkdir -p /tmp/tenant2_marker && \
                     echo \"tenant2\" > /tmp/tenant2_marker/$secret_data && tail -f /tmp/tenant2_marker/$secret_data"
-                ]
+                ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1096,6 +1116,16 @@ fn create_host_user_test_pod(pod_name: &str) -> Pod {
                 "name": "test",
                 "image": "alpine:latest",
                 "command": ["sleep", "1"],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1121,6 +1151,16 @@ fn create_user_target_pod(pod_name: &str) -> Pod {
                 "command": [
                     "sleep", "3600"
                 ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1158,6 +1198,16 @@ fn create_user_spy_pod(pod_name: &str) -> Pod {
                        echo 'User namespace properly isolated (non-host mapping)'; \
                      fi"
                 ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1178,6 +1228,16 @@ fn create_host_pid_test_pod(pod_name: &str) -> Pod {
                 "name": "test",
                 "image": "alpine:latest",
                 "command": ["sleep", "1"],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1199,6 +1259,16 @@ fn create_privileged_test_pod(pod_name: &str) -> Pod {
                 "command": ["sleep", "1"],
                 "securityContext": {
                     "privileged": true
+                },
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
                 }
             }],
             "restartPolicy": "Never",
@@ -1220,6 +1290,16 @@ fn create_host_network_test_pod(pod_name: &str) -> Pod {
                 "name": "test",
                 "image": "alpine:latest",
                 "command": ["sleep", "1"],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1240,6 +1320,16 @@ fn create_host_ipc_test_pod(pod_name: &str) -> Pod {
                 "name": "test",
                 "image": "alpine:latest",
                 "command": ["sleep", "1"],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1277,7 +1367,17 @@ fn create_ipc_target_pod(pod_name: &str) -> Pod {
                 "command": [
                     "sh", "-c",
                     script
-                ]
+                ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1304,6 +1404,16 @@ fn create_ipc_spy_pod(pod_name: &str, node_name: &str) -> Pod {
                      fingerprint=`(ipcs -m; ipcs -s; ipcs -q) | sha1sum | cut -d' ' -f1` && \
                      echo 'Fingerprint: ' $fingerprint",
                 ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1334,6 +1444,16 @@ fn create_target_process_pod(pod_name: &str) -> Pod {
                        sleep 30; \
                      done"
                 ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1374,6 +1494,16 @@ fn create_process_spy_pod(pod_name: &str, node_name: &str, target_pod_name: &str
                         target_pod_name, target_pod_name
                     )
                 ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1404,7 +1534,17 @@ fn create_network_target_pod(pod_name: &str) -> Pod {
                     "echo 'Starting network target server...' && \
                      echo '<h1>TENANT2_NETWORK_TARGET</h1>' > /usr/share/nginx/html/index.html && \
                      nginx -g 'daemon off;'"
-                ]
+                ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
@@ -1440,6 +1580,16 @@ fn create_network_spy_pod(pod_name: &str, target_ip: &str) -> Pod {
                         target_ip, target_ip
                     )
                 ],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
             }],
             "restartPolicy": "Never",
         }
