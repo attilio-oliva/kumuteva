@@ -111,7 +111,7 @@ pub(super) async fn test_cross_tenant_create(
                     autonomy: false,
                     isolation: IsolationLevel::Hard,
                     details: format!(
-                        "CREATE not possible for {} - operation authorized but the new object does not appear",
+                        "CREATE ineffective for {} - operation authorized but the new object does not appear",
                         object_kind.kind()
                     ),
                 }
@@ -412,7 +412,7 @@ pub(super) async fn test_cross_tenant_update_for_existing_resource(
                     autonomy: false,
                     isolation: IsolationLevel::Hard,
                     details: format!(
-                        "UPDATE not possible for {} - operation authorized but modification not effective",
+                        "UPDATE ineffective for {} - operation authorized but modification not effective",
                         object_kind.kind()
                     ),
                 }
