@@ -96,11 +96,22 @@ pub(super) async fn test_cross_tenant_create(
                     }
                 }
             } else {
+                // CrossTenantResult {
+                //     autonomy: false,
+                //     isolation: IsolationLevel::Unknown,
+                //     details: format!(
+                //         "Cannot verify CREATE isolation for {} - object state unclear",
+                //         object_kind.kind()
+                //     ),
+                // }
+                // This is an edge case where the behavior is unclear (object not found after successful create)
+                // This may happen for virtual clusters where they hide or discard special objects like Nodes
+                // To be compliant with the paper model we assume no autonomy and hard isolation because basically the operation is not allowed
                 CrossTenantResult {
                     autonomy: false,
-                    isolation: IsolationLevel::Unknown,
+                    isolation: IsolationLevel::Hard,
                     details: format!(
-                        "Cannot verify CREATE isolation for {} - object state unclear",
+                        "CREATE not possible for {} - operation authorized but the new object does not appear",
                         object_kind.kind()
                     ),
                 }
@@ -385,13 +396,23 @@ pub(super) async fn test_cross_tenant_update_for_existing_resource(
                     ),
                 }
             } else {
+                // CrossTenantResult {
+                //     autonomy: true,
+                //     isolation: IsolationLevel::Soft(
+                //         "Update succeeded but modification not visible".to_string(),
+                //     ),
+                //     details: format!(
+                //         "UPDATE has soft isolation for {} - modification not effective",
+                //         object_kind.kind()
+                //     ),
+                // }
+
+                // To be compliant with the paper model we assume no autonomy and hard isolation
                 CrossTenantResult {
-                    autonomy: true,
-                    isolation: IsolationLevel::Soft(
-                        "Update succeeded but modification not visible".to_string(),
-                    ),
+                    autonomy: false,
+                    isolation: IsolationLevel::Hard,
                     details: format!(
-                        "UPDATE has soft isolation for {} - modification not effective",
+                        "UPDATE not possible for {} - operation authorized but modification not effective",
                         object_kind.kind()
                     ),
                 }
