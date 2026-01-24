@@ -342,7 +342,7 @@ pub async fn run_assessment<A: MultitenancyAssessor>(
                 OperationAssessment {
                     autonomy: false,
                     isolation: IsolationLevel::Hard, // If not authorized, it's safe by definition
-                    details: Some("Operation not authorized - no autonomy".to_string()),
+                    details: Some("Operation not authorized".to_string()),
                 }
             } else {
                 // Authorized - proceed with cross-tenant effect check
