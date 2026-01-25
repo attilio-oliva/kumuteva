@@ -1,4 +1,3 @@
-# scripts/deploy-vcluster.sh
 #!/bin/bash
 set -euo pipefail
 
