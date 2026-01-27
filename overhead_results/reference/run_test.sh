@@ -4,15 +4,17 @@ usage() {
     echo "Usage: $0 <n_tenant> <kubeconfig_path>"
     echo "  n_tenant: Number of tenats to generate"
     echo "  kubeconfig_path: Path to kubeconfig file"
+    echo "  duration: duration of the load for each tenant"
     exit 1
 }
 
 # Check arguments
-if [ $# -ne 2 ]; then
+if [ $# -ne 3 ]; then
     usage
 fi
 
 N_TENANT="$1"
+DURATION=$3
 
 export KUBECONFIG="$2"
 
@@ -23,7 +25,7 @@ else
     rm ../results/overhead_reference.csv
 fi
 
-echo "Start,End,Num_Tenants" > ../results/overhead_reference.csv
+echo "Start,End,Num_Tenants,Total_Cycles" > ../results/overhead_reference.csv
 
 for i in $(seq 5 5 "$N_TENANT"); do
     echo "Running tests with $i tenants"
@@ -35,7 +37,7 @@ for i in $(seq 5 5 "$N_TENANT"); do
         cp $KUBECONFIG /tmp/kubeconfig-tenant$j
     done
 
-    ../load/generate_load.sh "$i" "tenant" "../results/overhead_reference.csv"
+    ../load/generate_load.sh "$i" "tenant" "../results/overhead_reference.csv" "$DURATION" #&> /dev/null
 
     for j in $(seq 1 1 "$i"); do
         kubectl delete namespace "tenant$j" &> /dev/null
