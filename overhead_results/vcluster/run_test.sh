@@ -5,11 +5,12 @@ usage() {
     echo "  action: Action to perform [create, teardown]"
     echo "  n_tenant: Number of tenats to generate"
     echo "  kubeconfig_path: Path to kubeconfig file"
+    echo "  duration: duration of the load for each tenant"
     exit 1
 }
 
 # Check arguments
-if [ $# -ne 3 ]; then
+if [ $# -ne 4 ]; then
     usage
 fi
 
@@ -55,6 +56,7 @@ teardown_tenants() {
 
 ACTION="$1"
 N_TENANT="$2"
+DURATION=$4
 
 export KUBECONFIG="$3"
 
@@ -65,7 +67,7 @@ else
     rm ../results/overhead_vcluster.csv
 fi
 
-echo "Start,End,Num_Tenants" > ../results/overhead_vcluster.csv
+echo "Start,End,Num_Tenants,Total_Cycles" > ../results/overhead_vcluster.csv
 
 if [ "$ACTION" == "create" ]; then
     for i in $(seq 5 5 "$N_TENANT"); do
@@ -74,7 +76,7 @@ if [ "$ACTION" == "create" ]; then
         create_tenants "$i"
 
         sleep 300
-        ../load/generate_load.sh "$i" "default" "../results/overhead_vcluster.csv"
+        ../load/generate_load.sh "$i" "default" "../results/overhead_vcluster.csv" "$DURATION" &> /dev/null
         teardown_tenants "$i"
     done
     
@@ -83,7 +85,6 @@ elif [ "$ACTION" == "teardown" ]; then
 else
     usage
 fi
-
 
 
 
