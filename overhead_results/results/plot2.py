@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import tikzplotlib
 
 # ==========================================
 # 1. SETUP: Configuration Definition
@@ -12,42 +13,41 @@ CONFIGURATIONS = [
     {
         'name': 'reference',
         'schedule_file': 'overhead_reference.csv', # <--- Unique schedule for A
-        'file_total': 'CPU_cluster.csv',
-        'file_contrib': 'CPU_API_server.csv',
-        'offset': -60*62 ,
+        'file_total': 'MEM_cluster.csv',
+        'file_contrib': 'MEM_API_server.csv',
+        'offset': -60*60 ,
         'color_contrib': "#0060E7",  # Dark Blue
         'color_rest': "#5F93DC"      # Light Blue
     },
     {
         'name': 'capsule',
         'schedule_file': 'overhead_capsule.csv', # <--- Unique schedule for A
-        'file_total': 'CPU_cluster.csv',
-        'file_contrib': 'CPU_API_server.csv',
-        'offset': -60*62 ,
+        'file_total': 'MEM_cluster.csv',
+        'file_contrib': 'MEM_API_server.csv',
+        'offset': -60*60 ,
         'color_contrib': "#E00000",  # Dark Blue
         'color_rest': "#DB7777"      # Light Blue
     },
     {
         'name': 'vcluster',
         'schedule_file': 'overhead_vcluster.csv', # <--- Unique schedule for A
-        'file_total': 'CPU_cluster.csv',
-        'file_contrib': 'CPU_API_server.csv',
-        'offset': -60*62 ,
+        'file_total': 'MEM_cluster.csv',
+        'file_contrib': 'MEM_API_server.csv',
+        'offset': -60*60 ,
         'color_contrib': "#00E038",  # Dark Blue
         'color_rest': "#7ED694"      # Light Blue
     },
     {
         'name': 'kubevirt',
         'schedule_file': 'overhead_kubevirt.csv', # <--- Unique schedule for A
-        'file_total': 'CPU_cluster.csv',
-        'file_contrib': 'CPU_API_server.csv',
-        'offset': -60*62 ,
+        'file_total': 'MEM_cluster.csv',
+        'file_contrib': 'MEM_API_server.csv',
+        'offset': -60*60 ,
         'color_contrib': "#C4CB00",  # Dark Blue
         'color_rest': "#D7DA78"      # Light Blue
     }
 ]
 
-start_first_load = "Fri Jan  9 17:29:46 CET 2026"
 
 # ==========================================
 # 3. PROCESSING LOGIC
@@ -91,8 +91,11 @@ for config in CONFIGURATIONS:
         subset_c = df_c[(df_c['Time'] >= t_start) & (df_c['Time'] <= t_end)]
         
         # Calculate
-        val_total = subset_t['1m load average'].mean() if not subset_t.empty else 0
+        val_total = subset_t['usage'].mean() if not subset_t.empty else 0
         val_contrib = subset_c['192.168.17.82:6443'].mean() if not subset_c.empty else 0
+
+        # val_total = val_total/(df_sched["Total_Cycles"][idx]*5)
+        # val_contrib = val_contrib/(df_sched["Total_Cycles"][idx]*5)
         
         config_results.append({
             'Num_Tenants': row['Num_Tenants'], # This ID links the tests across files
@@ -104,6 +107,24 @@ for config in CONFIGURATIONS:
     all_results.extend(config_results)
 
 df_all = pd.DataFrame(all_results)
+
+# if not df_all.empty:
+#     # We pivot the table so every row is a 'Num_Tenants' case, 
+#     # and columns are [config_name]_Total and [config_name]_Contrib
+#     df_pivot = df_all.pivot(index='Num_Tenants', columns='Config', values=['Total_Mean', 'Contrib_Mean'])
+    
+#     # Flatten the hierarchical column names (e.g., ('Total_Mean', 'reference') -> 'reference_Total')
+#     df_pivot.columns = [f"{col[1]}_{col[0].split('_')[0]}" for col in df_pivot.columns]
+    
+#     # Fill NaN with 0 (in case some tests are missing for some configs)
+#     df_pivot = df_pivot.fillna(0)
+    
+#     # Save
+#     csv_filename = 'pgfplot_input.csv'
+#     df_pivot.to_csv(csv_filename)
+#     print(f"\nSUCCESS: Data exported to {csv_filename}")
+#     print(df_pivot.head())
+
 
 # ==========================================
 # 4. VISUALIZATION (Stacked + Grouped)
@@ -149,10 +170,10 @@ if not df_all.empty:
         
         # Plot
         ax.bar(x_pos, val_cont, width=bar_width * 0.9, 
-               color=c_contrib, label=f"{cfg_name} (Contrib)")
+               color=c_contrib, label=f"{cfg_name} (API server)")
         
         ax.bar(x_pos, val_rest, bottom=val_cont, width=bar_width * 0.9, 
-               color=c_rest, label=f"{cfg_name} (Rest)")
+               color=c_rest, label=f"{cfg_name} (Total)")
 
     ax.set_xlabel('Num_Tenants (Test ID)', fontsize=12)
     ax.set_ylabel('Mean Value', fontsize=12)
@@ -162,10 +183,13 @@ if not df_all.empty:
     
     # Optional: Clean up legend to show only 2 items per config if desired, 
     # currently it shows all 4 parts.
-    ax.legend()
+    #ax.legend()
     
     plt.tight_layout()
     #plt.show()
-    plt.savefig('multi_schedule_plot.png')
+    tikzplotlib.save("MEM_overhead.tex")
+    #plt.savefig('multi_schedule_plot.png')
+
+    
 else:
     print("No results found. Please check your input files and dates.")

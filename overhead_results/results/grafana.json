@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 0,
+  "id": 29,
   "links": [],
   "panels": [
     {
@@ -113,9 +113,23 @@
           },
           "editorMode": "code",
           "expr": "node_load1{job=\"node-exporter\"}",
-          "legendFormat": "1m load average",
+          "hide": true,
+          "legendFormat": "usage",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(\n  rate(node_cpu_seconds_total{mode!=\"idle\"}[1m])\n)",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "usage",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Load Average",
@@ -213,7 +227,7 @@
           },
           "editorMode": "code",
           "expr": "(\n  node_memory_MemTotal_bytes{job=\"node-exporter\"}\n-\n  node_memory_MemFree_bytes{job=\"node-exporter\"}\n-\n  node_memory_Buffers_bytes{job=\"node-exporter\"}\n-\n  node_memory_Cached_bytes{job=\"node-exporter\"}\n)\n",
-          "legendFormat": "memory used",
+          "legendFormat": "usage",
           "range": true,
           "refId": "A"
         },
@@ -1121,12 +1135,12 @@
     "list": []
   },
   "time": {
-    "from": "2026-01-09T14:24:15.645Z",
-    "to": "2026-01-10T02:01:02.097Z"
+    "from": "2026-01-22T13:07:08.000Z",
+    "to": "2026-01-22T23:31:00.463Z"
   },
   "timepicker": {},
   "timezone": "browser",
   "title": "Overhead Evaluation",
   "uid": "adbfkz7",
-  "version": 12
+  "version": 5
 }

@@ -1,0 +1,91 @@
+% This file was created with tikzplotlib v0.10.1.
+\begin{tikzpicture}
+
+\definecolor{cornflowerblue95147220}{RGB}{95,147,220}
+\definecolor{darkslategray38}{RGB}{38,38,38}
+\definecolor{dodgerblue096231}{RGB}{0,96,231}
+\definecolor{goldenrod1962030}{RGB}{196,203,0}
+\definecolor{khaki215218120}{RGB}{215,218,120}
+\definecolor{lightcoral219119119}{RGB}{219,119,119}
+\definecolor{lightgray204}{RGB}{204,204,204}
+\definecolor{lightgreen126214148}{RGB}{126,214,148}
+\definecolor{limegreen022456}{RGB}{0,224,56}
+\definecolor{red22400}{RGB}{224,0,0}
+
+\begin{axis}[
+axis line style={lightgray204},
+tick align=outside,
+tick pos=left,
+title={Comparison: Stacked Bars (Independent Schedules)},
+x grid style={lightgray204},
+xlabel=\textcolor{darkslategray38}{Num_Tenants (Test ID)},
+xmajorgrids,
+xmin=-0.579, xmax=3.579,
+xtick style={color=darkslategray38},
+xtick={0,1,2,3},
+xticklabels={5,10,15,20},
+y grid style={lightgray204},
+ylabel=\textcolor{darkslategray38}{Mean Value},
+ymajorgrids,
+ymin=0, ymax=100.63064516129,
+ytick style={color=darkslategray38}
+]
+\draw[draw=none,fill=dodgerblue096231] (axis cs:-0.39,0) rectangle (axis cs:-0.21,2.507);
+\addlegendimage{ybar,ybar legend,draw=none,fill=dodgerblue096231}
+\addlegendentry{reference (API server)}
+
+\draw[draw=none,fill=dodgerblue096231] (axis cs:0.61,0) rectangle (axis cs:0.79,2.55290322580645);
+\draw[draw=none,fill=dodgerblue096231] (axis cs:1.61,0) rectangle (axis cs:1.79,2.59870967741935);
+\draw[draw=none,fill=dodgerblue096231] (axis cs:2.61,0) rectangle (axis cs:2.79,2.612);
+\draw[draw=none,fill=cornflowerblue95147220] (axis cs:-0.39,2.507) rectangle (axis cs:-0.21,13.0966666666667);
+\addlegendimage{ybar,ybar legend,draw=none,fill=cornflowerblue95147220}
+\addlegendentry{reference (Total)}
+
+\draw[draw=none,fill=cornflowerblue95147220] (axis cs:0.61,2.55290322580645) rectangle (axis cs:0.79,13.7290322580645);
+\draw[draw=none,fill=cornflowerblue95147220] (axis cs:1.61,2.59870967741935) rectangle (axis cs:1.79,14.2064516129032);
+\draw[draw=none,fill=cornflowerblue95147220] (axis cs:2.61,2.612) rectangle (axis cs:2.79,14.89);
+\draw[draw=none,fill=red22400] (axis cs:-0.19,0) rectangle (axis cs:-0.00999999999999998,2.545);
+\addlegendimage{ybar,ybar legend,draw=none,fill=red22400}
+\addlegendentry{capsule (API server)}
+
+\draw[draw=none,fill=red22400] (axis cs:0.81,0) rectangle (axis cs:0.99,2.6058064516129);
+\draw[draw=none,fill=red22400] (axis cs:1.81,0) rectangle (axis cs:1.99,2.6341935483871);
+\draw[draw=none,fill=red22400] (axis cs:2.81,0) rectangle (axis cs:2.99,2.66774193548387);
+\draw[draw=none,fill=lightcoral219119119] (axis cs:-0.19,2.545) rectangle (axis cs:-0.00999999999999998,13.7466666666667);
+\addlegendimage{ybar,ybar legend,draw=none,fill=lightcoral219119119}
+\addlegendentry{capsule (Total)}
+
+\draw[draw=none,fill=lightcoral219119119] (axis cs:0.81,2.6058064516129) rectangle (axis cs:0.99,14.1709677419355);
+\draw[draw=none,fill=lightcoral219119119] (axis cs:1.81,2.6341935483871) rectangle (axis cs:1.99,14.5548387096774);
+\draw[draw=none,fill=lightcoral219119119] (axis cs:2.81,2.66774193548387) rectangle (axis cs:2.99,15.341935483871);
+\draw[draw=none,fill=limegreen022456] (axis cs:0.01,0) rectangle (axis cs:0.19,2.76666666666667);
+\addlegendimage{ybar,ybar legend,draw=none,fill=limegreen022456}
+\addlegendentry{vcluster (API server)}
+
+\draw[draw=none,fill=limegreen022456] (axis cs:1.01,0) rectangle (axis cs:1.19,2.879);
+\draw[draw=none,fill=limegreen022456] (axis cs:2.01,0) rectangle (axis cs:2.19,2.94633333333333);
+\draw[draw=none,fill=limegreen022456] (axis cs:3.01,0) rectangle (axis cs:3.19,3.012);
+\draw[draw=none,fill=lightgreen126214148] (axis cs:0.01,2.76666666666667) rectangle (axis cs:0.19,16.86);
+\addlegendimage{ybar,ybar legend,draw=none,fill=lightgreen126214148}
+\addlegendentry{vcluster (Total)}
+
+\draw[draw=none,fill=lightgreen126214148] (axis cs:1.01,2.879) rectangle (axis cs:1.19,19.5266666666667);
+\draw[draw=none,fill=lightgreen126214148] (axis cs:2.01,2.94633333333333) rectangle (axis cs:2.19,23.0333333333333);
+\draw[draw=none,fill=lightgreen126214148] (axis cs:3.01,3.012) rectangle (axis cs:3.19,26.5633333333333);
+\draw[draw=none,fill=goldenrod1962030] (axis cs:0.21,0) rectangle (axis cs:0.39,2.4941935483871);
+\addlegendimage{ybar,ybar legend,draw=none,fill=goldenrod1962030}
+\addlegendentry{kubevirt (API server)}
+
+\draw[draw=none,fill=goldenrod1962030] (axis cs:1.21,0) rectangle (axis cs:1.39,2.50225806451613);
+\draw[draw=none,fill=goldenrod1962030] (axis cs:2.21,0) rectangle (axis cs:2.39,2.52677419354839);
+\draw[draw=none,fill=goldenrod1962030] (axis cs:3.21,0) rectangle (axis cs:3.39,2.5758064516129);
+\draw[draw=none,fill=khaki215218120] (axis cs:0.21,2.4941935483871) rectangle (axis cs:0.39,33.6516129032258);
+\addlegendimage{ybar,ybar legend,draw=none,fill=khaki215218120}
+\addlegendentry{kubevirt (Total)}
+
+\draw[draw=none,fill=khaki215218120] (axis cs:1.21,2.50225806451613) rectangle (axis cs:1.39,54.4354838709677);
+\draw[draw=none,fill=khaki215218120] (axis cs:2.21,2.52677419354839) rectangle (axis cs:2.39,75.2032258064516);
+\draw[draw=none,fill=khaki215218120] (axis cs:3.21,2.5758064516129) rectangle (axis cs:3.39,95.8387096774194);
+\end{axis}
+
+\end{tikzpicture}

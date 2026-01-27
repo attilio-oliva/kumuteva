@@ -1,0 +1,75 @@
+% This file was created with tikzplotlib v0.10.1.
+\begin{tikzpicture}
+
+\definecolor{cornflowerblue95147220}{RGB}{95,147,220}
+\definecolor{darkslategray38}{RGB}{38,38,38}
+\definecolor{dodgerblue096231}{RGB}{0,96,231}
+\definecolor{lightcoral219119119}{RGB}{219,119,119}
+\definecolor{lightgray204}{RGB}{204,204,204}
+\definecolor{lightgreen126214148}{RGB}{126,214,148}
+\definecolor{limegreen022456}{RGB}{0,224,56}
+\definecolor{red22400}{RGB}{224,0,0}
+
+\begin{axis}[
+axis line style={lightgray204},
+tick align=outside,
+tick pos=left,
+title={Comparison: Stacked Bars (Independent Schedules)},
+x grid style={lightgray204},
+xlabel=\textcolor{darkslategray38}{Num_Tenants (Test ID)},
+xmajorgrids,
+xmin=-0.575333333333333, xmax=3.57533333333333,
+xtick style={color=darkslategray38},
+xtick={0,1,2,3},
+xticklabels={5,10,15,20},
+y grid style={lightgray204},
+ylabel=\textcolor{darkslategray38}{Mean Value},
+ymajorgrids,
+ymin=0, ymax=0.0419935185185185,
+ytick style={color=darkslategray38}
+]
+\draw[draw=none,fill=dodgerblue096231] (axis cs:-0.386666666666667,0) rectangle (axis cs:-0.146666666666667,0.0030996383363472);
+\addlegendimage{ybar,ybar legend,draw=none,fill=dodgerblue096231}
+\addlegendentry{reference (API server)}
+
+\draw[draw=none,fill=dodgerblue096231] (axis cs:0.613333333333333,0) rectangle (axis cs:0.853333333333333,0.00250975674953221);
+\draw[draw=none,fill=dodgerblue096231] (axis cs:1.61333333333333,0) rectangle (axis cs:1.85333333333333,0.001955956902313);
+\draw[draw=none,fill=dodgerblue096231] (axis cs:2.61333333333333,0) rectangle (axis cs:2.85333333333333,0.00171980676328502);
+\draw[draw=none,fill=cornflowerblue95147220] (axis cs:-0.386666666666667,0.0030996383363472) rectangle (axis cs:-0.146666666666667,0.0227166968053044);
+\addlegendimage{ybar,ybar legend,draw=none,fill=cornflowerblue95147220}
+\addlegendentry{reference (Total)}
+
+\draw[draw=none,fill=cornflowerblue95147220] (axis cs:0.613333333333333,0.00250975674953221) rectangle (axis cs:0.853333333333333,0.025349371825715);
+\draw[draw=none,fill=cornflowerblue95147220] (axis cs:1.61333333333333,0.001955956902313) rectangle (axis cs:1.85333333333333,0.0153205431221373);
+\draw[draw=none,fill=cornflowerblue95147220] (axis cs:2.61333333333333,0.00171980676328502) rectangle (axis cs:2.85333333333333,0.0133881784597897);
+\draw[draw=none,fill=red22400] (axis cs:-0.12,0) rectangle (axis cs:0.12,0.00322401754284725);
+\addlegendimage{ybar,ybar legend,draw=none,fill=red22400}
+\addlegendentry{capsule (API server)}
+
+\draw[draw=none,fill=red22400] (axis cs:0.88,0) rectangle (axis cs:1.12,0.00288405797101449);
+\draw[draw=none,fill=red22400] (axis cs:1.88,0) rectangle (axis cs:2.12,0.00247500129170039);
+\draw[draw=none,fill=red22400] (axis cs:2.88,0) rectangle (axis cs:3.12,0.00260385778895977);
+\draw[draw=none,fill=lightcoral219119119] (axis cs:-0.12,0.00322401754284725) rectangle (axis cs:0.12,0.0259870736914998);
+\addlegendimage{ybar,ybar legend,draw=none,fill=lightcoral219119119}
+\addlegendentry{capsule (Total)}
+
+\draw[draw=none,fill=lightcoral219119119] (axis cs:0.88,0.00288405797101449) rectangle (axis cs:1.12,0.0199524200164069);
+\draw[draw=none,fill=lightcoral219119119] (axis cs:1.88,0.00247500129170039) rectangle (axis cs:2.12,0.0148511100012056);
+\draw[draw=none,fill=lightcoral219119119] (axis cs:2.88,0.00260385778895977) rectangle (axis cs:3.12,0.0123326444424477);
+\draw[draw=none,fill=limegreen022456] (axis cs:0.146666666666667,0) rectangle (axis cs:0.386666666666667,0.00437944444444444);
+\addlegendimage{ybar,ybar legend,draw=none,fill=limegreen022456}
+\addlegendentry{vcluster (API server)}
+
+\draw[draw=none,fill=limegreen022456] (axis cs:1.14666666666667,0) rectangle (axis cs:1.38666666666667,0.00250388509536143);
+\draw[draw=none,fill=limegreen022456] (axis cs:2.14666666666667,0) rectangle (axis cs:2.38666666666667,0.00249840865690643);
+\draw[draw=none,fill=limegreen022456] (axis cs:3.14666666666667,0) rectangle (axis cs:3.38666666666667,0.00199127061105723);
+\draw[draw=none,fill=lightgreen126214148] (axis cs:0.146666666666667,0.00437944444444444) rectangle (axis cs:0.386666666666667,0.0399938271604938);
+\addlegendimage{ybar,ybar legend,draw=none,fill=lightgreen126214148}
+\addlegendentry{vcluster (Total)}
+
+\draw[draw=none,fill=lightgreen126214148] (axis cs:1.14666666666667,0.00250388509536143) rectangle (axis cs:1.38666666666667,0.027639215917118);
+\draw[draw=none,fill=lightgreen126214148] (axis cs:2.14666666666667,0.00249840865690643) rectangle (axis cs:2.38666666666667,0.0248735412688309);
+\draw[draw=none,fill=lightgreen126214148] (axis cs:3.14666666666667,0.00199127061105723) rectangle (axis cs:3.38666666666667,0.0206660200452635);
+\end{axis}
+
+\end{tikzpicture}
