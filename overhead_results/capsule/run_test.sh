@@ -4,6 +4,7 @@ usage() {
     echo "Usage: $0 <action> <n_tenant> <kubeconfig_path>"
     echo "  n_tenant: Number of tenats to generate"
     echo "  kubeconfig_path: Path to kubeconfig file"
+    echo "  duration: duration of the load for each tenant"
     exit 1
 }
 
@@ -38,9 +39,11 @@ delete_users_namespace() {
 }
 
 # Check arguments
-if [ $# -ne 2 ]; then
+if [ $# -ne 3 ]; then
     usage
 fi
+
+DURATION=$3
 
 # Check if overhead file exists, if not create and add header
 if [ ! -f ../results/overhead_capsule.csv ]; then
@@ -49,7 +52,7 @@ else
     rm ../results/overhead_capsule.csv
 fi
 
-echo "Start,End,Num_Tenants" > ../results/overhead_capsule.csv
+echo "Start,End,Num_Tenants,Total_Cycles" > ../results/overhead_capsule.csv
 
 # logic here
 for i in $(seq 5 5 "$1"); do
@@ -59,10 +62,9 @@ for i in $(seq 5 5 "$1"); do
 
     sleep 300
 
-    ../load/generate_load.sh "$i" "tenant" "../results/overhead_capsule.csv"
+    ../load/generate_load.sh "$i" "tenant" "../results/overhead_capsule.csv" "$DURATION" &> /dev/null
 
     delete_users_namespace $i
 
     ./deploy-capsule.sh "uninstall" $2
 done
-
