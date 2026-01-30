@@ -727,6 +727,11 @@ impl KubernetesClusterBuilder {
         // sleep for a while to ensure the host cluster is ready
         sleep(Duration::from_secs(10)).await;
 
+        println!("Deploying KubeVirt on host cluster...");
+        println!(
+            "  Running: provisioner/kubevirt/deploy-kubevirt.sh {}",
+            self.host_cluster.kubeconfig_path().to_string_lossy()
+        );
         // Use the shell script to deploy KubeVirt
         let output = Command::new("provisioner/kubevirt/deploy-kubevirt.sh")
             .arg(self.host_cluster.kubeconfig_path())
@@ -741,6 +746,11 @@ impl KubernetesClusterBuilder {
             );
         }
 
+        println!("Deploying CAPI provider on host cluster...");
+        println!(
+            "  Running: provisioner/kubevirt/deploy-capi-provider.sh {}",
+            self.host_cluster.kubeconfig_path().to_string_lossy()
+        );
         let output = Command::new("provisioner/kubevirt/deploy-capi-provider.sh")
             .arg(self.host_cluster.kubeconfig_path())
             .output()
@@ -754,10 +764,37 @@ impl KubernetesClusterBuilder {
             );
         }
 
+        let tenant_mapping = match namespace {
+            "tenant1" => &self.host_cluster.port_mappings().tenant1,
+            "tenant2" => &self.host_cluster.port_mappings().tenant2,
+            _ => return Err(anyhow!("No port mapping for namespace {}", namespace)),
+        };
+
+        println!(
+            "Creating KubeVirt cluster for tenant in namespace: {}",
+            namespace
+        );
+        println!(
+            "  Running: provisioner/kubevirt/create-kubevirt-cluster.sh {} {} {} {} {}",
+            self.host_cluster.kubeconfig_path().to_string_lossy(),
+            self.kubeconfig_path.to_str().unwrap(),
+            namespace,
+            tenant_mapping.container_port,
+            tenant_mapping.host_port,
+        );
+
+        // If kind cluster, expose the API server as nodeport
+        let should_use_nodeport = matches!(self.host_cluster, HostClusterType::Kind(_))
+            .then(|| "y")
+            .unwrap_or("n");
+
         let output = Command::new("provisioner/kubevirt/create-kubevirt-cluster.sh")
             .arg(self.host_cluster.kubeconfig_path())
             .arg(self.kubeconfig_path.to_str().unwrap())
             .arg(namespace)
+            .arg(should_use_nodeport)
+            .arg(tenant_mapping.container_port.to_string())
+            .arg(tenant_mapping.host_port.to_string())
             .output()
             .context("Failed to execute CAPI controller deployment script")?;
 
