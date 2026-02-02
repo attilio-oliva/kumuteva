@@ -35,6 +35,7 @@ const NODE_PROBE_POD_NAME: &str = "node-network-probe";
 
 pub type NetworkIsolationReport = SubsystemReport<NetworkResource>;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NetworkResource {
     /// Pod-to-pod network communication
@@ -42,6 +43,7 @@ pub enum NetworkResource {
     /// Service exposure and access
     ServiceNetwork,
     /// Node-to-node network communication
+    /// Currently not tested separately, as it overlaps with NodePort tests
     InfrastructureNetwork,
     /// DNS resolution across namespaces
     DnsResolution,
@@ -68,7 +70,8 @@ impl AssessableResource for NetworkResource {
         vec![
             NetworkResource::PodNetwork,
             NetworkResource::ServiceNetwork,
-            NetworkResource::InfrastructureNetwork,
+            // Removed as it is redundant with NodePort tests
+            // NetworkResource::InfrastructureNetwork,
             NetworkResource::DnsResolution,
         ]
     }
@@ -458,57 +461,256 @@ async fn test_nodeport_autonomy(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
 ) -> anyhow::Result<CrossTenantResult> {
-    info!("Testing network autonomy - NodePort service exposure independence...");
+    info!("Testing NodePort isolation - can tenant2 reach tenant1's NodePort service?");
 
-    // Create identical NodePort services in both tenant namespaces
-    let tenant1_service = create_nodeport_service(
+    // Generate a unique marker to identify tenant1's service
+    let marker = format!("TENANT1_NODEPORT_MARKER_{}", uuid::Uuid::new_v4());
+    info!("Generated NodePort marker for tenant1: {}", marker);
+
+    // 1. Create a pod in tenant1 that serves the marker
+    let marker_pod = create_nodeport_marker_pod("nodeport-marker-pod", &marker);
+
+    let create_pod_result = tenant1
+        .cluster
+        .create_pod_in_namespace(&marker_pod, &tenant1.namespace)
+        .await;
+
+    if create_pod_result.is_err() {
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: false,
+            details: format!(
+                "Could not create marker pod in tenant1: {:?}",
+                create_pod_result.err()
+            ),
+        });
+    }
+
+    // Wait for pod to be ready
+    if let Err(e) = tenant1
+        .cluster
+        .wait_for_pod_to_be_ready("nodeport-marker-pod", &tenant1.namespace)
+        .await
+    {
+        let _ = tenant1
+            .cluster
+            .delete_pod_in_namespace("nodeport-marker-pod", &tenant1.namespace)
+            .await;
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: false,
+            details: format!("Tenant1 marker pod failed to start: {}", e),
+        });
+    }
+
+    // 2. Create NodePort service pointing to the marker pod
+    let tenant1_service = create_nodeport_service_with_selector(
         &tenant1.namespace,
         AUTONOMY_TEST_SERVICE_NAME,
         AUTONOMY_TEST_NODE_PORT,
+        "nodeport-marker",
     );
+
+    let create_svc_result = tenant1
+        .cluster
+        .create_namespaced_resource::<Service>(&tenant1_service, &tenant1.namespace)
+        .await;
+
+    if create_svc_result.is_err() {
+        let _ = tenant1
+            .cluster
+            .delete_pod_in_namespace("nodeport-marker-pod", &tenant1.namespace)
+            .await;
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: false,
+            details: format!(
+                "Could not create NodePort service in tenant1: {:?}",
+                create_svc_result.err()
+            ),
+        });
+    }
+
+    // 3. Try to get node IP - first try listing nodes, fall back to hostNetwork pod
+    let node_ip = get_node_ip_for_nodeport_test(tenant1, tenant2).await?;
+
+    if node_ip.is_empty() {
+        cleanup_nodeport_test_resources(tenant1, tenant2).await;
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: false,
+            details: "Could not determine node IP for NodePort test".to_string(),
+        });
+    }
+
+    info!(
+        "Probing tenant1's NodePort service at {}:{}",
+        node_ip, AUTONOMY_TEST_NODE_PORT
+    );
+
+    // 4. Create probe pod in tenant2 (regular pod, not hostNetwork)
+    let probe_pod = create_network_multitool_pod("nodeport-probe");
+
+    let create_probe_result = tenant2
+        .cluster
+        .create_pod_in_namespace(&probe_pod, &tenant2.namespace)
+        .await;
+
+    if create_probe_result.is_err() {
+        // Cleanup tenant1 resources
+        let _ = tenant1
+            .cluster
+            .delete_resource_in_namespace::<Service>(AUTONOMY_TEST_SERVICE_NAME, &tenant1.namespace)
+            .await;
+        let _ = tenant1
+            .cluster
+            .delete_pod_in_namespace("nodeport-marker-pod", &tenant1.namespace)
+            .await;
+
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: false,
+            details: format!(
+                "Could not create probe pod in tenant2: {:?}",
+                create_probe_result.err()
+            ),
+        });
+    }
+
+    // Wait for probe pod to be ready
+    if let Err(e) = tenant2
+        .cluster
+        .wait_for_pod_to_be_ready("nodeport-probe", &tenant2.namespace)
+        .await
+    {
+        // Cleanup
+        cleanup_nodeport_test_resources(tenant1, tenant2).await;
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: false,
+            details: format!("Tenant2 probe pod failed to start: {}", e),
+        });
+    }
+
+    // 5. Probe tenant1's NodePort from tenant2
+    let probe_cmd = format!(
+        "curl -s --connect-timeout 5 http://{}:{} 2>/dev/null || wget -q -O - --timeout=5 http://{}:{} 2>/dev/null || echo 'CONNECTION_FAILED'",
+        node_ip, AUTONOMY_TEST_NODE_PORT, node_ip, AUTONOMY_TEST_NODE_PORT
+    );
+
+    let probe_output = tenant2
+        .cluster
+        .exec_command_in_container("nodeport-probe", &tenant2.namespace, &probe_cmd)
+        .await
+        .unwrap_or_else(|e| format!("Exec failed: {}", e));
+
+    info!("NodePort probe output from tenant2: {}", probe_output);
+
+    let marker_found = probe_output.contains(&marker);
+    let connection_failed =
+        probe_output.contains("CONNECTION_FAILED") || probe_output.contains("Exec failed");
+
+    // 6. Test autonomy: can tenant2 create a NodePort on the same port?
     let tenant2_service = create_nodeport_service(
         &tenant2.namespace,
         AUTONOMY_TEST_SERVICE_NAME,
         AUTONOMY_TEST_NODE_PORT,
     );
 
-    // Try to create service in tenant1
-    let tenant1_result = tenant1
-        .cluster
-        .create_namespaced_resource::<Service>(&tenant1_service, &tenant1.namespace)
-        .await;
-
-    if tenant1_result.is_err() {
-        return Ok(CrossTenantResult {
-            isolation: IsolationLevel::Unknown,
-            autonomy: false,
-            details: format!(
-                "Could not create NodePort service in tenant1: {:?}",
-                tenant1_result.err()
-            ),
-        });
-    }
-
-    // Try to create identical service in tenant2 (same NodePort)
-    let tenant2_result = tenant2
+    let tenant2_svc_result = tenant2
         .cluster
         .create_namespaced_resource::<Service>(&tenant2_service, &tenant2.namespace)
         .await;
 
-    let hard_isolation = tenant2_result.is_ok();
+    let can_use_same_port = tenant2_svc_result.is_ok();
 
-    // Cleanup
+    // Cleanup all resources
+    cleanup_nodeport_test_resources(tenant1, tenant2).await;
+
+    let isolation = if can_use_same_port {
+        IsolationLevel::Hard
+    } else {
+        IsolationLevel::Soft("NodePort unreachable but cannot use same port".to_string())
+    };
+
+    // Determine isolation level based on results
+    // Note: autonomy is true as long as the test could be performed (tenant2 can create NodePort services)
+    // The port collision only affects whether they can use the SAME port number, not overall capability
+    if marker_found {
+        // Tenant2 can reach tenant1's NodePort and read the marker - no isolation
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::None,
+            autonomy: true, // Tenant2 was able to perform the operation
+            details: format!(
+                "Tenant2 successfully connected to tenant1 service via NodePort at {}:{} - \
+                NodePort traffic not isolated between tenants. - {}",
+                node_ip,
+                AUTONOMY_TEST_NODE_PORT,
+                if can_use_same_port {
+                    "Both tenants can use same NodePort (separate port spaces)."
+                } else {
+                    "Tenants share NodePort space (port collision on same port number)."
+                }
+            ),
+        })
+    } else if connection_failed {
+        // Tenant2 cannot reach the NodePort at all
+        Ok(CrossTenantResult {
+            isolation,
+            autonomy: true, // Tenant2 can create NodePort services, traffic is just isolated
+            details: format!(
+                "Tenant2 cannot reach tenant1's NodePort at {}:{} - NodePort traffic isolated. {}",
+                node_ip,
+                AUTONOMY_TEST_NODE_PORT,
+                if can_use_same_port {
+                    "Both tenants can use same NodePort independently"
+                } else {
+                    "Tenants share NodePort space (cannot use same port) but traffic is isolated."
+                }
+            ),
+        })
+    } else {
+        // Connection succeeded but marker not found - might be different service or proxy
+        Ok(CrossTenantResult {
+            isolation,
+            autonomy: true,
+            details: format!(
+                "Tenant2 endpoint reached {}:{} but received unexpected response: '{}' - \
+                We assume it is a different service or proxy - {}",
+                node_ip,
+                AUTONOMY_TEST_NODE_PORT,
+                probe_output.chars().take(100).collect::<String>(),
+                if can_use_same_port {
+                    "Both tenants can use same NodePort."
+                } else {
+                    "Tenants share NodePort space."
+                }
+            ),
+        })
+    }
+}
+
+/// Helper to cleanup NodePort test resources
+async fn cleanup_nodeport_test_resources(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) {
     let _ = tenant1
         .cluster
         .delete_resource_in_namespace::<Service>(AUTONOMY_TEST_SERVICE_NAME, &tenant1.namespace)
         .await;
-
-    if hard_isolation {
-        let _ = tenant2
-            .cluster
-            .delete_resource_in_namespace::<Service>(AUTONOMY_TEST_SERVICE_NAME, &tenant2.namespace)
-            .await;
-    }
+    let _ = tenant1
+        .cluster
+        .delete_pod_in_namespace("nodeport-marker-pod", &tenant1.namespace)
+        .await;
+    let _ = tenant2
+        .cluster
+        .delete_resource_in_namespace::<Service>(AUTONOMY_TEST_SERVICE_NAME, &tenant2.namespace)
+        .await;
+    let _ = tenant2
+        .cluster
+        .delete_pod_in_namespace("nodeport-probe", &tenant2.namespace)
+        .await;
 
     // Wait for cleanup
     let _ = tenant1
@@ -518,60 +720,113 @@ async fn test_nodeport_autonomy(
             &tenant1.namespace,
         )
         .await;
+    let _ = tenant1
+        .cluster
+        .wait_for_pod_deletion("nodeport-marker-pod", &tenant1.namespace)
+        .await;
+    let _ = tenant2
+        .cluster
+        .wait_for_pod_deletion("nodeport-probe", &tenant2.namespace)
+        .await;
+}
 
-    if hard_isolation {
-        let _ = tenant2
-            .cluster
-            .wait_for_namespaced_resource_deletion::<Service>(
-                AUTONOMY_TEST_SERVICE_NAME,
-                &tenant2.namespace,
-            )
-            .await;
-    }
-
-    if hard_isolation {
-        // Both tenants can create NodePort on same port - full isolation (separate network namespaces)
-        Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: true,
-            details: format!(
-                "Both tenants can independently expose services on NodePort {} - Full network autonomy",
-                AUTONOMY_TEST_NODE_PORT
-            ),
-        })
-    } else {
-        // NodePort conflict - tenants share the NodePort space
-        // Check if the error is due to port conflict
-        let error_msg = tenant2_result
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-
-        if error_msg.contains("already allocated")
-            || error_msg.contains("port is already allocated")
-            || error_msg.contains("nodePort")
-        {
-            // Port collision detected - partial autonomy
-            Ok(CrossTenantResult {
-                isolation: IsolationLevel::Soft(format!(
-                    "NodePort {} shared across tenants",
-                    AUTONOMY_TEST_NODE_PORT
-                )),
-                autonomy: true, // They can still create services, just not on the same port (soft isolation)
-                details: format!(
-                    "NodePort {} collision detected - Tenants share NodePort space, may conflict with each other",
-                    AUTONOMY_TEST_NODE_PORT
-                ),
+/// Helper to get a node IP for NodePort testing.
+/// First tries to list nodes (preferred), falls back to pod status.hostIP if forbidden.
+async fn get_node_ip_for_nodeport_test(
+    tenant1: &TenantClusterConfig,
+    _tenant2: &TenantClusterConfig,
+) -> anyhow::Result<String> {
+    // Try to list nodes first (preferred method)
+    if let Ok(nodes) = tenant1.cluster.list_nodes().await {
+        if let Some(node_ip) = nodes.iter().find_map(|n| {
+            n.status.as_ref().and_then(|s| {
+                s.addresses.as_ref().and_then(|addrs| {
+                    addrs
+                        .iter()
+                        .find(|a| a.type_ == "InternalIP")
+                        .map(|a| a.address.clone())
+                })
             })
-        } else {
-            // Some other error
-            Ok(CrossTenantResult {
-                isolation: IsolationLevel::Unknown,
-                autonomy: false,
-                details: format!("NodePort creation failed for tenant2: {}", error_msg),
-            })
+        }) {
+            info!("Got node IP from node listing: {}", node_ip);
+            return Ok(node_ip);
         }
     }
+
+    // Fallback: get node IP from the marker pod's status.hostIP
+    // This tells us which node the pod is running on
+    info!("Node listing not available, getting node IP from pod status.hostIP...");
+    if let Ok(pod) = tenant1
+        .cluster
+        .get_pod_in_namespace("nodeport-marker-pod", &tenant1.namespace)
+        .await
+    {
+        if let Some(host_ip) = pod.status.and_then(|s| s.host_ip) {
+            info!("Got node IP from pod status.hostIP: {}", host_ip);
+            return Ok(host_ip);
+        }
+    }
+
+    // Last resort: try to get the default gateway from within the pod
+    // This might work in some setups where hostIP is not populated
+    info!("hostIP not available, trying to get default gateway from pod...");
+    let get_gateway_cmd = "ip route | grep default | awk '{print $3}'";
+    let gateway_ip = tenant1
+        .cluster
+        .exec_command_in_container("nodeport-marker-pod", &tenant1.namespace, get_gateway_cmd)
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if !gateway_ip.is_empty() {
+        info!("Got gateway IP from pod: {}", gateway_ip);
+        return Ok(gateway_ip);
+    }
+
+    Ok(String::new())
+}
+
+/// Helper to get a node IP for infrastructure network testing.
+/// First tries to list nodes (preferred), falls back to hostNetwork pod discovery if forbidden.
+async fn get_node_ip_for_infra_test(
+    tenant1: &TenantClusterConfig,
+    marker_pod_name: &str,
+) -> anyhow::Result<String> {
+    // Try to list nodes first (preferred method)
+    if let Ok(nodes) = tenant1.cluster.list_nodes().await {
+        if let Some(node_ip) = nodes.iter().find_map(|n| {
+            n.status.as_ref().and_then(|s| {
+                s.addresses.as_ref().and_then(|addrs| {
+                    addrs
+                        .iter()
+                        .find(|a| a.type_ == "InternalIP")
+                        .map(|a| a.address.clone())
+                })
+            })
+        }) {
+            info!("Got node IP from node listing: {}", node_ip);
+            return Ok(node_ip);
+        }
+    }
+
+    // Fallback: discover node IP from within the hostNetwork marker pod
+    info!("Node listing not available, discovering node IP from hostNetwork pod...");
+    let get_node_ip_cmd =
+        r#"ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}'"#;
+    let node_ip = tenant1
+        .cluster
+        .exec_command_in_container(marker_pod_name, &tenant1.namespace, get_node_ip_cmd)
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if !node_ip.is_empty() {
+        info!("Got node IP from hostNetwork pod: {}", node_ip);
+    }
+
+    Ok(node_ip)
 }
 
 async fn test_dns_isolation(
@@ -725,16 +980,20 @@ async fn test_node_network_isolation(
         });
     }
 
-    // Get the node IP where tenant1's marker pod is running
-    let marker_pod_obj = tenant1
-        .cluster
-        .get_pod_in_namespace(NODE_MARKER_POD_NAME, &tenant1.namespace)
-        .await?;
+    // Get node IP - try listing nodes first, fall back to discovering from hostNetwork pod
+    let node_ip = get_node_ip_for_infra_test(tenant1, NODE_MARKER_POD_NAME).await?;
 
-    let node_ip = marker_pod_obj
-        .status
-        .and_then(|s| s.host_ip)
-        .ok_or_else(|| anyhow::anyhow!("Could not get host IP from marker pod"))?;
+    if node_ip.is_empty() {
+        let _ = tenant1
+            .cluster
+            .delete_pod_in_namespace(NODE_MARKER_POD_NAME, &tenant1.namespace)
+            .await;
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: false,
+            details: "Could not determine node IP for infrastructure network test".to_string(),
+        });
+    }
 
     info!("Tenant1 marker service running on node IP: {}", node_ip);
 
@@ -824,8 +1083,8 @@ async fn test_node_network_isolation(
             isolation: IsolationLevel::None,
             autonomy: true,
             details: format!(
-                "Tenant2 successfully read tenant1's marker via node network at {}:{} - \
-                Infrastructure shared and cluster network isolation can be bypassed",
+                "Tenant2 successfully connected to tenant1 service via node network at {}:{} - \
+                Infrastructure network is shared and can be used to bypass cluster network isolation",
                 node_ip, NODE_MARKER_PORT
             ),
         })
@@ -990,6 +1249,85 @@ fn create_nodeport_service_auto_port(namespace: &str, name: &str) -> Service {
                 // nodePort omitted - Kubernetes will auto-assign from available range
             }],
             "type": "NodePort"
+        }
+    }))
+    .unwrap()
+}
+
+/// Creates a NodePort service with a custom selector.
+/// Used for isolation testing where we need to point to a specific marker pod.
+fn create_nodeport_service_with_selector(
+    namespace: &str,
+    name: &str,
+    node_port: i32,
+    app_selector: &str,
+) -> Service {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {
+                "test": "network-isolation"
+            }
+        },
+        "spec": {
+            "selector": {
+                "app": app_selector
+            },
+            "ports": [{
+                "name": "http",
+                "protocol": "TCP",
+                "port": 80,
+                "targetPort": 80,
+                "nodePort": node_port
+            }],
+            "type": "NodePort"
+        }
+    }))
+    .unwrap()
+}
+
+/// Creates a pod that serves a unique marker on port 80.
+/// Used for NodePort isolation testing.
+fn create_nodeport_marker_pod(name: &str, marker: &str) -> Pod {
+    // Use nginx to serve the marker
+    let serve_cmd = format!(
+        "echo '{}' > /usr/share/nginx/html/index.html && nginx -g 'daemon off;'",
+        marker
+    );
+
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "labels": {
+                "app": "nodeport-marker"
+            }
+        },
+        "spec": {
+            "containers": [{
+                "name": "marker-server",
+                "image": "praqma/network-multitool",
+                "command": ["/bin/sh", "-c", serve_cmd],
+                "ports": [{
+                    "containerPort": 80,
+                    "protocol": "TCP"
+                }],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
+            }],
+            "restartPolicy": "Never"
         }
     }))
     .unwrap()
