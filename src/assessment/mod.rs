@@ -163,6 +163,16 @@ fn compute_overall_isolation_level(assessments: &[IsolationLevel]) -> IsolationL
         .unwrap_or(IsolationLevel::Hard)
 }
 
+/// Computes the minimum isolation level from known assessments only (excluding Unknown).
+/// Returns None if all assessments are Unknown or the list is empty.
+fn compute_min_known_isolation_level(assessments: &[IsolationLevel]) -> Option<IsolationLevel> {
+    assessments
+        .iter()
+        .filter(|l| !matches!(l, IsolationLevel::Unknown))
+        .min()
+        .cloned()
+}
+
 /// Result of assessing a single operation
 #[derive(Debug, Clone)]
 pub struct OperationAssessment {
@@ -255,6 +265,17 @@ impl<R: AssessableResource> SubsystemReport<R> {
         }
 
         ratio
+    }
+
+    /// Returns the minimum known isolation level (excluding Unknown values) from this subsystem's assessments.
+    /// Returns None if all assessments have Unknown isolation.
+    pub fn min_known_isolation(&self) -> Option<IsolationLevel> {
+        let levels: Vec<IsolationLevel> = self
+            .assessments
+            .iter()
+            .map(|a| a.overall_isolation.clone())
+            .collect();
+        compute_min_known_isolation_level(&levels)
     }
 }
 
@@ -427,7 +448,7 @@ impl Display for OperationAssessment {
         };
         write!(
             f,
-            "{} {}  {}{}",
+            "{}{}  {}{}",
             safe_emoji,
             "Isolation".dimmed(),
             auth_emoji,
@@ -694,6 +715,25 @@ impl MultitenancyReport {
         compute_overall_isolation_level(&levels)
     }
 
+    /// Returns the minimum known isolation level (excluding Unknown values).
+    /// This digs into subsystem assessments to find the minimum known level.
+    /// Returns None if all levels are Unknown.
+    pub fn min_known_isolation(&self) -> Option<IsolationLevel> {
+        // Collect min_known from each subsystem (which looks at individual resource assessments)
+        let min_known_levels: Vec<IsolationLevel> = [
+            self.control_plane.as_ref().and_then(|r| r.min_known_isolation()),
+            self.storage.as_ref().and_then(|r| r.min_known_isolation()),
+            self.network.as_ref().and_then(|r| r.min_known_isolation()),
+            self.workload.as_ref().and_then(|r| r.min_known_isolation()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        // Return the minimum of the min_known levels
+        min_known_levels.into_iter().min()
+    }
+
     pub fn overall_autonomy_ratio(&self) -> AutonomyRatio {
         let mut total = AutonomyRatio::default();
         if let Some(cp) = &self.control_plane {
@@ -808,11 +848,53 @@ fn format_ratio_with_icon(ratio: &AutonomyRatio) -> String {
 }
 
 fn format_isolation(level: &IsolationLevel) -> String {
+    format_isolation_with_bound(level, None)
+}
+
+/// Formats an isolation level, optionally showing the upper bound when Unknown.
+/// When level is Unknown and min_known is provided, shows "❓/🟠 Unknown/Soft" format.
+fn format_isolation_with_bound(level: &IsolationLevel, min_known: Option<&IsolationLevel>) -> String {
     match level {
         IsolationLevel::Hard => "✅ Hard".to_string(),
         IsolationLevel::Soft(_reason) => "🟠 Soft".to_string(),
         IsolationLevel::None => "❌ None".to_string(),
-        IsolationLevel::Unknown => "❓ Unknown".to_string(),
+        IsolationLevel::Unknown => {
+            match min_known {
+                Some(bound) => {
+                    let bound_str = match bound {
+                        IsolationLevel::Hard => "❓/✅ Unknown/Hard",
+                        IsolationLevel::Soft(_) => "❓/🟠 Unknown/Soft",
+                        IsolationLevel::None => "❓/❌ Unknown/None",
+                        IsolationLevel::Unknown => "❓ Unknown",
+                    };
+                    bound_str.to_string()
+                }
+                None => "❓ Unknown".to_string(),
+            }
+        }
+    }
+}
+
+/// Formats isolation for the summary with a more verbose description.
+fn format_isolation_summary(level: &IsolationLevel, min_known: Option<&IsolationLevel>) -> String {
+    match level {
+        IsolationLevel::Hard => "✅ Hard".to_string(),
+        IsolationLevel::Soft(_reason) => "🟠 Soft".to_string(),
+        IsolationLevel::None => "❌ None".to_string(),
+        IsolationLevel::Unknown => {
+            match min_known {
+                Some(bound) => {
+                    let bound_str = match bound {
+                        IsolationLevel::Hard => "❓ Unknown but no more than ✅ Hard",
+                        IsolationLevel::Soft(_) => "❓ Unknown but no more than 🟠 Soft",
+                        IsolationLevel::None => "❓ Unknown but no more than ❌ None",
+                        IsolationLevel::Unknown => "❓ Unknown",
+                    };
+                    bound_str.to_string()
+                }
+                None => "❓ Unknown".to_string(),
+            }
+        }
     }
 }
 
@@ -836,10 +918,11 @@ impl Display for MultitenancyReport {
         // Control Plane section
         if let Some(control_plane) = &self.control_plane {
             add_separator(&mut rows, &mut first_section);
+            let cp_min_known = control_plane.min_known_isolation();
             rows.push(ReportRow {
                 system: "Control Plane".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(&control_plane.isolation_level),
+                value: format_isolation_with_bound(&control_plane.isolation_level, cp_min_known.as_ref()),
             });
             rows.push(ReportRow {
                 system: "".to_string(),
@@ -874,10 +957,11 @@ impl Display for MultitenancyReport {
         // Storage section
         if let Some(storage) = &self.storage {
             add_separator(&mut rows, &mut first_section);
+            let storage_min_known = storage.min_known_isolation();
             rows.push(ReportRow {
                 system: "Storage".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(&storage.isolation_level),
+                value: format_isolation_with_bound(&storage.isolation_level, storage_min_known.as_ref()),
             });
             rows.push(ReportRow {
                 system: "".to_string(),
@@ -889,10 +973,11 @@ impl Display for MultitenancyReport {
         // Network section
         if let Some(network) = &self.network {
             add_separator(&mut rows, &mut first_section);
+            let network_min_known = network.min_known_isolation();
             rows.push(ReportRow {
                 system: "Network".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(&network.isolation_level),
+                value: format_isolation_with_bound(&network.isolation_level, network_min_known.as_ref()),
             });
             rows.push(ReportRow {
                 system: "".to_string(),
@@ -904,10 +989,11 @@ impl Display for MultitenancyReport {
         // Workload section
         if let Some(workload) = &self.workload {
             add_separator(&mut rows, &mut first_section);
+            let workload_min_known = workload.min_known_isolation();
             rows.push(ReportRow {
                 system: "Workload".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation(&workload.isolation_level),
+                value: format_isolation_with_bound(&workload.isolation_level, workload_min_known.as_ref()),
             });
             rows.push(ReportRow {
                 system: "".to_string(),
@@ -935,13 +1021,14 @@ impl Display for MultitenancyReport {
 
         // Overall summary
         let overall_iso = self.overall_isolation();
+        let min_known_iso = self.min_known_isolation();
         let overall_auto = self.overall_autonomy_ratio();
 
         writeln!(f, "\n📋 Summary:")?;
         writeln!(
             f,
             "   Overall Isolation: {}",
-            format_isolation(&overall_iso)
+            format_isolation_summary(&overall_iso, min_known_iso.as_ref())
         )?;
         writeln!(
             f,
