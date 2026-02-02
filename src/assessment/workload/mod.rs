@@ -1,3 +1,6 @@
+mod fairness;
+pub use fairness::*;
+
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 use std::fmt::Display;
