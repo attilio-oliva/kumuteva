@@ -24,6 +24,11 @@ const AUTONOMY_TEST_PORT: i32 = 8080;
 const AUTONOMY_TEST_NODE_PORT: i32 = 30080;
 const WEBSERVER_PORT: i32 = 80;
 
+// Infrastructure network test constants
+const NODE_MARKER_POD_NAME: &str = "node-marker-service";
+const NODE_MARKER_PORT: i32 = 31337;
+const NODE_PROBE_POD_NAME: &str = "node-network-probe";
+
 // =============================================================================
 // RESOURCE AND OPERATION DEFINITIONS
 // =============================================================================
@@ -36,6 +41,8 @@ pub enum NetworkResource {
     PodNetwork,
     /// Service exposure and access
     ServiceNetwork,
+    /// Node-to-node network communication
+    InfrastructureNetwork,
     /// DNS resolution across namespaces
     DnsResolution,
 }
@@ -46,6 +53,8 @@ pub enum NetworkOperation {
     ConnectToPod,
     /// Access a service via ClusterIP
     ConnectToService,
+    /// Reach a node via its IP
+    ConnectToNode,
     /// Expose a service on a NodePort
     ExposeNodePort,
     /// Resolve DNS names across namespaces
@@ -59,6 +68,7 @@ impl AssessableResource for NetworkResource {
         vec![
             NetworkResource::PodNetwork,
             NetworkResource::ServiceNetwork,
+            NetworkResource::InfrastructureNetwork,
             NetworkResource::DnsResolution,
         ]
     }
@@ -70,6 +80,7 @@ impl AssessableResource for NetworkResource {
                 NetworkOperation::ConnectToService,
                 NetworkOperation::ExposeNodePort,
             ],
+            NetworkResource::InfrastructureNetwork => vec![NetworkOperation::ConnectToNode],
             NetworkResource::DnsResolution => vec![NetworkOperation::ResolveDns],
         }
     }
@@ -112,6 +123,9 @@ impl MultitenancyAssessor for NetworkAssessor {
                 // Test if tenant can create NodePort services
                 test_nodeport_authorization(tenant).await
             }
+            (NetworkResource::InfrastructureNetwork, NetworkOperation::ConnectToNode) => {
+                test_node_network_authorization(tenant).await
+            }
             (NetworkResource::DnsResolution, NetworkOperation::ResolveDns) => {
                 // DNS resolution is typically always available
                 Ok(true)
@@ -143,6 +157,9 @@ impl MultitenancyAssessor for NetworkAssessor {
             }
             (NetworkResource::DnsResolution, NetworkOperation::ResolveDns) => {
                 test_dns_isolation(tenant1, tenant2).await
+            }
+            (NetworkResource::InfrastructureNetwork, NetworkOperation::ConnectToNode) => {
+                test_node_network_isolation(tenant1, tenant2).await
             }
             _ => Ok(CrossTenantResult {
                 isolation: IsolationLevel::Unknown,
@@ -222,6 +239,24 @@ async fn test_nodeport_authorization(tenant: &TenantClusterConfig) -> anyhow::Re
     let _ = tenant
         .cluster
         .wait_for_namespaced_resource_deletion::<Service>("auth-test-nodeport", &tenant.namespace)
+        .await;
+
+    Ok(result.is_ok())
+}
+
+async fn test_node_network_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+    let pod_name = "auth-test-hostnetwork";
+    let pod = create_host_network_pod(pod_name);
+
+    let result = tenant
+        .cluster
+        .create_pod_in_namespace(&pod, &tenant.namespace)
+        .await;
+
+    // Cleanup
+    let _ = tenant
+        .cluster
+        .delete_pod_in_namespace(pod_name, &tenant.namespace)
         .await;
 
     Ok(result.is_ok())
@@ -631,6 +666,195 @@ async fn test_dns_isolation(
     }
 }
 
+/// Tests infrastructure network isolation using a marker-based approach.
+///
+/// This test verifies if tenant2 can bypass cluster network isolation by accessing
+/// a tenant1 service through the underlying node network (using hostNetwork pods).
+///
+/// Methodology:
+/// 1. Tenant1 creates a hostNetwork pod that listens on a specific port and responds
+///    with a unique marker string - this is the "observable state" owned by tenant1
+/// 2. Tenant2 creates a hostNetwork pod and attempts to reach tenant1's marker service
+///    via the node's internal IP
+/// 3. If tenant2 can read tenant1's marker, it proves:
+///    a) They share the same underlying node infrastructure
+///    b) Tenant2 can bypass cluster network isolation via the node network
+///
+/// This aligns with the assessment methodology: we create a tenant-owned observable
+/// state (the marker) and verify if another tenant can observe/access it.
+async fn test_node_network_isolation(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<CrossTenantResult> {
+    // Generate a unique marker that identifies tenant1's service
+    let marker = format!("TENANT1_NODE_MARKER_{}", uuid::Uuid::new_v4());
+    info!("Generated marker for tenant1: {}", marker);
+
+    // 1. Create marker service pod in tenant1 (hostNetwork to bind to node's port)
+    let marker_pod = create_node_marker_pod(NODE_MARKER_POD_NAME, &marker, NODE_MARKER_PORT);
+
+    let create_marker_result = tenant1
+        .cluster
+        .create_pod_in_namespace(&marker_pod, &tenant1.namespace)
+        .await;
+
+    if create_marker_result.is_err() {
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false,
+            details:
+                "Tenant1 cannot create hostNetwork pod - infrastructure network test not applicable"
+                    .to_string(),
+        });
+    }
+
+    // Wait for marker pod to be ready
+    if let Err(e) = tenant1
+        .cluster
+        .wait_for_pod_to_be_ready(NODE_MARKER_POD_NAME, &tenant1.namespace)
+        .await
+    {
+        let _ = tenant1
+            .cluster
+            .delete_pod_in_namespace(NODE_MARKER_POD_NAME, &tenant1.namespace)
+            .await;
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: false,
+            details: format!("Tenant1 marker pod failed to start: {}", e),
+        });
+    }
+
+    // Get the node IP where tenant1's marker pod is running
+    let marker_pod_obj = tenant1
+        .cluster
+        .get_pod_in_namespace(NODE_MARKER_POD_NAME, &tenant1.namespace)
+        .await?;
+
+    let node_ip = marker_pod_obj
+        .status
+        .and_then(|s| s.host_ip)
+        .ok_or_else(|| anyhow::anyhow!("Could not get host IP from marker pod"))?;
+
+    info!("Tenant1 marker service running on node IP: {}", node_ip);
+
+    // 2. Create probe pod in tenant2 (hostNetwork to access node network)
+    let probe_pod = create_host_network_pod(NODE_PROBE_POD_NAME);
+
+    let create_probe_result = tenant2
+        .cluster
+        .create_pod_in_namespace(&probe_pod, &tenant2.namespace)
+        .await;
+
+    if create_probe_result.is_err() {
+        // Cleanup tenant1's marker pod
+        let _ = tenant1
+            .cluster
+            .delete_pod_in_namespace(NODE_MARKER_POD_NAME, &tenant1.namespace)
+            .await;
+
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false,
+            details: "Tenant2 cannot create hostNetwork pod - isolation enforced by policy"
+                .to_string(),
+        });
+    }
+
+    // Wait for probe pod to be ready
+    if let Err(e) = tenant2
+        .cluster
+        .wait_for_pod_to_be_ready(NODE_PROBE_POD_NAME, &tenant2.namespace)
+        .await
+    {
+        // Cleanup
+        let _ = tenant1
+            .cluster
+            .delete_pod_in_namespace(NODE_MARKER_POD_NAME, &tenant1.namespace)
+            .await;
+        let _ = tenant2
+            .cluster
+            .delete_pod_in_namespace(NODE_PROBE_POD_NAME, &tenant2.namespace)
+            .await;
+
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: false,
+            details: format!("Tenant2 probe pod failed to start: {}", e),
+        });
+    }
+
+    // 3. Try to read tenant1's marker from tenant2's probe pod
+    let probe_cmd = format!(
+        "wget -q -O - --timeout=5 http://{}:{} 2>/dev/null || curl -s --connect-timeout 5 http://{}:{} 2>/dev/null || echo 'CONNECTION_FAILED'",
+        node_ip, NODE_MARKER_PORT, node_ip, NODE_MARKER_PORT
+    );
+
+    let probe_output = tenant2
+        .cluster
+        .exec_command_in_container(NODE_PROBE_POD_NAME, &tenant2.namespace, &probe_cmd)
+        .await
+        .unwrap_or_else(|e| format!("Exec failed: {}", e));
+
+    info!("Probe output from tenant2: {}", probe_output);
+
+    // Check if tenant2 successfully read tenant1's marker
+    let marker_found = probe_output.contains(&marker);
+
+    // Cleanup both pods
+    let _ = tenant1
+        .cluster
+        .delete_pod_in_namespace(NODE_MARKER_POD_NAME, &tenant1.namespace)
+        .await;
+    let _ = tenant2
+        .cluster
+        .delete_pod_in_namespace(NODE_PROBE_POD_NAME, &tenant2.namespace)
+        .await;
+    let _ = tenant1
+        .cluster
+        .wait_for_pod_deletion(NODE_MARKER_POD_NAME, &tenant1.namespace)
+        .await;
+    let _ = tenant2
+        .cluster
+        .wait_for_pod_deletion(NODE_PROBE_POD_NAME, &tenant2.namespace)
+        .await;
+
+    if marker_found {
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::None,
+            autonomy: true,
+            details: format!(
+                "Tenant2 successfully read tenant1's marker via node network at {}:{} - \
+                Infrastructure shared and cluster network isolation can be bypassed",
+                node_ip, NODE_MARKER_PORT
+            ),
+        })
+    } else if probe_output.contains("CONNECTION_FAILED") || probe_output.contains("Exec failed") {
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: format!(
+                "Tenant2 cannot reach tenant1's node service at {}:{} - \
+                Infrastructure network is isolated (different nodes or network policies in place)",
+                node_ip, NODE_MARKER_PORT
+            ),
+        })
+    } else {
+        // Connection succeeded but marker not found - unexpected response
+        Ok(CrossTenantResult {
+            isolation: IsolationLevel::Soft("Partial infrastructure sharing detected".to_string()),
+            autonomy: true,
+            details: format!(
+                "Tenant2 reached {}:{} but received unexpected response: '{}' - \
+                May indicate different service or NAT/proxy in between",
+                node_ip,
+                NODE_MARKER_PORT,
+                probe_output.chars().take(100).collect::<String>()
+            ),
+        })
+    }
+}
+
 // =============================================================================
 // MANIFEST CREATION HELPERS
 // =============================================================================
@@ -771,6 +995,90 @@ fn create_nodeport_service_auto_port(namespace: &str, name: &str) -> Service {
     .unwrap()
 }
 
+fn create_host_network_pod(name: &str) -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "labels": {
+                "app": "host-network-test"
+            }
+        },
+        "spec": {
+            "hostNetwork": true,
+            "containers": [{
+                "name": "probe",
+                "image": "praqma/network-multitool",
+                "command": ["/bin/sh", "-c", "sleep 3600"],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
+            }],
+            "restartPolicy": "Never"
+        }
+    }))
+    .unwrap()
+}
+
+/// Creates a hostNetwork pod that serves a unique marker on a specified port.
+/// This is used to create an observable state that can be verified by another tenant.
+fn create_node_marker_pod(name: &str, marker: &str, port: i32) -> Pod {
+    // praqma/network-multitool has nginx built-in. We'll:
+    // 1. Write our marker to the nginx html directory
+    // 2. Reconfigure nginx to listen on our custom port
+    // 3. Start nginx
+    let serve_cmd = format!(
+        "echo '{}' > /usr/share/nginx/html/index.html && \
+         sed -i 's/listen.*80/listen {}/g' /etc/nginx/nginx.conf && \
+         nginx -g 'daemon off;'",
+        marker, port
+    );
+
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "labels": {
+                "app": "node-marker-service"
+            }
+        },
+        "spec": {
+            "hostNetwork": true,
+            "containers": [{
+                "name": "marker-server",
+                "image": "praqma/network-multitool",
+                "command": ["/bin/sh", "-c", serve_cmd],
+                "ports": [{
+                    "containerPort": port,
+                    "hostPort": port,
+                    "protocol": "TCP"
+                }],
+                "resources": {
+                    "requests": {
+                        "memory": "64Mi",
+                        "cpu": "250m"
+                    },
+                    "limits": {
+                        "memory": "128Mi",
+                        "cpu": "500m"
+                    }
+                }
+            }],
+            "restartPolicy": "Never"
+        }
+    }))
+    .unwrap()
+}
+
 // =============================================================================
 // DISPLAY IMPLEMENTATIONS
 // =============================================================================
@@ -780,6 +1088,7 @@ impl Display for NetworkResource {
         match self {
             NetworkResource::PodNetwork => write!(f, "Pod Network"),
             NetworkResource::ServiceNetwork => write!(f, "Service Network"),
+            NetworkResource::InfrastructureNetwork => write!(f, "Infrastructure Network"),
             NetworkResource::DnsResolution => write!(f, "DNS Resolution"),
         }
     }
@@ -790,6 +1099,7 @@ impl Display for NetworkOperation {
         match self {
             NetworkOperation::ConnectToPod => write!(f, "Connect to Pod"),
             NetworkOperation::ConnectToService => write!(f, "Connect to Service"),
+            NetworkOperation::ConnectToNode => write!(f, "Connect to Node"),
             NetworkOperation::ExposeNodePort => write!(f, "Expose NodePort"),
             NetworkOperation::ResolveDns => write!(f, "Resolve DNS"),
         }
