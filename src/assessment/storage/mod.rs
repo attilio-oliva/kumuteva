@@ -211,7 +211,9 @@ async fn test_pv_cross_tenant_access(
             details: "Cross-tenant PV access is properly blocked".to_string(),
         }),
         Ok(AccessResult::IsolatedByPolicy(reason)) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
+            isolation: IsolationLevel::Soft(
+                "A policy forbid the operation for this resource".to_string(),
+            ),
             autonomy: true,
             details: format!("Storage isolated by policy: {}", reason),
         }),
@@ -245,7 +247,9 @@ async fn test_hostpath_cross_tenant_access(
             details: "HostPath volumes are properly isolated between tenants".to_string(),
         }),
         Ok(AccessResult::IsolatedByPolicy(reason)) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
+            isolation: IsolationLevel::Soft(
+                "A policy explicitly forbid the operation for this resource".to_string(),
+            ),
             autonomy: false, // Policy blocked it, so no autonomy for this operation
             details: format!("HostPath isolated by policy: {}", reason),
         }),
@@ -404,11 +408,11 @@ async fn attempt_other_tenant_file_access(
                 || (error_msg.contains("Status") && error_msg.contains("deserializ"))
             {
                 info!(
-                    "PV {} access is blocked for tenant1 (proxy/RBAC restriction). Storage is isolated.",
+                    "PV {} access is blocked for tenant1 (proxy or RBAC restriction). Storage is isolated.",
                     dynamic_pv_name
                 );
                 return Ok(AccessResult::IsolatedByPolicy(
-                    "Cannot access PersistentVolume - cluster-scoped resource blocked by proxy/RBAC".to_string(),
+                    "Cannot access PersistentVolume - cluster-scoped resource blocked by RBAC policy or reverse proxy filtering".to_string(),
                 ));
             }
             info!(
