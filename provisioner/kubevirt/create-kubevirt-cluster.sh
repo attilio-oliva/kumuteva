@@ -111,7 +111,8 @@ MAX_ATTEMPTS=20
 # Install a basic storage class 
 echo "Installing local-path-storage for storage inside cluster $CLUSTER_NAME with the extracted kubeconfig..."
 kubectl apply -f kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.34/deploy/local-path-storage.yaml --kubeconfig "$OUTPUT_PATH"
-
+# Set local-path as the default storage class
+kubectl patch storageclass local-path --kubeconfig "$OUTPUT_PATH" -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 
 # Wait for the cluster to be ready
 
