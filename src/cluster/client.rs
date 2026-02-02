@@ -513,8 +513,9 @@ impl KubernetesClient {
         namespace: Option<&str>,
     ) -> anyhow::Result<DynamicObject> {
         let kind = resource.kind();
+        let group = resource.group();
         // Common discovery, parameters, and api configuration for a single resource
-        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind, Some(group))
             .with_context(|| format!("resource {resource:?} not found in cluster"))?;
 
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
@@ -534,8 +535,9 @@ impl KubernetesClient {
         namespace: Option<&str>,
     ) -> Result<ObjectList<DynamicObject>> {
         let kind = resource.kind();
+        let group = resource.group();
         // Common discovery, parameters, and api configuration for a single resource
-        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind, Some(group))
             .with_context(|| format!("resource {resource:?} not found in cluster"))?;
 
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
@@ -553,8 +555,9 @@ impl KubernetesClient {
         namespace: Option<&str>,
     ) -> Result<()> {
         let kind = resource.kind();
+        let group = resource.group();
         // Common discovery, parameters, and api configuration for a single resource
-        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind, Some(group))
             .with_context(|| format!("resource {resource:?} not found in cluster"))?;
 
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
@@ -578,8 +581,9 @@ impl KubernetesClient {
         P: serde::Serialize + std::fmt::Debug,
     {
         let kind = resource.kind();
+        let group = resource.group();
         // Common discovery, parameters, and api configuration for a single resource
-        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind, Some(group))
             .with_context(|| format!("resource {resource:?} not found in cluster"))?;
 
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
@@ -598,8 +602,9 @@ impl KubernetesClient {
         namespace: Option<&str>,
     ) -> Result<DynamicObject> {
         let kind = resource.kind();
+        let group = resource.group();
         // Common discovery, parameters, and api configuration for a single resource
-        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind, Some(group))
             .with_context(|| format!("resource {resource:?} not found in cluster"))?;
 
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
@@ -613,6 +618,7 @@ impl KubernetesClient {
     fn resolve_api_resource(
         discovery: &Discovery,
         name: &str,
+        expected_group: Option<&str>,
     ) -> Option<(ApiResource, ApiCapabilities)> {
         // iterate through groups to find matching kind/plural names at recommended versions
         // and then take the minimal match by group.name (equivalent to sorting groups by group.name).
@@ -625,10 +631,13 @@ impl KubernetesClient {
                     .into_iter()
                     .map(move |res| (group, res))
             })
-            .filter(|(_, (res, _))| {
+            .filter(|(group, (res, _))| {
                 // match on both resource name and kind name
-                // ideally we should allow shortname matches as well
-                name.eq_ignore_ascii_case(&res.kind) || name.eq_ignore_ascii_case(&res.plural)
+                let name_matches =
+                    name.eq_ignore_ascii_case(&res.kind) || name.eq_ignore_ascii_case(&res.plural);
+                // If expected_group is provided, also filter by group
+                let group_matches = expected_group.map(|eg| group.name() == eg).unwrap_or(true);
+                name_matches && group_matches
             })
             .min_by_key(|(group, _res)| group.name())
             .map(|(_, res)| res)
@@ -798,8 +807,9 @@ impl KubernetesClient {
         namespace: Option<&str>,
     ) -> Result<DynamicObject> {
         let kind = resource.kind();
+        let group = resource.group();
         // Common discovery, parameters, and api configuration for a single resource
-        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind, Some(group))
             .with_context(|| format!("resource {resource:?} not found in cluster"))?;
 
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
@@ -833,8 +843,9 @@ impl KubernetesClient {
         namespace: Option<&str>,
     ) -> Result<()> {
         let kind = resource.kind();
+        let group = resource.group();
         // Common discovery, parameters, and api configuration for a single resource
-        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind)
+        let (ar, caps) = Self::resolve_api_resource(&self.discovery, kind, Some(group))
             .with_context(|| format!("resource {resource:?} not found in cluster"))?;
 
         let api = Self::dynamic_api(ar, caps, self.client.clone(), namespace, false);
