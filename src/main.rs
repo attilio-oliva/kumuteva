@@ -89,18 +89,25 @@ impl ChosenClusterProvider {
 enum Commands {
     /// Setup test environment with two tenants given a cluster environment type
     Setup {
-        /// Enable verbose output
-        #[clap(long, default_value = "false")]
-        verbose: bool,
         /// Use an existing cluster instead of creating a new one
-        #[clap(long, short, default_value = "false")]
-        existing_cluster: bool,
+        /// Provide kubeconfig path for the existing cluster
+        #[clap(long = "existing-cluster", short = 'f')]
+        existing_cluster_kubeconfig: Option<PathBuf>,
+
+        /// Output directory for generated kubeconfig files
+        /// If not specified, defaults to /tmp
+        #[clap(long = "output", short = 'o')]
+        output_dir: Option<PathBuf>,
+
         /// Name of the cluster to use or create.
         /// It is used as a prefix and followed by the environment type (e.g. test-vcluster).
-        #[clap(long, default_value = "test")]
+        #[clap(long, default_value = "kumuteva")]
         cluster_name: String,
+
+        /// Multitenancy solution for handling tenant clusters
         #[clap(long = "type", short = 't', default_value = "vcluster")]
         kind: ClusterEnvironmentType,
+
         /// Host cluster provider to use for the underlying cluster
         #[clap(long = "provider", short = 'p', default_value = "kind")]
         provider: ChosenClusterProvider,
@@ -108,14 +115,18 @@ enum Commands {
         tenant1: Tenant1SetupConfig,
         #[clap(flatten)]
         tenant2: Tenant2SetupConfig,
+
+        /// Enable verbose output
+        #[clap(long, default_value = "false")]
+        verbose: bool,
     },
     /// Verify isolation between two clusters
     Verify {
-        #[clap(long, default_value = "false")]
-        verbose: bool,
-        #[clap(short = 'f', long = "tenant1-kubeconfig")]
+        /// Path to tenant1 kubeconfig file (owner role) [required]
+        #[clap(value_name = "tenant1-kubeconfig")]
         tenant1_kubeconfig_path: PathBuf,
-        #[clap(short = 's', long = "tenant2-kubeconfig")]
+        /// Path to tenant2 kubeconfig file (attacker role) [required]
+        #[clap(value_name = "tenant2-kubeconfig")]
         tenant2_kubeconfig_path: PathBuf,
 
         #[clap(long = "tenant1-ns", default_value = "tenant1")]
@@ -135,6 +146,9 @@ enum Commands {
         /// Assess workload isolation (exclusive if any system is specified)
         #[clap(long = "workload", alias = "wl")]
         workload: bool,
+
+        #[clap(long, default_value = "false")]
+        verbose: bool,
     },
 }
 
@@ -245,20 +259,22 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Commands::Setup {
-            verbose,
-            existing_cluster,
+            existing_cluster_kubeconfig,
+            output_dir,
             cluster_name,
             kind,
             provider,
             tenant1,
             tenant2,
+            verbose,
         } => {
             setup_logging(verbose)?;
 
             println!("Setting up test environment...");
             let cluster_name = format!("{}-{}", cluster_name, kind.as_str());
             setup_test_environment(
-                existing_cluster,
+                existing_cluster_kubeconfig,
+                output_dir,
                 &cluster_name,
                 kind,
                 provider,
@@ -307,6 +323,9 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("Failed to run multitenancy assessment")?;
 
+            println!();
+            println!("Cluster isolation assessment report:");
+
             // Print individual subsystem reports if available
             if let Some(cp) = &report.control_plane {
                 println!("{}", cp);
@@ -320,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(workload) = &report.workload {
                 println!("{}", workload);
             }
-            println!("Multitenancy assessment report:\n{}", report);
+            println!("{}", report);
 
             // Common config
             // let config = FairnessTestConfig::default();
@@ -465,7 +484,8 @@ async fn get_or_create_tenant_cluster(
 }
 
 async fn setup_test_environment(
-    existing_cluster: bool,
+    existing_cluster_kubeconfig: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
     cluster_name: &str,
     env: ClusterEnvironmentType,
     provider: ChosenClusterProvider,
@@ -483,48 +503,67 @@ async fn setup_test_environment(
         tenant2_ns, tenant2_mapping.0, tenant2_mapping.1
     );
 
+    let output_dir = output_dir.unwrap_or_else(|| PathBuf::from("/tmp"));
+    std::fs::create_dir_all(&output_dir)
+        .context("Failed to create output directory for kubeconfig files")?;
+
     let port_mappings = TenantsPortMapping::from_tuple(tenant1_mapping, tenant2_mapping);
-    let test_kubeconfig = PathBuf::from(format!("/tmp/{}.kubeconfig", cluster_name));
+    let using_existing_cluster = existing_cluster_kubeconfig.is_some();
+    let cluster_kubeconfig = if let Some(existing_path) = existing_cluster_kubeconfig {
+        existing_path
+    } else {
+        output_dir.join(format!("{}.kubeconfig", cluster_name))
+    };
+
+    let cluster_name = if using_existing_cluster {
+        // If using existing cluster, try to extract the name from the kubeconfig file path
+        cluster_kubeconfig
+            .file_stem()
+            .and_then(|os_str| os_str.to_str())
+            .unwrap_or(cluster_name)
+    } else {
+        cluster_name
+    };
 
     // Create base cluster based on provider type
     let base_cluster = match provider {
         ChosenClusterProvider::Kind => {
-            let cluster = if existing_cluster {
+            let cluster = if using_existing_cluster {
                 println!("Using existing kind cluster '{}'", cluster_name);
-                KindCluster::load(cluster_name, test_kubeconfig.clone())
+                KindCluster::load(cluster_name, cluster_kubeconfig.clone())
                     .await
                     .context("Failed to load existing kind cluster")?
             } else {
                 println!("Creating new kind cluster '{}'", cluster_name);
-                KindCluster::create(cluster_name, test_kubeconfig.clone(), port_mappings)
+                KindCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
                     .await
                     .context("Failed to create new kind cluster")?
             };
             HostClusterType::Kind(cluster)
         }
         ChosenClusterProvider::K3s => {
-            let cluster = if existing_cluster {
+            let cluster = if using_existing_cluster {
                 println!("Using existing k3s cluster '{}'", cluster_name);
-                K3sCluster::load(cluster_name, test_kubeconfig.clone())
+                K3sCluster::load(cluster_name, cluster_kubeconfig.clone())
                     .await
                     .context("Failed to load existing k3s cluster")?
             } else {
                 println!("Creating new k3s cluster '{}'", cluster_name);
-                K3sCluster::create(cluster_name, test_kubeconfig.clone(), port_mappings)
+                K3sCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
                     .await
                     .context("Failed to create new k3s cluster")?
             };
             HostClusterType::K3s(cluster)
         }
         ChosenClusterProvider::None => {
-            let cluster = if existing_cluster {
+            let cluster = if using_existing_cluster {
                 println!("Using existing pre-existing cluster '{}'", cluster_name);
-                PreExistingCluster::load(cluster_name, test_kubeconfig.clone())
+                PreExistingCluster::load(cluster_name, cluster_kubeconfig.clone())
                     .await
                     .context("Failed to load existing pre-existing cluster")?
             } else {
                 println!("Creating new pre-existing cluster '{}'", cluster_name);
-                PreExistingCluster::create(cluster_name, test_kubeconfig.clone(), port_mappings)
+                PreExistingCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
                     .await
                     .context("Failed to create new pre-existing cluster")?
             };
@@ -534,8 +573,8 @@ async fn setup_test_environment(
 
     let tenant1_kubeconfig_name = format!("tenant1-{}", cluster_name);
     let tenant2_kubeconfig_name = format!("tenant2-{}", cluster_name);
-    let tenant1_kubeconfig = PathBuf::from(format!("/tmp/{}.kubeconfig", tenant1_kubeconfig_name));
-    let tenant2_kubeconfig = PathBuf::from(format!("/tmp/{}.kubeconfig", tenant2_kubeconfig_name));
+    let tenant1_kubeconfig = output_dir.join(format!("{}.kubeconfig", tenant1_kubeconfig_name));
+    let tenant2_kubeconfig = output_dir.join(format!("{}.kubeconfig", tenant2_kubeconfig_name));
 
     let tenant1_cluster =
         get_or_create_tenant_cluster(&base_cluster, "tenant1", tenant1_kubeconfig.clone(), env)
