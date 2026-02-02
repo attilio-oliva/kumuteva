@@ -283,11 +283,9 @@ pub(super) async fn test_autonomy_delete(
     object_kind: &KubernetesObject,
 ) -> anyhow::Result<bool> {
     // Special handling for resources that can't be created
-    if requires_existing_object(object_kind) {
-        // For resources like Node, DELETE is generally not allowed by tenants
-        // We can't safely test this without potentially breaking the cluster
-        return Ok(false);
-    }
+    // if requires_existing_object(object_kind) {
+
+    // }
 
     // For DELETE, we MUST create a resource to delete - we can't delete existing resources
     // as that would be destructive to the user's environment
