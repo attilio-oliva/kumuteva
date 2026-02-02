@@ -175,10 +175,7 @@ pub(super) async fn test_cross_tenant_update(
     if create_result.is_err() {
         return Ok(CrossTenantResult {
             autonomy: false,
-            isolation: IsolationLevel::Soft(format!(
-                "Could not create test object: {}",
-                create_result.unwrap_err()
-            )),
+            isolation: IsolationLevel::Unknown,
             details: format!(
                 "Cannot verify UPDATE isolation for {} - tenant1 creation failed",
                 object_kind.kind()
@@ -470,10 +467,7 @@ pub(super) async fn test_cross_tenant_get(
     if create_result.is_err() {
         return Ok(CrossTenantResult {
             autonomy: false,
-            isolation: IsolationLevel::Soft(format!(
-                "Could not create test object: {}",
-                create_result.unwrap_err()
-            )),
+            isolation: IsolationLevel::Unknown,
             details: format!(
                 "Cannot verify GET isolation for {} - tenant1 creation failed",
                 object_kind.kind()
@@ -663,10 +657,7 @@ pub(super) async fn test_cross_tenant_list(
     if create_result.is_err() {
         return Ok(CrossTenantResult {
             autonomy: false,
-            isolation: IsolationLevel::Soft(format!(
-                "Could not create test object: {}",
-                create_result.unwrap_err()
-            )),
+            isolation: IsolationLevel::Unknown,
             details: format!(
                 "Cannot verify LIST isolation for {} - tenant1 creation failed",
                 object_kind.kind()
