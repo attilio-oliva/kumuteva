@@ -164,7 +164,7 @@ fn iperf3_server_pod(index: u32) -> Pod {
             "containers": [{
                 "name": "iperf3",
                 "image": "networkstatic/iperf3",
-                "args": ["-s"]
+                "args": ["-s", "--one-off"]
             }]
         }
     }))
@@ -260,6 +260,22 @@ async fn create_iperf3_pair(
 async fn wait_for_completion(tenant: &TenantClusterConfig, pairs: u32) -> Result<()> {
     for i in 0..pairs {
         let name = format!("net-fairness-cli-{}", i);
+
+        // First check if pod already completed (avoid race with watch)
+        if let Ok(pod) = tenant
+            .cluster
+            .get_pod_in_namespace(&name, &tenant.namespace)
+            .await
+        {
+            if let Some(status) = pod.status {
+                if let Some(phase) = status.phase {
+                    if phase == "Succeeded" || phase == "Failed" {
+                        continue;
+                    }
+                }
+            }
+        }
+
         // Wait for pod to succeed or fail
         tenant
             .cluster
@@ -288,9 +304,10 @@ async fn collect_results(tenant: &TenantClusterConfig, pairs: u32) -> Result<Vec
             .get_pod_logs(&name, &tenant.namespace)
             .await?;
 
-        if let Some(rtt) = parse_iperf3_rtt(&logs) {
+        let rtt_points = parse_iperf3_rtt(&logs);
+        for (timestamp, rtt) in rtt_points {
             points.push(MetricPoint {
-                timestamp_secs: 0.0,
+                timestamp_secs: timestamp,
                 latency_ms: rtt,
                 is_error: false,
                 label: Some(format!("iperf3-{}", i)),
@@ -301,35 +318,79 @@ async fn collect_results(tenant: &TenantClusterConfig, pairs: u32) -> Result<Vec
     Ok(points)
 }
 
-fn parse_iperf3_rtt(logs: &str) -> Option<f64> {
-    let json_start = logs.find('{')?;
-    let json_end = logs.rfind('}')?;
+/// Returns a vector of (timestamp_secs, rtt_ms) tuples
+fn parse_iperf3_rtt(logs: &str) -> Vec<(f64, f64)> {
+    let mut rtts = Vec::new();
+
+    let json_start = match logs.find('{') {
+        Some(idx) => idx,
+        None => return rtts,
+    };
+    let json_end = match logs.rfind('}') {
+        Some(idx) => idx,
+        None => return rtts,
+    };
     let json_str = &logs[json_start..=json_end];
 
-    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let v: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return rtts,
+    };
 
-    // Try to get mean_rtt from streams
-    if let Some(streams) = v["end"]["streams"].as_array() {
-        if let Some(stream) = streams.first() {
-            if let Some(rtt) = stream["sender"]["mean_rtt"].as_f64() {
-                if rtt > 0.0 {
-                    return Some(rtt / 1000.0); // microseconds to ms
+    // Extract RTT from each interval (per-second measurements)
+    if let Some(intervals) = v["intervals"].as_array() {
+        for interval in intervals {
+            // Get timestamp from the interval (use "end" time of the interval)
+            let timestamp = interval["sum"]["end"].as_f64().unwrap_or(0.0);
+
+            // Each interval has streams array
+            if let Some(streams) = interval["streams"].as_array() {
+                for stream in streams {
+                    if let Some(rtt) = stream["rtt"].as_f64() {
+                        if rtt > 0.0 {
+                            rtts.push((timestamp, rtt / 1000.0)); // microseconds to ms
+                        }
+                    }
+                }
+            }
+            // Also check the sum for the interval if no stream RTTs found
+            if rtts.last().map(|(t, _)| *t != timestamp).unwrap_or(true) {
+                if let Some(rtt) = interval["sum"]["rtt"].as_f64() {
+                    if rtt > 0.0 {
+                        rtts.push((timestamp, rtt / 1000.0));
+                    }
                 }
             }
         }
     }
 
-    // Fallback to sum_sent
-    if let Some(rtt) = v["end"]["sum_sent"]["mean_rtt"].as_f64() {
-        if rtt > 0.0 {
-            return Some(rtt / 1000.0);
+    // Fallback: if no interval RTTs found, try end summary
+    if rtts.is_empty() {
+        if let Some(streams) = v["end"]["streams"].as_array() {
+            for (idx, stream) in streams.iter().enumerate() {
+                if let Some(rtt) = stream["sender"]["mean_rtt"].as_f64() {
+                    if rtt > 0.0 {
+                        rtts.push((idx as f64, rtt / 1000.0));
+                    }
+                }
+            }
         }
     }
 
-    None
+    // Final fallback to sum_sent
+    if rtts.is_empty() {
+        if let Some(rtt) = v["end"]["sum_sent"]["mean_rtt"].as_f64() {
+            if rtt > 0.0 {
+                rtts.push((0.0, rtt / 1000.0));
+            }
+        }
+    }
+
+    rtts
 }
 
 async fn cleanup_pods(tenant: &TenantClusterConfig, pairs: u32) -> Result<()> {
+    // First, initiate deletion for all pods
     for i in 0..pairs {
         let server = format!("net-fairness-srv-{}", i);
         let client = format!("net-fairness-cli-{}", i);
@@ -342,5 +403,21 @@ async fn cleanup_pods(tenant: &TenantClusterConfig, pairs: u32) -> Result<()> {
             .delete_pod_in_namespace(&client, &tenant.namespace)
             .await;
     }
+
+    // Then, wait for all pods to be fully deleted to avoid "AlreadyExists" errors
+    // when creating new pods with the same names in subsequent phases
+    for i in 0..pairs {
+        let server = format!("net-fairness-srv-{}", i);
+        let client = format!("net-fairness-cli-{}", i);
+        let _ = tenant
+            .cluster
+            .wait_for_pod_deletion(&server, &tenant.namespace)
+            .await;
+        let _ = tenant
+            .cluster
+            .wait_for_pod_deletion(&client, &tenant.namespace)
+            .await;
+    }
+
     Ok(())
 }

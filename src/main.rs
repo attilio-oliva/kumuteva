@@ -201,9 +201,6 @@ enum Commands {
         /// Number of concurrent requesters for control plane tests
         #[clap(long, default_value = "1")]
         cp_requesters: usize,
-        /// Request rate per requester for control plane tests (requests/sec)
-        #[clap(long, default_value = "50.0")]
-        cp_request_rate: f64,
 
         /// Number of benchmark pods per tenant for workload tests
         #[clap(long, default_value = "1")]
@@ -479,64 +476,6 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", workload);
             }
             println!("{}", report);
-
-            // Common config
-            // let config = FairnessTestConfig::default();
-
-            // Control Plane
-            // let cp_assessor =
-            //     ControlPlaneFairnessAssessor::new(ControlPlaneFairnessConfig::default());
-            // let cp_result = run_fairness_assessment(
-            //     &cp_assessor,
-            //     tenant1_config.clone(),
-            //     tenant2_config.clone(),
-            //     &config,
-            // )
-            // .await?;
-
-            // Network
-            // let net_assessor = NetworkFairnessAssessor::new(NetworkFairnessConfig::default());
-            // let net_result = run_detailed_fairness_assessment(
-            //     &net_assessor,
-            //     tenant1_config.clone(),
-            //     tenant2_config.clone(),
-            //     &config,
-            //     true,
-            //     Some("results/net"),
-            // )
-            // .await?;
-
-            // Storage
-            // let storage_assessor = StorageFairnessAssessor::new(StorageFairnessConfig::default());
-            // let storage_result = run_fairness_assessment(
-            //     &storage_assessor,
-            //     tenant1_config.clone(),
-            //     tenant2_config.clone(),
-            //     &config,
-            // )
-            // .await?;
-
-            // println!(
-            //     "Control Plane degradation: {:.1}%",
-            //     cp_result.latency_degradation * 100.0
-            // );
-            // println!(
-            //     "Network degradation: {:.1}%",
-            //     net_result.result.latency_degradation * 100.0
-            // );
-            // println!(
-            //     "Storage degradation: {:.1}%",
-            //     storage_result.latency_degradation * 100.0
-            // );
-
-            // manual_test_cross_tenant_operation(
-            //     &tenant1_config,
-            //     &tenant2_config,
-            //     &ControlPlaneResource::StorageClass,
-            //     &ControlPlaneOperation::Get,
-            //     false, // Don't cleanup - leave objects for inspection
-            // )
-            // .await?;
         }
         Commands::Fairness {
             tenant1_kubeconfig_path,
@@ -553,7 +492,6 @@ async fn main() -> anyhow::Result<()> {
             rate_limit,
             load_multiplier,
             cp_requesters,
-            cp_request_rate,
             wl_pods,
             wl_threads,
             wl_max_prime,
@@ -635,6 +573,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("\n═══════════════════════════════════════════════════════════");
                 println!("Network Fairness Assessment");
                 println!("  Pod pairs per tenant: {}", net_pod_pairs);
+                println!("  Baseline bandwidth: {}Mbps", runner.config().tenant1_rate);
                 println!("═══════════════════════════════════════════════════════════");
 
                 let net_config = FairnessNetworkConfig {
