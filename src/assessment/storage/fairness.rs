@@ -77,17 +77,23 @@ impl FairnessStorageAssessor {
     ) -> Result<PhaseResult> {
         let duration_secs = duration.as_secs();
 
-        // Create benchmark pods
-        for i in 0..t1_pods {
-            create_fio_pod(&tenant1, i, &self.config, duration_secs, t1_rate_iops).await?;
-        }
-        for i in 0..t2_pods {
-            create_fio_pod(&tenant2, i, &self.config, duration_secs, t2_rate_iops).await?;
-        }
+        // Create all benchmark pods in parallel across tenants
+        let config1 = self.config.clone();
+        let config2 = self.config.clone();
+        let t1_clone = tenant1.clone();
+        let t2_clone = tenant2.clone();
+        tokio::try_join!(
+            create_fio_pods(&t1_clone, t1_pods, &config1, duration_secs, t1_rate_iops),
+            create_fio_pods(&t2_clone, t2_pods, &config2, duration_secs, t2_rate_iops)
+        )?;
 
-        // Wait for completion
-        wait_for_completion(&tenant1, t1_pods).await?;
-        wait_for_completion(&tenant2, t2_pods).await?;
+        // Wait for completion in parallel across tenants
+        let t1_clone = tenant1.clone();
+        let t2_clone = tenant2.clone();
+        tokio::try_join!(
+            wait_for_completion(&t1_clone, t1_pods),
+            wait_for_completion(&t2_clone, t2_pods)
+        )?;
 
         // Collect results
         let t1_points = collect_results(&tenant1, t1_pods).await?;
@@ -226,44 +232,88 @@ fn fio_pod(
     .unwrap()
 }
 
-async fn create_fio_pod(
+/// Create all fio pods for a tenant in parallel
+async fn create_fio_pods(
     tenant: &TenantClusterConfig,
-    index: u32,
+    pods: u32,
     config: &FairnessStorageConfig,
     duration_secs: u64,
     rate_iops: Option<u32>,
 ) -> Result<()> {
-    let pod = fio_pod(index, config, duration_secs, rate_iops);
-    let name = pod.metadata.name.clone().unwrap();
+    // First, create all pods without waiting
+    let mut pod_names = Vec::new();
+    for i in 0..pods {
+        let pod = fio_pod(i, config, duration_secs, rate_iops);
+        let name = pod.metadata.name.clone().unwrap();
+        tenant
+            .cluster
+            .create_pod_in_namespace(&pod, &tenant.namespace)
+            .await?;
+        pod_names.push(name);
+    }
 
-    tenant
-        .cluster
-        .create_pod_in_namespace(&pod, &tenant.namespace)
-        .await?;
-    tenant
-        .cluster
-        .wait_for_pod_to_be_ready(&name, &tenant.namespace)
-        .await?;
+    // Then wait for all pods to be ready (they start executing immediately)
+    for name in pod_names {
+        tenant
+            .cluster
+            .wait_for_pod_to_be_ready(&name, &tenant.namespace)
+            .await?;
+    }
 
     Ok(())
 }
 
 async fn wait_for_completion(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
+    use futures::{StreamExt, TryStreamExt};
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::WatchParams;
+    use kube::Api;
+
+    let api: Api<Pod> = Api::namespaced(tenant.cluster.client().clone(), &tenant.namespace);
+
     for i in 0..pods {
         let name = format!("storage-fairness-{}", i);
-        tenant
-            .cluster
-            .watch_pod_until_condition(&name, &tenant.namespace, |event| async move {
-                if let kube::api::WatchEvent::Modified(pod) = event {
-                    if let Some(status) = pod.status {
-                        if let Some(phase) = status.phase {
-                            return phase == "Succeeded" || phase == "Failed";
+
+        // Helper to check if pod is completed
+        let is_completed = |pod: &Pod| -> bool {
+            pod.status
+                .as_ref()
+                .and_then(|s| s.phase.as_ref())
+                .map(|p| p == "Succeeded" || p == "Failed")
+                .unwrap_or(false)
+        };
+
+        // First check if pod already completed (avoid race with watch)
+        if let Ok(pod) = api.get(&name).await {
+            if is_completed(&pod) {
+                continue;
+            }
+        }
+
+        // Watch for completion
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", name))
+            .timeout(290);
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(event) = stream.try_next().await? {
+            match event {
+                kube::api::WatchEvent::Modified(pod) => {
+                    if is_completed(&pod) {
+                        break;
+                    }
+                }
+                _ => {
+                    // On any other event (Bookmark, Added, etc.), check pod status directly
+                    if let Ok(pod) = api.get(&name).await {
+                        if is_completed(&pod) {
+                            break;
                         }
                     }
                 }
-                false
-            })
-            .await?;
+            }
+        }
     }
     Ok(())
 }
@@ -320,6 +370,7 @@ fn parse_fio_latency(logs: &str) -> Option<f64> {
 }
 
 async fn cleanup_pods(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
+    // First, initiate deletion for all pods
     for i in 0..pods {
         let name = format!("storage-fairness-{}", i);
         let _ = tenant
@@ -327,5 +378,16 @@ async fn cleanup_pods(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
             .delete_pod_in_namespace(&name, &tenant.namespace)
             .await;
     }
+
+    // Then, wait for all pods to be fully deleted to avoid "AlreadyExists" errors
+    // when creating new pods with the same names in subsequent phases
+    for i in 0..pods {
+        let name = format!("storage-fairness-{}", i);
+        let _ = tenant
+            .cluster
+            .wait_for_pod_deletion(&name, &tenant.namespace)
+            .await;
+    }
+
     Ok(())
 }

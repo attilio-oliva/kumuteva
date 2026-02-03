@@ -58,17 +58,32 @@ impl FairnessNetworkAssessor {
     ) -> Result<PhaseResult> {
         let duration_secs = duration.as_secs();
 
-        // Create iperf3 pod pairs
-        for i in 0..t1_pairs {
-            create_iperf3_pair(&tenant1, i, duration_secs, t1_bandwidth_mbps).await?;
-        }
-        for i in 0..t2_pairs {
-            create_iperf3_pair(&tenant2, i, duration_secs, t2_bandwidth_mbps).await?;
-        }
+        // Create iperf3 servers first (in parallel across tenants)
+        let t1_clone = tenant1.clone();
+        let t2_clone = tenant2.clone();
+        let (t1_servers, t2_servers) = tokio::try_join!(
+            create_iperf3_servers(&t1_clone, t1_pairs),
+            create_iperf3_servers(&t2_clone, t2_pairs)
+        )?;
 
-        // Wait for completion
-        wait_for_completion(&tenant1, t1_pairs).await?;
-        wait_for_completion(&tenant2, t2_pairs).await?;
+        // Small delay for servers to start listening
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Create all clients in parallel (they will start the actual test)
+        let t1_clone = tenant1.clone();
+        let t2_clone = tenant2.clone();
+        tokio::try_join!(
+            create_iperf3_clients(&t1_clone, &t1_servers, duration_secs, t1_bandwidth_mbps),
+            create_iperf3_clients(&t2_clone, &t2_servers, duration_secs, t2_bandwidth_mbps)
+        )?;
+
+        // Wait for completion (in parallel across tenants)
+        let t1_clone = tenant1.clone();
+        let t2_clone = tenant2.clone();
+        tokio::try_join!(
+            wait_for_completion(&t1_clone, t1_pairs),
+            wait_for_completion(&t2_clone, t2_pairs)
+        )?;
 
         // Collect results
         let t1_points = collect_results(&tenant1, t1_pairs).await?;
@@ -145,7 +160,7 @@ impl FairnessAssessor for FairnessNetworkAssessor {
 // =============================================================================
 
 /// Convert rate (ops/sec) to bandwidth (Mbps)
-fn rate_to_bandwidth(rate: f64) -> Option<f64> {
+pub fn rate_to_bandwidth(rate: f64) -> Option<f64> {
     if rate <= 0.0 {
         None
     } else {
@@ -201,95 +216,145 @@ fn iperf3_client_pod(index: u32, server_ip: &str, duration: u64, bandwidth: Opti
     .unwrap()
 }
 
-async fn create_iperf3_pair(
+/// Server info: (index, server_ip)
+type ServerInfo = (u32, String);
+
+/// Create all iperf3 servers and return their IPs
+async fn create_iperf3_servers(
     tenant: &TenantClusterConfig,
-    index: u32,
+    pairs: u32,
+) -> Result<Vec<ServerInfo>> {
+    let mut servers = Vec::new();
+
+    // Create all server pods
+    for i in 0..pairs {
+        let server = iperf3_server_pod(i);
+        let server_name = server.metadata.name.clone().unwrap();
+        tenant
+            .cluster
+            .create_pod_in_namespace(&server, &tenant.namespace)
+            .await?;
+        servers.push((i, server_name));
+    }
+
+    // Wait for all servers to be ready and get their IPs
+    let mut server_infos = Vec::new();
+    for (index, server_name) in servers {
+        tenant
+            .cluster
+            .wait_for_pod_to_be_ready(&server_name, &tenant.namespace)
+            .await?;
+
+        // Get server IP
+        let mut server_ip = String::new();
+        for _ in 0..10 {
+            if let Ok(ip) = tenant
+                .cluster
+                .get_pod_ip(&server_name, &tenant.namespace)
+                .await
+            {
+                if !ip.is_empty() {
+                    server_ip = ip;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        if server_ip.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Failed to get server IP for {}",
+                server_name
+            ));
+        }
+
+        server_infos.push((index, server_ip));
+    }
+
+    Ok(server_infos)
+}
+
+/// Create all iperf3 clients pointing to their respective servers
+async fn create_iperf3_clients(
+    tenant: &TenantClusterConfig,
+    servers: &[ServerInfo],
     duration: u64,
     bandwidth: Option<f64>,
 ) -> Result<()> {
-    // Create server
-    let server = iperf3_server_pod(index);
-    let server_name = server.metadata.name.clone().unwrap();
-    tenant
-        .cluster
-        .create_pod_in_namespace(&server, &tenant.namespace)
-        .await?;
-    tenant
-        .cluster
-        .wait_for_pod_to_be_ready(&server_name, &tenant.namespace)
-        .await?;
-
-    // Get server IP
-    let mut server_ip = String::new();
-    for _ in 0..10 {
-        if let Ok(ip) = tenant
+    // Create all client pods
+    let mut client_names = Vec::new();
+    for (index, server_ip) in servers {
+        let client = iperf3_client_pod(*index, server_ip, duration, bandwidth);
+        let client_name = client.metadata.name.clone().unwrap();
+        tenant
             .cluster
-            .get_pod_ip(&server_name, &tenant.namespace)
-            .await
-        {
-            if !ip.is_empty() {
-                server_ip = ip;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+            .create_pod_in_namespace(&client, &tenant.namespace)
+            .await?;
+        client_names.push(client_name);
     }
 
-    if server_ip.is_empty() {
-        return Err(anyhow::anyhow!("Failed to get server IP"));
+    // Wait for all clients to be ready (they start the test immediately)
+    for client_name in client_names {
+        tenant
+            .cluster
+            .wait_for_pod_to_be_ready(&client_name, &tenant.namespace)
+            .await?;
     }
-
-    // Wait for server to start listening
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Create client
-    let client = iperf3_client_pod(index, &server_ip, duration, bandwidth);
-    let client_name = client.metadata.name.clone().unwrap();
-    tenant
-        .cluster
-        .create_pod_in_namespace(&client, &tenant.namespace)
-        .await?;
-    tenant
-        .cluster
-        .wait_for_pod_to_be_ready(&client_name, &tenant.namespace)
-        .await?;
 
     Ok(())
 }
 
 async fn wait_for_completion(tenant: &TenantClusterConfig, pairs: u32) -> Result<()> {
+    use futures::{StreamExt, TryStreamExt};
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::WatchParams;
+    use kube::Api;
+
+    let api: Api<Pod> = Api::namespaced(tenant.cluster.client().clone(), &tenant.namespace);
+
     for i in 0..pairs {
         let name = format!("net-fairness-cli-{}", i);
 
+        // Helper to check if pod is completed
+        let is_completed = |pod: &Pod| -> bool {
+            pod.status
+                .as_ref()
+                .and_then(|s| s.phase.as_ref())
+                .map(|p| p == "Succeeded" || p == "Failed")
+                .unwrap_or(false)
+        };
+
         // First check if pod already completed (avoid race with watch)
-        if let Ok(pod) = tenant
-            .cluster
-            .get_pod_in_namespace(&name, &tenant.namespace)
-            .await
-        {
-            if let Some(status) = pod.status {
-                if let Some(phase) = status.phase {
-                    if phase == "Succeeded" || phase == "Failed" {
-                        continue;
+        if let Ok(pod) = api.get(&name).await {
+            if is_completed(&pod) {
+                continue;
+            }
+        }
+
+        // Watch for completion
+        let lp = WatchParams::default()
+            .fields(&format!("metadata.name={}", name))
+            .timeout(290);
+
+        let mut stream = api.watch(&lp, "0").await?.boxed();
+
+        while let Some(event) = stream.try_next().await? {
+            match event {
+                kube::api::WatchEvent::Modified(pod) => {
+                    if is_completed(&pod) {
+                        break;
+                    }
+                }
+                _ => {
+                    // On any other event (Bookmark, Added, etc.), check pod status directly
+                    if let Ok(pod) = api.get(&name).await {
+                        if is_completed(&pod) {
+                            break;
+                        }
                     }
                 }
             }
         }
-
-        // Wait for pod to succeed or fail
-        tenant
-            .cluster
-            .watch_pod_until_condition(&name, &tenant.namespace, |event| async move {
-                if let kube::api::WatchEvent::Modified(pod) = event {
-                    if let Some(status) = pod.status {
-                        if let Some(phase) = status.phase {
-                            return phase == "Succeeded" || phase == "Failed";
-                        }
-                    }
-                }
-                false
-            })
-            .await?;
     }
     Ok(())
 }

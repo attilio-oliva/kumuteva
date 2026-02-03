@@ -21,9 +21,9 @@ use crate::assessment::{
     AssessmentConfig,
 };
 use crate::assessment::{
-    FairnessControlPlaneAssessor, FairnessControlPlaneConfig, FairnessNetworkAssessor,
-    FairnessNetworkConfig, FairnessStorageAssessor, FairnessStorageConfig, FairnessStorageScenario,
-    FairnessWorkloadAssessor, FairnessWorkloadConfig,
+    rate_to_bandwidth, FairnessControlPlaneAssessor, FairnessControlPlaneConfig,
+    FairnessNetworkAssessor, FairnessNetworkConfig, FairnessStorageAssessor, FairnessStorageConfig,
+    FairnessStorageScenario, FairnessWorkloadAssessor, FairnessWorkloadConfig,
 };
 
 use crate::cluster::{HostClusterType, K3sCluster, PreExistingCluster};
@@ -543,7 +543,7 @@ async fn main() -> anyhow::Result<()> {
             println!("  Test duration: {} seconds", test_duration);
             println!("  Rate strategy: {:?}", rate_strategy);
             if !matches!(rate_strategy, RateLimitStrategy::Unlimited) {
-                println!("  Rate limit: {} req/sec", rate_limit);
+                println!("  Rate limit: {} req/s", rate_limit);
             }
             println!("  Load multiplier: {}x", load_multiplier);
             println!();
@@ -573,7 +573,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("\n═══════════════════════════════════════════════════════════");
                 println!("Network Fairness Assessment");
                 println!("  Pod pairs per tenant: {}", net_pod_pairs);
-                println!("  Baseline bandwidth: {}Mbps", runner.config().tenant1_rate);
+                println!(
+                    "  Baseline bandwidth: {}Mbps",
+                    rate_to_bandwidth(rate_limit).unwrap_or(f64::INFINITY)
+                );
                 println!("═══════════════════════════════════════════════════════════");
 
                 let net_config = FairnessNetworkConfig {
