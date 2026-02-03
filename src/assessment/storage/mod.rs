@@ -1,4 +1,5 @@
 mod fairness;
+
 pub use fairness::*;
 
 use std::fmt::Display;

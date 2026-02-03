@@ -1,15 +1,22 @@
+// Isolation assessment modules (for multi-tenancy isolation checks)
 mod control_plane;
-
-mod fairness_framework;
 mod network;
 mod storage;
 mod workload;
 
+pub mod fairness_assessor;
+
+// Re-export isolation assessment types
 pub use control_plane::*;
-pub use fairness_framework::*;
 pub use network::*;
 pub use storage::*;
 pub use workload::*;
+
+// Re-export new clean fairness API
+pub use fairness_assessor::{
+    FairnessAssessor, FairnessConfig, FairnessLevel, FairnessResult, FairnessRunner,
+    FairnessRunnerBuilder, MetricPoint, PhaseResult, RateLimitStrategy, RateLimiter, TenantMetrics,
+};
 
 use tabled::settings::object::Rows;
 use tabled::settings::{Alignment, Modify, Style};
@@ -721,7 +728,9 @@ impl MultitenancyReport {
     pub fn min_known_isolation(&self) -> Option<IsolationLevel> {
         // Collect min_known from each subsystem (which looks at individual resource assessments)
         let min_known_levels: Vec<IsolationLevel> = [
-            self.control_plane.as_ref().and_then(|r| r.min_known_isolation()),
+            self.control_plane
+                .as_ref()
+                .and_then(|r| r.min_known_isolation()),
             self.storage.as_ref().and_then(|r| r.min_known_isolation()),
             self.network.as_ref().and_then(|r| r.min_known_isolation()),
             self.workload.as_ref().and_then(|r| r.min_known_isolation()),
@@ -853,25 +862,26 @@ fn format_isolation(level: &IsolationLevel) -> String {
 
 /// Formats an isolation level, optionally showing the upper bound when Unknown.
 /// When level is Unknown and min_known is provided, shows "❓/🟠 Unknown/Soft" format.
-fn format_isolation_with_bound(level: &IsolationLevel, min_known: Option<&IsolationLevel>) -> String {
+fn format_isolation_with_bound(
+    level: &IsolationLevel,
+    min_known: Option<&IsolationLevel>,
+) -> String {
     match level {
         IsolationLevel::Hard => "✅ Hard".to_string(),
         IsolationLevel::Soft(_reason) => "🟠 Soft".to_string(),
         IsolationLevel::None => "❌ None".to_string(),
-        IsolationLevel::Unknown => {
-            match min_known {
-                Some(bound) => {
-                    let bound_str = match bound {
-                        IsolationLevel::Hard => "❓/✅ Unknown/Hard",
-                        IsolationLevel::Soft(_) => "❓/🟠 Unknown/Soft",
-                        IsolationLevel::None => "❓/❌ Unknown/None",
-                        IsolationLevel::Unknown => "❓ Unknown",
-                    };
-                    bound_str.to_string()
-                }
-                None => "❓ Unknown".to_string(),
+        IsolationLevel::Unknown => match min_known {
+            Some(bound) => {
+                let bound_str = match bound {
+                    IsolationLevel::Hard => "❓/✅ Unknown/Hard",
+                    IsolationLevel::Soft(_) => "❓/🟠 Unknown/Soft",
+                    IsolationLevel::None => "❓/❌ Unknown/None",
+                    IsolationLevel::Unknown => "❓ Unknown",
+                };
+                bound_str.to_string()
             }
-        }
+            None => "❓ Unknown".to_string(),
+        },
     }
 }
 
@@ -881,20 +891,18 @@ fn format_isolation_summary(level: &IsolationLevel, min_known: Option<&Isolation
         IsolationLevel::Hard => "✅ Hard".to_string(),
         IsolationLevel::Soft(_reason) => "🟠 Soft".to_string(),
         IsolationLevel::None => "❌ None".to_string(),
-        IsolationLevel::Unknown => {
-            match min_known {
-                Some(bound) => {
-                    let bound_str = match bound {
-                        IsolationLevel::Hard => "❓ Unknown but no more than ✅ Hard",
-                        IsolationLevel::Soft(_) => "❓ Unknown but no more than 🟠 Soft",
-                        IsolationLevel::None => "❓ Unknown but no more than ❌ None",
-                        IsolationLevel::Unknown => "❓ Unknown",
-                    };
-                    bound_str.to_string()
-                }
-                None => "❓ Unknown".to_string(),
+        IsolationLevel::Unknown => match min_known {
+            Some(bound) => {
+                let bound_str = match bound {
+                    IsolationLevel::Hard => "❓ Unknown but no more than ✅ Hard",
+                    IsolationLevel::Soft(_) => "❓ Unknown but no more than 🟠 Soft",
+                    IsolationLevel::None => "❓ Unknown but no more than ❌ None",
+                    IsolationLevel::Unknown => "❓ Unknown",
+                };
+                bound_str.to_string()
             }
-        }
+            None => "❓ Unknown".to_string(),
+        },
     }
 }
 
@@ -922,7 +930,10 @@ impl Display for MultitenancyReport {
             rows.push(ReportRow {
                 system: "Control Plane".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation_with_bound(&control_plane.isolation_level, cp_min_known.as_ref()),
+                value: format_isolation_with_bound(
+                    &control_plane.isolation_level,
+                    cp_min_known.as_ref(),
+                ),
             });
             rows.push(ReportRow {
                 system: "".to_string(),
@@ -961,7 +972,10 @@ impl Display for MultitenancyReport {
             rows.push(ReportRow {
                 system: "Storage".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation_with_bound(&storage.isolation_level, storage_min_known.as_ref()),
+                value: format_isolation_with_bound(
+                    &storage.isolation_level,
+                    storage_min_known.as_ref(),
+                ),
             });
             rows.push(ReportRow {
                 system: "".to_string(),
@@ -977,7 +991,10 @@ impl Display for MultitenancyReport {
             rows.push(ReportRow {
                 system: "Network".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation_with_bound(&network.isolation_level, network_min_known.as_ref()),
+                value: format_isolation_with_bound(
+                    &network.isolation_level,
+                    network_min_known.as_ref(),
+                ),
             });
             rows.push(ReportRow {
                 system: "".to_string(),
@@ -993,7 +1010,10 @@ impl Display for MultitenancyReport {
             rows.push(ReportRow {
                 system: "Workload".to_string(),
                 property: "Isolation".to_string(),
-                value: format_isolation_with_bound(&workload.isolation_level, workload_min_known.as_ref()),
+                value: format_isolation_with_bound(
+                    &workload.isolation_level,
+                    workload_min_known.as_ref(),
+                ),
             });
             rows.push(ReportRow {
                 system: "".to_string(),

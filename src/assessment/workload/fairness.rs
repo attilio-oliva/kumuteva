@@ -1,14 +1,6 @@
-//! Workload Fairness Assessor
+//! Clean Workload (CPU) Fairness Assessor
 //!
-//! This module implements the `FairnessAssessor` trait for the workload subsystem.
-//! It measures compute latency fairness by comparing how a "regular" tenant's
-//! task completion time is affected when a "malicious" tenant increases their
-//! CPU load.
-//!
-//! Uses sysbench CPU benchmark to measure the time to complete a fixed workload,
-//! running multiple iterations to get statistically significant results.
-
-#![allow(dead_code)]
+//! Measures CPU fairness using sysbench benchmark pods.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,9 +9,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 
-use crate::assessment::fairness_framework::{
-    DetailedFairnessAssessor, DetailedPhaseResults, FairnessAssessor, FairnessTestConfig,
-    MetricDataPoint, PhaseResults, TenantMetrics,
+use crate::assessment::fairness_assessor::{
+    FairnessAssessor, FairnessConfig, MetricPoint, PhaseResult, RateLimitStrategy, TenantMetrics,
 };
 use crate::assessment::TenantClusterConfig;
 
@@ -27,139 +18,110 @@ use crate::assessment::TenantClusterConfig;
 // CONFIGURATION
 // =============================================================================
 
-/// Workload fairness assessor configuration
+/// Workload assessor configuration
 #[derive(Debug, Clone)]
-pub struct WorkloadFairnessConfig {
-    /// Number of benchmark pods per tenant for baseline
-    pub pods_per_tenant: u32,
-    /// Number of CPU threads to use per benchmark pod
-    pub threads_per_pod: u32,
-    /// Number of prime numbers to calculate (workload size)
-    /// Higher = longer task, more stable measurements
+pub struct FairnessWorkloadConfig {
+    /// Number of benchmark pods per tenant
+    pub pods: u32,
+    /// Number of CPU threads per pod
+    pub threads: u32,
+    /// Max prime number for sysbench (higher = longer tasks)
     pub max_prime: u32,
 }
 
-impl Default for WorkloadFairnessConfig {
+impl Default for FairnessWorkloadConfig {
     fn default() -> Self {
         Self {
-            pods_per_tenant: 1,
-            threads_per_pod: 1,
-            max_prime: 500_000,
+            pods: 1,
+            threads: 1,
+            max_prime: 500000,
         }
     }
 }
 
+// =============================================================================
+// ASSESSOR
+// =============================================================================
+
 /// Workload fairness assessor using sysbench CPU benchmark
-pub struct WorkloadFairnessAssessor {
-    pub config: WorkloadFairnessConfig,
+pub struct FairnessWorkloadAssessor {
+    config: FairnessWorkloadConfig,
 }
 
-// =============================================================================
-// IMPLEMENTATION
-// =============================================================================
-
-impl WorkloadFairnessAssessor {
-    pub fn new(config: WorkloadFairnessConfig) -> Self {
+impl FairnessWorkloadAssessor {
+    pub fn new(config: FairnessWorkloadConfig) -> Self {
         Self { config }
     }
 
-    /// Run a test phase with specified pod counts
     async fn run_phase(
         &self,
         tenant1: Arc<TenantClusterConfig>,
         tenant2: Arc<TenantClusterConfig>,
         duration: Duration,
-        tenant1_pods: u32,
-        tenant2_pods: u32,
-    ) -> Result<PhaseResults> {
-        let detailed = self
-            .run_phase_detailed(tenant1, tenant2, duration, tenant1_pods, tenant2_pods)
-            .await?;
-        Ok(detailed.into())
-    }
-
-    /// Run a test phase and return detailed results with raw data for CSV export
-    async fn run_phase_detailed(
-        &self,
-        tenant1: Arc<TenantClusterConfig>,
-        tenant2: Arc<TenantClusterConfig>,
-        duration: Duration,
-        tenant1_pods: u32,
-        tenant2_pods: u32,
-    ) -> Result<DetailedPhaseResults> {
+        t1_pods: u32,
+        t2_pods: u32,
+        t1_rate: Option<f64>,
+        t2_rate: Option<f64>,
+    ) -> Result<PhaseResult> {
         let duration_secs = duration.as_secs();
 
-        // Create benchmark pods for both tenants
-        create_benchmark_pods(
-            &tenant1,
-            &tenant2,
-            self.config.threads_per_pod,
-            self.config.max_prime,
-            duration_secs,
-            tenant1_pods,
-            tenant2_pods,
-        )
-        .await?;
+        // Create benchmark pods
+        for i in 0..t1_pods {
+            create_sysbench_pod(&tenant1, i, &self.config, duration_secs, t1_rate).await?;
+        }
+        for i in 0..t2_pods {
+            create_sysbench_pod(&tenant2, i, &self.config, duration_secs, t2_rate).await?;
+        }
 
         // Wait for completion
-        wait_for_benchmark_completion(&tenant1, &tenant2, tenant1_pods, tenant2_pods).await?;
+        wait_for_completion(&tenant1, t1_pods).await?;
+        wait_for_completion(&tenant2, t2_pods).await?;
 
-        // Collect latency results with raw data
-        let (tenant1_raw, tenant2_raw) =
-            collect_benchmark_results(&tenant1, &tenant2, tenant1_pods, tenant2_pods).await?;
+        // Collect results
+        let t1_points = collect_results(&tenant1, t1_pods).await?;
+        let t2_points = collect_results(&tenant2, t2_pods).await?;
 
         // Cleanup
-        cleanup_benchmark_pods(&tenant1, tenant1_pods).await?;
-        cleanup_benchmark_pods(&tenant2, tenant2_pods).await?;
+        cleanup_pods(&tenant1, t1_pods).await?;
+        cleanup_pods(&tenant2, t2_pods).await?;
 
-        // Calculate statistics from raw data
-        let (t1_avg, t1_std, t1_count) =
-            calculate_stats(&tenant1_raw.iter().map(|p| p.latency_ms).collect::<Vec<_>>());
-        let (t2_avg, t2_std, t2_count) =
-            calculate_stats(&tenant2_raw.iter().map(|p| p.latency_ms).collect::<Vec<_>>());
-
-        Ok(DetailedPhaseResults {
-            tenant1: TenantMetrics {
-                avg_latency_ms: t1_avg,
-                std_deviation_ms: t1_std,
-                total_operations: t1_count,
-                error_rate: if tenant1_raw.is_empty() { 100.0 } else { 0.0 },
-            },
-            tenant2: TenantMetrics {
-                avg_latency_ms: t2_avg,
-                std_deviation_ms: t2_std,
-                total_operations: t2_count,
-                error_rate: if tenant2_raw.is_empty() { 100.0 } else { 0.0 },
-            },
-            tenant1_raw,
-            tenant2_raw,
+        Ok(PhaseResult {
+            tenant1: TenantMetrics::from_raw(t1_points),
+            tenant2: TenantMetrics::from_raw(t2_points),
         })
     }
 }
 
 #[async_trait]
-impl FairnessAssessor for WorkloadFairnessAssessor {
+impl FairnessAssessor for FairnessWorkloadAssessor {
     fn name(&self) -> &'static str {
         "Workload"
     }
 
-    fn operation_description(&self) -> &'static str {
-        "CPU task completion latency"
+    fn metric(&self) -> &'static str {
+        "CPU task latency"
     }
 
     async fn run_baseline(
         &self,
         tenant1: Arc<TenantClusterConfig>,
         tenant2: Arc<TenantClusterConfig>,
-        config: &FairnessTestConfig,
-    ) -> Result<PhaseResults> {
-        // Both tenants run with the same number of pods
+        config: &FairnessConfig,
+    ) -> Result<PhaseResult> {
+        let rate = if matches!(config.strategy, RateLimitStrategy::Unlimited) {
+            None
+        } else {
+            Some(config.tenant1_rate)
+        };
+
         self.run_phase(
             tenant1,
             tenant2,
             config.baseline_duration,
-            self.config.pods_per_tenant,
-            self.config.pods_per_tenant,
+            self.config.pods,
+            self.config.pods,
+            rate,
+            rate,
         )
         .await
     }
@@ -168,343 +130,207 @@ impl FairnessAssessor for WorkloadFairnessAssessor {
         &self,
         tenant1: Arc<TenantClusterConfig>,
         tenant2: Arc<TenantClusterConfig>,
-        config: &FairnessTestConfig,
-    ) -> Result<PhaseResults> {
-        // Tenant1 stays regular, Tenant2 gets more pods (malicious)
-        let malicious_pods =
-            (self.config.pods_per_tenant as f64 * config.malicious_load_multiplier) as u32;
+        config: &FairnessConfig,
+    ) -> Result<PhaseResult> {
+        let t1_rate = if matches!(config.strategy, RateLimitStrategy::Unlimited) {
+            None
+        } else {
+            Some(config.tenant1_rate)
+        };
+        let t2_rate = if matches!(config.strategy, RateLimitStrategy::Unlimited) {
+            None
+        } else {
+            Some(config.malicious_rate())
+        };
+
+        let malicious_pods = (self.config.pods as f64 * config.malicious_load_multiplier) as u32;
 
         self.run_phase(
             tenant1,
             tenant2,
             config.test_duration,
-            self.config.pods_per_tenant,
+            self.config.pods,
             malicious_pods.max(1),
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl DetailedFairnessAssessor for WorkloadFairnessAssessor {
-    async fn run_baseline_detailed(
-        &self,
-        tenant1: Arc<TenantClusterConfig>,
-        tenant2: Arc<TenantClusterConfig>,
-        config: &FairnessTestConfig,
-    ) -> Result<DetailedPhaseResults> {
-        self.run_phase_detailed(
-            tenant1,
-            tenant2,
-            config.baseline_duration,
-            self.config.pods_per_tenant,
-            self.config.pods_per_tenant,
-        )
-        .await
-    }
-
-    async fn run_unbalanced_detailed(
-        &self,
-        tenant1: Arc<TenantClusterConfig>,
-        tenant2: Arc<TenantClusterConfig>,
-        config: &FairnessTestConfig,
-    ) -> Result<DetailedPhaseResults> {
-        let malicious_pods =
-            (self.config.pods_per_tenant as f64 * config.malicious_load_multiplier) as u32;
-
-        self.run_phase_detailed(
-            tenant1,
-            tenant2,
-            config.test_duration,
-            self.config.pods_per_tenant,
-            malicious_pods.max(1),
+            t1_rate,
+            t2_rate,
         )
         .await
     }
 }
 
 // =============================================================================
-// HELPER FUNCTIONS
+// HELPERS
 // =============================================================================
 
-fn calculate_stats(latencies: &[f64]) -> (f64, f64, u64) {
-    if latencies.is_empty() {
-        return (0.0, 0.0, 0);
-    }
+fn sysbench_pod(
+    index: u32,
+    config: &FairnessWorkloadConfig,
+    duration_secs: u64,
+    rate: Option<f64>,
+) -> Pod {
+    // Rate limiting in shell: track elapsed time and sleep if ahead of schedule
+    // This mimics how RateLimiter works in Rust code
+    let rate_limit_setup = rate
+        .map(|r| {
+            format!(
+                "rate={}; interval=$(awk \"BEGIN {{printf \\\"%.6f\\\", 1.0/{}}}\"); ",
+                r, r
+            )
+        })
+        .unwrap_or_default();
 
-    let count = latencies.len() as u64;
-    let avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
+    let rate_limit_check = if rate.is_some() {
+        // Calculate expected start time for this iteration and sleep if ahead
+        "expected=$(awk \"BEGIN {printf \\\"%.6f\\\", $i * $interval}\"); \
+         elapsed=$(awk \"BEGIN {printf \\\"%.6f\\\", $(date +%s.%N) - $start_time}\"); \
+         ahead=$(awk \"BEGIN {printf \\\"%.6f\\\", $expected - $elapsed}\"); \
+         if [ $(awk \"BEGIN {print ($ahead > 0.001) ? 1 : 0}\") -eq 1 ]; then sleep $ahead; fi; "
+    } else {
+        ""
+    };
 
-    let variance =
-        latencies.iter().map(|x| (x - avg).powi(2)).sum::<f64>() / latencies.len() as f64;
-    let std_dev = variance.sqrt();
-
-    (avg, std_dev, count)
-}
-
-/// Create a sysbench CPU benchmark pod manifest
-///
-/// The pod runs sysbench in a loop for the specified duration, outputting
-/// JSON-formatted results for each run. Each sysbench execution is one
-/// measurement - the total time to complete a fixed CPU task.
-fn benchmark_pod_manifest(threads: u32, max_prime: u32, duration_secs: u64, pod_index: u32) -> Pod {
-    let pod_name = format!("workload-fairness-{}", pod_index);
-
-    // Script that runs sysbench repeatedly and outputs the total time for each task
-    // Each sysbench run = one data point = time to complete calculating primes up to max_prime
+    // Run sysbench in a loop with proper rate limiting
     let command = format!(
-        r#"
-apk add --no-cache sysbench > /dev/null 2>&1
-
-END_TIME=$(($(date +%s) + {duration}))
-ITERATION=0
-
-echo "["
-
-while [ $(date +%s) -lt $END_TIME ]; do
-    # Run sysbench CPU test - calculate primes up to max_prime once
-    OUTPUT=$(sysbench cpu \
-        --cpu-max-prime={max_prime} \
-        --threads={threads} \
-        --time=0 \
-        --events=1 \
-        run 2>/dev/null)
-    
-    # Extract total time from output (in seconds)
-    # sysbench outputs: "total time: X.XXXXs"
-    TOTAL_TIME=$(echo "$OUTPUT" | grep "total time:" | awk '{{print $3}}' | tr -d 's')
-    
-    # Convert to milliseconds and output
-    if [ -n "$TOTAL_TIME" ]; then
-        LATENCY_MS=$(echo "scale=6; $TOTAL_TIME * 1000" | bc)
-        
-        if [ $ITERATION -gt 0 ]; then
-            echo ","
-        fi
-        
-        echo "{{\"iteration\": $ITERATION, \"latency_ms\": $LATENCY_MS}}"
-        ITERATION=$((ITERATION + 1))
-    fi
-done
-
-echo "]"
-"#,
+        "apk add --no-cache sysbench >/dev/null 2>&1 && \
+         start_time=$(date +%s.%N); \
+         end_time=$(($(date +%s) + {duration})); \
+         {rate_setup}\
+         results=''; \
+         i=0; \
+         while [ $(date +%s) -lt $end_time ]; do \
+           {rate_check}\
+           result=$(sysbench cpu --threads={threads} --cpu-max-prime={max_prime} --time=0 --events=1 run 2>&1 | grep 'total time:' | awk '{{print $3}}' | tr -d 's'); \
+           ts=$(awk \"BEGIN {{printf \\\"%.3f\\\", $(date +%s.%N) - $start_time}}\"); \
+           results=\"$results$ts:$result,\"; \
+           i=$((i + 1)); \
+         done; \
+         echo \"RESULTS:$results\"",
         duration = duration_secs,
-        max_prime = max_prime,
-        threads = threads
+        rate_setup = rate_limit_setup,
+        rate_check = rate_limit_check,
+        threads = config.threads,
+        max_prime = config.max_prime
     );
 
     serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {
-            "name": pod_name
-        },
+        "metadata": { "name": format!("workload-fairness-{}", index) },
         "spec": {
             "restartPolicy": "Never",
-            "containers": [
-                {
-                    "name": "benchmark",
-                    "image": "alpine:latest",
-                    "command": ["sh", "-c", command],
-                    "resources": {
-                        "requests": {
-                            "memory": "64Mi",
-                            "cpu": "100m"
-                        },
-                        "limits": {
-                            "memory": "128Mi",
-                            "cpu": "1000m"  // Allow up to 1 CPU core
-                        }
-                    }
+            "containers": [{
+                "name": "sysbench",
+                "image": "alpine:latest",
+                "command": ["sh", "-c", command],
+                "resources": {
+                    "requests": { "memory": "64Mi", "cpu": "100m" },
+                    "limits": { "memory": "256Mi", "cpu": "1000m" }
                 }
-            ]
+            }]
         }
     }))
     .unwrap()
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn create_benchmark_pods(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-    threads: u32,
-    max_prime: u32,
+async fn create_sysbench_pod(
+    tenant: &TenantClusterConfig,
+    index: u32,
+    config: &FairnessWorkloadConfig,
     duration_secs: u64,
-    tenant1_pods: u32,
-    tenant2_pods: u32,
+    rate: Option<f64>,
 ) -> Result<()> {
-    // Create pods for tenant1
-    for i in 0..tenant1_pods {
-        let pod = benchmark_pod_manifest(threads, max_prime, duration_secs, i);
-        tenant1
-            .cluster
-            .create_pod_in_namespace(&pod, &tenant1.namespace)
-            .await?;
-    }
+    let pod = sysbench_pod(index, config, duration_secs, rate);
+    let name = pod.metadata.name.clone().unwrap();
 
-    // Create pods for tenant2
-    for i in 0..tenant2_pods {
-        let pod = benchmark_pod_manifest(threads, max_prime, duration_secs, i);
-        tenant2
-            .cluster
-            .create_pod_in_namespace(&pod, &tenant2.namespace)
-            .await?;
-    }
-
-    // Wait for pods to be ready
-    for i in 0..tenant1_pods {
-        let pod_name = format!("workload-fairness-{}", i);
-        tenant1
-            .cluster
-            .wait_for_pod_to_be_ready(&pod_name, &tenant1.namespace)
-            .await?;
-    }
-
-    for i in 0..tenant2_pods {
-        let pod_name = format!("workload-fairness-{}", i);
-        tenant2
-            .cluster
-            .wait_for_pod_to_be_ready(&pod_name, &tenant2.namespace)
-            .await?;
-    }
+    tenant
+        .cluster
+        .create_pod_in_namespace(&pod, &tenant.namespace)
+        .await?;
+    tenant
+        .cluster
+        .wait_for_pod_to_be_ready(&name, &tenant.namespace)
+        .await?;
 
     Ok(())
 }
 
-async fn wait_for_benchmark_completion(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-    tenant1_pods: u32,
-    tenant2_pods: u32,
-) -> Result<()> {
-    // Wait for tenant1 pods
-    for i in 0..tenant1_pods {
-        wait_for_pod_completion(tenant1, i).await?;
-    }
+async fn wait_for_completion(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::Api;
 
-    // Wait for tenant2 pods
-    for i in 0..tenant2_pods {
-        wait_for_pod_completion(tenant2, i).await?;
-    }
+    let api: Api<Pod> = Api::namespaced(tenant.cluster.client().clone(), &tenant.namespace);
 
-    Ok(())
-}
+    for i in 0..pods {
+        let name = format!("workload-fairness-{}", i);
 
-async fn wait_for_pod_completion(tenant: &TenantClusterConfig, pod_index: u32) -> Result<()> {
-    let pod_name = format!("workload-fairness-{}", pod_index);
-
-    // Poll until pod completes (Succeeded or Failed)
-    loop {
-        if let Ok(pod) = tenant
-            .cluster
-            .get_pod_in_namespace(&pod_name, &tenant.namespace)
-            .await
-        {
+        // First check if pod is already completed
+        if let Ok(pod) = api.get(&name).await {
             if let Some(status) = &pod.status {
                 if let Some(phase) = &status.phase {
-                    match phase.as_str() {
-                        "Succeeded" | "Failed" => return Ok(()),
-                        _ => {}
+                    if phase == "Succeeded" || phase == "Failed" {
+                        continue; // Already done, skip watching
                     }
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
 
-async fn collect_benchmark_results(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-    tenant1_pods: u32,
-    tenant2_pods: u32,
-) -> Result<(Vec<MetricDataPoint>, Vec<MetricDataPoint>)> {
-    let mut tenant1_data = Vec::new();
-    let mut tenant2_data = Vec::new();
-
-    // Collect from tenant1 pods
-    for i in 0..tenant1_pods {
-        let pod_name = format!("workload-fairness-{}", i);
-        let logs = tenant1
+        // Pod not done yet, watch for completion
+        tenant
             .cluster
-            .get_pod_logs(&pod_name, &tenant1.namespace)
-            .await?;
-
-        if let Some(data_points) = parse_benchmark_results(&logs, i) {
-            tenant1_data.extend(data_points);
-        }
-    }
-
-    // Collect from tenant2 pods
-    for i in 0..tenant2_pods {
-        let pod_name = format!("workload-fairness-{}", i);
-        let logs = tenant2
-            .cluster
-            .get_pod_logs(&pod_name, &tenant2.namespace)
-            .await?;
-
-        if let Some(data_points) = parse_benchmark_results(&logs, i) {
-            tenant2_data.extend(data_points);
-        }
-    }
-
-    Ok((tenant1_data, tenant2_data))
-}
-
-fn parse_benchmark_results(logs: &str, pod_index: u32) -> Option<Vec<MetricDataPoint>> {
-    // Find JSON array in logs
-    let json_start = logs.find('[')?;
-    let json_end = logs.rfind(']')?;
-
-    if json_start >= json_end {
-        return None;
-    }
-
-    let json_str = &logs[json_start..=json_end];
-
-    // Parse JSON array
-    let results: Vec<serde_json::Value> = serde_json::from_str(json_str).ok()?;
-
-    let data_points: Vec<MetricDataPoint> = results
-        .iter()
-        .filter_map(|entry| {
-            let iteration = entry["iteration"].as_u64()?;
-            let latency_ms = entry["latency_ms"].as_f64()?;
-
-            Some(MetricDataPoint {
-                timestamp_secs: iteration as f64,
-                latency_ms,
-                is_error: false,
-                operation: Some(format!("sysbench-cpu-pod-{}", pod_index)),
+            .watch_pod_until_condition(&name, &tenant.namespace, |event| async move {
+                if let kube::api::WatchEvent::Modified(pod) = event {
+                    if let Some(status) = pod.status {
+                        if let Some(phase) = status.phase {
+                            return phase == "Succeeded" || phase == "Failed";
+                        }
+                    }
+                }
+                false
             })
-        })
-        .collect();
-
-    if data_points.is_empty() {
-        None
-    } else {
-        Some(data_points)
+            .await?;
     }
+    Ok(())
 }
 
-async fn cleanup_benchmark_pods(tenant: &TenantClusterConfig, pod_count: u32) -> Result<()> {
-    for i in 0..pod_count {
-        let pod_name = format!("workload-fairness-{}", i);
-        let _ = tenant
+async fn collect_results(tenant: &TenantClusterConfig, pods: u32) -> Result<Vec<MetricPoint>> {
+    let mut points = Vec::new();
+
+    for i in 0..pods {
+        let name = format!("workload-fairness-{}", i);
+        let logs = tenant
             .cluster
-            .delete_pod_in_namespace(&pod_name, &tenant.namespace)
-            .await;
+            .get_pod_logs(&name, &tenant.namespace)
+            .await?;
+
+        // Parse "RESULTS:ts1:time1,ts2:time2," format
+        if let Some(results_start) = logs.find("RESULTS:") {
+            let results_str = &logs[results_start + 8..];
+            for (idx, entry) in results_str.split(',').enumerate() {
+                let parts: Vec<&str> = entry.trim().split(':').collect();
+                if parts.len() == 2 {
+                    if let (Ok(ts), Ok(secs)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                        points.push(MetricPoint {
+                            timestamp_secs: ts,
+                            latency_ms: secs * 1000.0, // seconds to ms
+                            is_error: false,
+                            label: Some(format!("sysbench-{}-{}", i, idx)),
+                        });
+                    }
+                }
+            }
+        }
     }
 
-    // Wait for deletions
-    for i in 0..pod_count {
-        let pod_name = format!("workload-fairness-{}", i);
+    Ok(points)
+}
+
+async fn cleanup_pods(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
+    for i in 0..pods {
+        let name = format!("workload-fairness-{}", i);
         let _ = tenant
             .cluster
-            .wait_for_pod_deletion(&pod_name, &tenant.namespace)
+            .delete_pod_in_namespace(&name, &tenant.namespace)
             .await;
     }
-
     Ok(())
 }

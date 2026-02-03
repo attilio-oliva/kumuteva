@@ -9,22 +9,24 @@ use anyhow::{anyhow, Context};
 use assessment::TenantClusterConfig;
 use clap::{Parser, Subcommand, ValueEnum};
 use cluster::TenantsPortMapping;
-use cluster::{
-    ControlPlaneIsolation, KindCluster, KubernetesClient, KubernetesClusterBuilder,
-    NetworkIsolationStrategy,
-};
+use cluster::{ControlPlaneIsolation, KindCluster, KubernetesClient, KubernetesClusterBuilder};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
 use tracing::Level;
 
 use crate::assessment::{
-    manual_test_cross_tenant_operation, run_detailed_fairness_assessment, run_fairness_assessment,
-    AssessmentConfig, ControlPlaneFairnessAssessor, ControlPlaneFairnessConfig,
-    ControlPlaneOperation, ControlPlaneResource, FairnessTestConfig, NetworkFairnessAssessor,
-    NetworkFairnessConfig, StorageFairnessAssessor, StorageFairnessConfig,
+    // New clean assessors
+    fairness_assessor::{FairnessRunnerBuilder, RateLimitStrategy as FairnessRateLimitStrategy},
+    // Legacy types for isolation assessment
+    AssessmentConfig,
+};
+use crate::assessment::{
+    FairnessControlPlaneAssessor, FairnessControlPlaneConfig, FairnessNetworkAssessor,
+    FairnessNetworkConfig, FairnessStorageAssessor, FairnessStorageConfig, FairnessStorageScenario,
+    FairnessWorkloadAssessor, FairnessWorkloadConfig,
 };
 
-use crate::cluster::{HostCluster, HostClusterType, K3sCluster, K3sProvider, PreExistingCluster};
+use crate::cluster::{HostClusterType, K3sCluster, PreExistingCluster};
 
 #[derive(Debug, Parser)]
 #[clap(name = "multi-tenancy-verifier")]
@@ -150,6 +152,143 @@ enum Commands {
         #[clap(long, default_value = "false")]
         verbose: bool,
     },
+    /// Run fairness assessment tests between two tenants
+    Fairness {
+        /// Path to tenant1 kubeconfig file (regular tenant) [required]
+        #[clap(value_name = "tenant1-kubeconfig")]
+        tenant1_kubeconfig_path: PathBuf,
+        /// Path to tenant2 kubeconfig file (malicious tenant) [required]
+        #[clap(value_name = "tenant2-kubeconfig")]
+        tenant2_kubeconfig_path: PathBuf,
+
+        /// Namespace for tenant1
+        #[clap(long = "tenant1-ns", default_value = "tenant1")]
+        tenant1_namespace: String,
+        /// Namespace for tenant2
+        #[clap(long = "tenant2-ns", default_value = "tenant2")]
+        tenant2_namespace: String,
+
+        /// Assess control plane fairness
+        #[clap(long = "control-plane", alias = "cp")]
+        control_plane: bool,
+        /// Assess storage fairness
+        #[clap(long = "storage", alias = "st")]
+        storage: bool,
+        /// Assess network fairness
+        #[clap(long = "network", alias = "net")]
+        network: bool,
+        /// Assess workload (CPU) fairness
+        #[clap(long = "workload", alias = "wl")]
+        workload: bool,
+
+        /// Duration for baseline measurement in seconds
+        #[clap(long, default_value = "30")]
+        baseline_duration: u64,
+        /// Duration for unbalanced test phase in seconds
+        #[clap(long, default_value = "60")]
+        test_duration: u64,
+
+        /// Rate limiting strategy for the runner
+        #[clap(long, default_value = "unlimited", value_enum)]
+        rate_strategy: RateLimitStrategy,
+        /// Request rate limit (requests/sec) - only used with non-unlimited strategies
+        #[clap(long, default_value = "10.0")]
+        rate_limit: f64,
+        /// Load multiplier for malicious tenant (e.g., 10.0 = 10x normal load)
+        #[clap(long, default_value = "10.0")]
+        load_multiplier: f64,
+
+        /// Number of concurrent requesters for control plane tests
+        #[clap(long, default_value = "1")]
+        cp_requesters: usize,
+        /// Request rate per requester for control plane tests (requests/sec)
+        #[clap(long, default_value = "50.0")]
+        cp_request_rate: f64,
+
+        /// Number of benchmark pods per tenant for workload tests
+        #[clap(long, default_value = "1")]
+        wl_pods: u32,
+        /// Number of CPU threads per workload benchmark pod
+        #[clap(long, default_value = "1")]
+        wl_threads: u32,
+        /// Max prime number for workload benchmark (higher = longer task)
+        #[clap(long, default_value = "500000")]
+        wl_max_prime: u32,
+
+        /// Number of iperf3 client-server pod pairs for network tests
+        #[clap(long, default_value = "1")]
+        net_pod_pairs: u32,
+
+        /// Number of I/O benchmark pods per tenant for storage tests
+        #[clap(long, default_value = "1")]
+        st_pods: u32,
+        /// I/O block size in KB for storage tests
+        #[clap(long, default_value = "4")]
+        st_block_size: u32,
+        /// File size in MB for storage tests
+        #[clap(long, default_value = "100")]
+        st_file_size: u32,
+        /// Storage test scenario: random or sequential
+        #[clap(long, default_value = "random", value_parser = parse_storage_scenario)]
+        st_scenario: StorageScenario,
+
+        /// Export results to CSV files
+        #[clap(long)]
+        export_csv: bool,
+        /// Output directory for CSV export (default: fairness_results)
+        #[clap(long, default_value = "fairness_results")]
+        output_dir: String,
+
+        /// Enable verbose output
+        #[clap(long, default_value = "false")]
+        verbose: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum StorageScenario {
+    Random,
+    Sequential,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RateLimitStrategy {
+    /// No rate limiting - run as fast as possible
+    Unlimited,
+    /// Fixed delay between requests
+    FixedDelay,
+    /// Adaptive rate adjustment based on feedback
+    Adaptive,
+}
+
+impl From<RateLimitStrategy> for FairnessRateLimitStrategy {
+    fn from(strategy: RateLimitStrategy) -> Self {
+        match strategy {
+            RateLimitStrategy::Unlimited => FairnessRateLimitStrategy::Unlimited,
+            RateLimitStrategy::FixedDelay => FairnessRateLimitStrategy::FixedDelay,
+            RateLimitStrategy::Adaptive => FairnessRateLimitStrategy::Adaptive,
+        }
+    }
+}
+
+fn parse_storage_scenario(s: &str) -> Result<StorageScenario, String> {
+    match s.to_lowercase().as_str() {
+        "random" => Ok(StorageScenario::Random),
+        "sequential" | "seq" => Ok(StorageScenario::Sequential),
+        _ => Err(format!(
+            "Invalid storage scenario: {}. Use 'random' or 'sequential'",
+            s
+        )),
+    }
+}
+
+impl From<StorageScenario> for FairnessStorageScenario {
+    fn from(scenario: StorageScenario) -> Self {
+        match scenario {
+            StorageScenario::Random => FairnessStorageScenario::RandomIO,
+            StorageScenario::Sequential => FairnessStorageScenario::SequentialIO,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -398,6 +537,212 @@ async fn main() -> anyhow::Result<()> {
             //     false, // Don't cleanup - leave objects for inspection
             // )
             // .await?;
+        }
+        Commands::Fairness {
+            tenant1_kubeconfig_path,
+            tenant2_kubeconfig_path,
+            tenant1_namespace,
+            tenant2_namespace,
+            control_plane,
+            storage,
+            network,
+            workload,
+            baseline_duration,
+            test_duration,
+            rate_strategy,
+            rate_limit,
+            load_multiplier,
+            cp_requesters,
+            cp_request_rate,
+            wl_pods,
+            wl_threads,
+            wl_max_prime,
+            net_pod_pairs,
+            st_pods,
+            st_block_size,
+            st_file_size,
+            st_scenario,
+            export_csv,
+            output_dir,
+            verbose,
+        } => {
+            setup_logging(verbose)?;
+            println!("Running fairness assessment...\n");
+
+            // Determine which subsystems to test
+            let run_all = !control_plane && !storage && !network && !workload;
+            let run_cp = control_plane || run_all;
+            let run_storage = storage || run_all;
+            let run_network = network || run_all;
+            let run_workload = workload || run_all;
+
+            // Load tenant configurations
+            let tenant1_config = Arc::new(TenantClusterConfig {
+                cluster: KubernetesClient::load_with_retry(&tenant1_kubeconfig_path, 5).await?,
+                namespace: tenant1_namespace,
+            });
+            let tenant2_config = Arc::new(TenantClusterConfig {
+                cluster: KubernetesClient::load_with_retry(&tenant2_kubeconfig_path, 5).await?,
+                namespace: tenant2_namespace,
+            });
+
+            // Build the fairness runner with the specified configuration
+            let mut runner_builder = FairnessRunnerBuilder::new()
+                .baseline_duration(std::time::Duration::from_secs(baseline_duration))
+                .test_duration(std::time::Duration::from_secs(test_duration))
+                .rate(rate_limit)
+                .strategy(rate_strategy.into())
+                .malicious_multiplier(load_multiplier);
+
+            if export_csv {
+                runner_builder = runner_builder.export_csv(&output_dir);
+            }
+
+            let runner = runner_builder.build();
+
+            println!("Fairness Test Configuration:");
+            println!("  Baseline duration: {} seconds", baseline_duration);
+            println!("  Test duration: {} seconds", test_duration);
+            println!("  Rate strategy: {:?}", rate_strategy);
+            if !matches!(rate_strategy, RateLimitStrategy::Unlimited) {
+                println!("  Rate limit: {} req/sec", rate_limit);
+            }
+            println!("  Load multiplier: {}x", load_multiplier);
+            println!();
+
+            let mut results = Vec::new();
+
+            // Control Plane fairness
+            if run_cp {
+                println!("═══════════════════════════════════════════════════════════");
+                println!("Control Plane Fairness Assessment");
+                println!("  Workers: {}", cp_requesters);
+                println!("═══════════════════════════════════════════════════════════");
+
+                let cp_config = FairnessControlPlaneConfig {
+                    workers: cp_requesters,
+                };
+                let cp_assessor = FairnessControlPlaneAssessor::new(cp_config);
+
+                let result = runner
+                    .run(&cp_assessor, tenant1_config.clone(), tenant2_config.clone())
+                    .await?;
+                results.push(("Control Plane", result));
+            }
+
+            // Network fairness
+            if run_network {
+                println!("\n═══════════════════════════════════════════════════════════");
+                println!("Network Fairness Assessment");
+                println!("  Pod pairs per tenant: {}", net_pod_pairs);
+                println!("═══════════════════════════════════════════════════════════");
+
+                let net_config = FairnessNetworkConfig {
+                    pod_pairs: net_pod_pairs,
+                };
+                let net_assessor = FairnessNetworkAssessor::new(net_config);
+
+                let result = runner
+                    .run(
+                        &net_assessor,
+                        tenant1_config.clone(),
+                        tenant2_config.clone(),
+                    )
+                    .await?;
+                results.push(("Network", result));
+            }
+
+            // Storage fairness
+            if run_storage {
+                println!("\n═══════════════════════════════════════════════════════════");
+                println!("Storage Fairness Assessment");
+                println!(
+                    "  Pods: {}, Block size: {}KB, File size: {}MB, Scenario: {:?}",
+                    st_pods, st_block_size, st_file_size, st_scenario
+                );
+                println!("═══════════════════════════════════════════════════════════");
+
+                let storage_config = FairnessStorageConfig {
+                    pods: st_pods,
+                    block_size_kb: st_block_size,
+                    file_size_mb: st_file_size,
+                    scenario: st_scenario.into(),
+                };
+                let storage_assessor = FairnessStorageAssessor::new(storage_config);
+
+                let result = runner
+                    .run(
+                        &storage_assessor,
+                        tenant1_config.clone(),
+                        tenant2_config.clone(),
+                    )
+                    .await?;
+                results.push(("Storage", result));
+            }
+
+            // Workload fairness
+            if run_workload {
+                println!("\n═══════════════════════════════════════════════════════════");
+                println!("Workload (CPU) Fairness Assessment");
+                println!(
+                    "  Pods: {}, Threads: {}, Max prime: {}",
+                    wl_pods, wl_threads, wl_max_prime
+                );
+                println!("═══════════════════════════════════════════════════════════");
+
+                let wl_config = FairnessWorkloadConfig {
+                    pods: wl_pods,
+                    threads: wl_threads,
+                    max_prime: wl_max_prime,
+                };
+                let wl_assessor = FairnessWorkloadAssessor::new(wl_config);
+
+                let result = runner
+                    .run(&wl_assessor, tenant1_config.clone(), tenant2_config.clone())
+                    .await?;
+                results.push(("Workload", result));
+            }
+
+            // Print summary
+            println!("\n═══════════════════════════════════════════════════════════");
+            println!("FAIRNESS ASSESSMENT SUMMARY");
+            println!("═══════════════════════════════════════════════════════════\n");
+
+            for (_, result) in &results {
+                println!("{}", result);
+            }
+
+            // Calculate overall degradation
+            if !results.is_empty() {
+                let avg_degradation: f64 = results
+                    .iter()
+                    .map(|(_, r)| r.latency_degradation)
+                    .sum::<f64>()
+                    / results.len() as f64;
+
+                println!("\n───────────────────────────────────────────────────────────");
+                println!(
+                    "Overall Average Latency Degradation: {:.2}x",
+                    avg_degradation
+                );
+
+                if let Some((worst_name, worst_result)) = results.iter().max_by(|(_, a), (_, b)| {
+                    a.latency_degradation
+                        .partial_cmp(&b.latency_degradation)
+                        .unwrap()
+                }) {
+                    println!(
+                        "Worst Subsystem: {} ({:.2}x degradation, {})",
+                        worst_name,
+                        worst_result.latency_degradation,
+                        worst_result.fairness_level()
+                    );
+                }
+            }
+
+            if export_csv {
+                println!("\n📁 Results exported to: {}/", output_dir);
+            }
         }
     }
 
