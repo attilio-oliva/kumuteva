@@ -192,6 +192,7 @@ fn iperf3_client_pod(index: u32, server_ip: &str, duration: u64, bandwidth: Opti
         server_ip.to_string(),
         "-t".to_string(),
         duration.to_string(),
+        "-P 4".to_string(),
         "--json".to_string(),
     ];
 
