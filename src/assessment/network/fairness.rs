@@ -251,7 +251,7 @@ asyncio.run(main())
     .unwrap()
 }
 
-/// Create a high-performance TCP ping client pod using Python asyncio
+/// Create a high-performance TCP ping client pod using Python asyncio with pipelining
 fn tcp_ping_client_pod(
     index: u32,
     server_ip: &str,
@@ -269,12 +269,14 @@ fn tcp_ping_client_pod(
         .map(|r| format!("{} pkt/s total", r))
         .unwrap_or_else(|| "unlimited".to_string());
 
-    // Python asyncio TCP ping client - can achieve very high packet rates
+    // Python asyncio TCP ping client with pipelining - sends and receives in parallel
+    // This allows achieving high packet rates regardless of RTT
     let python_script = format!(
         r#"
 import asyncio
 import time
 import sys
+from collections import deque
 
 SERVER = "{server_ip}"
 PORT = {port}
@@ -282,15 +284,28 @@ DURATION = {duration}
 STREAMS = {streams}
 RATE_PER_STREAM = {rate_str}  # packets per second per stream, None = unlimited
 PACKET_SIZE = {packet_size}  # payload size in bytes
+MAX_IN_FLIGHT = 1000  # Maximum packets waiting for response per stream
 
-# Pre-generate padding for packet payload (message format: "P<seq><padding>\n")
-# We need room for: "P" (1) + seq number (~10 max) + "\n" (1) = ~12 bytes overhead
-# The rest is padding. Final message is exactly PACKET_SIZE bytes.
-def make_packet(seq):
-    prefix = f"P{{seq}}".encode()
+# Pre-generate padding for packet payload (message format: "S<stream>P<seq><padding>\n")
+def make_packet(stream_id, seq):
+    prefix = f"S{{stream_id}}P{{seq}}".encode()
     # Total size = PACKET_SIZE, last byte is newline
     padding_len = max(0, PACKET_SIZE - len(prefix) - 1)
     return prefix + (b'X' * padding_len) + b'\n'
+
+def parse_seq(data):
+    # Parse "S<stream>P<seq>..." format
+    try:
+        s = data.decode('utf-8', errors='ignore')
+        if s.startswith('S') and 'P' in s:
+            p_idx = s.index('P')
+            seq_end = p_idx + 1
+            while seq_end < len(s) and s[seq_end].isdigit():
+                seq_end += 1
+            return int(s[p_idx+1:seq_end])
+    except:
+        pass
+    return None
 
 print("=== TCP Ping Client Configuration ===", flush=True)
 print(f"Server: {{SERVER}}:{{PORT}}", flush=True)
@@ -299,11 +314,116 @@ print(f"Streams: {{STREAMS}} (async connections)", flush=True)
 print(f"Rate per stream: {{RATE_PER_STREAM}} pkt/s", flush=True)
 print(f"Packet size: {{PACKET_SIZE}} bytes", flush=True)
 print(f"Rate limit: {total_rate}", flush=True)
+print(f"Pipelining: enabled (max {{MAX_IN_FLIGHT}} in-flight)", flush=True)
 print("======================================", flush=True)
 
-async def run_stream(stream_id: int, results: list):
-    interval = 1.0 / RATE_PER_STREAM if RATE_PER_STREAM else 0
+async def sender(stream_id, writer, send_times, stop_event, start_time, end_time):
+    """Send packets at the target rate using token bucket for accurate rate control"""
+    seq = 0
     
+    try:
+        while time.perf_counter() < end_time and not stop_event.is_set():
+            now = time.perf_counter()
+            
+            # Calculate how many packets should have been sent by now (token bucket)
+            if RATE_PER_STREAM:
+                elapsed = now - start_time
+                target_packets = int(elapsed * RATE_PER_STREAM)
+            else:
+                target_packets = seq + 100  # Unlimited: always send more
+            
+            # Send packets to catch up to target
+            packets_to_send = target_packets - seq
+            
+            if packets_to_send > 0:
+                for _ in range(packets_to_send):
+                    # Check if too many in flight
+                    if len(send_times) >= MAX_IN_FLIGHT:
+                        break
+                    if time.perf_counter() >= end_time:
+                        break
+                    
+                    # Send packet
+                    msg = make_packet(stream_id, seq)
+                    send_time = time.perf_counter()
+                    send_times[seq] = send_time
+                    writer.write(msg)
+                    seq += 1
+                
+                # Flush all writes at once (more efficient)
+                await writer.drain()
+            else:
+                # We're ahead of schedule, wait a bit
+                if RATE_PER_STREAM:
+                    next_packet_time = start_time + (seq + 1) / RATE_PER_STREAM
+                    sleep_time = next_packet_time - now
+                    if sleep_time > 0:
+                        await asyncio.sleep(min(sleep_time, 0.01))  # Cap at 10ms
+                    else:
+                        await asyncio.sleep(0.0001)  # Minimal yield
+                else:
+                    await asyncio.sleep(0.0001)  # Minimal yield for unlimited
+                    
+    except Exception as e:
+        print(f"[Stream {{stream_id}}] Sender error: {{e}}", file=sys.stderr, flush=True)
+    
+    return seq
+
+async def receiver(stream_id, reader, send_times, results, stop_event, start_time, end_time):
+    """Receive responses and match them to sent packets for RTT calculation"""
+    received = 0
+    errors = 0
+    
+    try:
+        # Keep receiving until stopped and all in-flight packets are accounted for
+        while not stop_event.is_set() or len(send_times) > 0:
+            try:
+                response = await asyncio.wait_for(reader.readline(), timeout=0.5)
+                recv_time = time.perf_counter()
+                
+                if not response:
+                    break
+                
+                seq = parse_seq(response)
+                if seq is not None and seq in send_times:
+                    send_time = send_times.pop(seq)
+                    rtt_ms = (recv_time - send_time) * 1000
+                    rel_ts = send_time - start_time
+                    results.append(f"{{rel_ts:.3f}}:{{rtt_ms:.3f}}:0")
+                    received += 1
+                else:
+                    # Couldn't match response to a send time
+                    rel_ts = recv_time - start_time
+                    results.append(f"{{rel_ts:.3f}}:0.0:1")
+                    errors += 1
+                    
+            except asyncio.TimeoutError:
+                # Check if we should stop
+                if stop_event.is_set() and len(send_times) == 0:
+                    break
+                # Mark oldest in-flight packet as lost if we've been waiting too long
+                if send_times:
+                    oldest_seq = min(send_times.keys())
+                    oldest_time = send_times[oldest_seq]
+                    if time.perf_counter() - oldest_time > 2.0:  # 2 second timeout
+                        send_times.pop(oldest_seq)
+                        rel_ts = oldest_time - start_time
+                        results.append(f"{{rel_ts:.3f}}:2000.0:1")  # Mark as timeout
+                        errors += 1
+                continue
+    except Exception as e:
+        print(f"[Stream {{stream_id}}] Receiver error: {{e}}", file=sys.stderr, flush=True)
+    
+    # Mark remaining in-flight packets as lost
+    for seq, send_time in send_times.items():
+        rel_ts = send_time - start_time
+        results.append(f"{{rel_ts:.3f}}:2000.0:1")
+        errors += 1
+    send_times.clear()
+    
+    return received, errors
+
+async def run_stream(stream_id: int, all_results: list):
     try:
         reader, writer = await asyncio.open_connection(SERVER, PORT)
         print(f"[Stream {{stream_id}}] Connected", file=sys.stderr, flush=True)
@@ -313,42 +433,35 @@ async def run_stream(stream_id: int, results: list):
     
     start_time = time.perf_counter()
     end_time = start_time + DURATION
-    packet_count = 0
-    error_count = 0
-    stream_results = []
+    send_times = {{}}  # seq -> send_time
+    results = []
+    stop_event = asyncio.Event()
     
     try:
-        while time.perf_counter() < end_time:
-            loop_start = time.perf_counter()
-            
-            # Send packet with configured size (ends with \n for readline)
-            msg = make_packet(packet_count)
-            before = time.perf_counter()
-            writer.write(msg)
-            await writer.drain()
-            
-            # Receive response (server echoes back, ends with \n)
-            try:
-                response = await asyncio.wait_for(reader.readline(), timeout=1.0)
-                after = time.perf_counter()
-                rtt_ms = (after - before) * 1000
-                rel_ts = before - start_time
-                stream_results.append(f"{{rel_ts:.3f}}:{{rtt_ms:.3f}}:0")
-            except asyncio.TimeoutError:
-                after = time.perf_counter()
-                rtt_ms = (after - before) * 1000
-                rel_ts = before - start_time
-                stream_results.append(f"{{rel_ts:.3f}}:{{rtt_ms:.3f}}:1")
-                error_count += 1
-            
-            packet_count += 1
-            
-            # Rate limiting
-            if interval > 0:
-                elapsed = time.perf_counter() - loop_start
-                sleep_time = interval - elapsed
-                if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
+        # Run sender and receiver concurrently
+        sender_task = asyncio.create_task(
+            sender(stream_id, writer, send_times, stop_event, start_time, end_time)
+        )
+        receiver_task = asyncio.create_task(
+            receiver(stream_id, reader, send_times, results, stop_event, start_time, end_time)
+        )
+        
+        # Wait for sender to finish (duration elapsed)
+        sent = await sender_task
+        
+        # Signal receiver to stop after draining
+        stop_event.set()
+        
+        # Wait for receiver to finish (with timeout)
+        try:
+            received, errors = await asyncio.wait_for(receiver_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            print(f"[Stream {{stream_id}}] Receiver timeout, stopping", file=sys.stderr, flush=True)
+            receiver_task.cancel()
+            received, errors = 0, 0
+        
+        print(f"[Stream {{stream_id}}] Sent {{sent}}, received {{received}}, errors {{errors}}", file=sys.stderr, flush=True)
+        
     except Exception as e:
         print(f"[Stream {{stream_id}}] Error: {{e}}", file=sys.stderr, flush=True)
     finally:
@@ -358,11 +471,10 @@ async def run_stream(stream_id: int, results: list):
         except:
             pass
     
-    results.extend(stream_results)
-    print(f"[Stream {{stream_id}}] Completed {{packet_count}} packets ({{error_count}} errors)", file=sys.stderr, flush=True)
+    all_results.extend(results)
 
 async def main():
-    print(f"Launching {{STREAMS}} async streams...", flush=True)
+    print(f"Launching {{STREAMS}} pipelined streams...", flush=True)
     
     all_results = []
     tasks = [run_stream(i, all_results) for i in range(STREAMS)]
@@ -406,8 +518,8 @@ asyncio.run(main())
                 "image": "python:3.11-alpine",
                 "command": ["python3", "-c", python_script],
                 "resources": {
-                    "requests": { "memory": "128Mi", "cpu": "200m" },
-                    "limits": { "memory": "256Mi", "cpu": "1000m" }
+                    "requests": { "memory": "256Mi", "cpu": "500m" },
+                    "limits": { "memory": "512Mi", "cpu": "2000m" }
                 }
             }]
         }
