@@ -22,9 +22,9 @@ use crate::assessment::{
     AssessmentConfig,
 };
 use crate::assessment::{
-    rate_to_bandwidth, FairnessControlPlaneAssessor, FairnessControlPlaneConfig,
-    FairnessNetworkAssessor, FairnessNetworkConfig, FairnessStorageAssessor, FairnessStorageConfig,
-    FairnessStorageScenario, FairnessWorkloadAssessor, FairnessWorkloadConfig,
+    FairnessControlPlaneAssessor, FairnessControlPlaneConfig, FairnessNetworkAssessor,
+    FairnessNetworkConfig, FairnessStorageAssessor, FairnessStorageConfig, FairnessStorageScenario,
+    FairnessWorkloadAssessor, FairnessWorkloadConfig,
 };
 
 use crate::cluster::{HostClusterType, K3sCluster, PreExistingCluster};
@@ -230,9 +230,15 @@ enum Commands {
         #[clap(long, default_value = "500000")]
         wl_max_prime: u32,
 
-        /// Number of iperf3 client-server pod pairs for network tests
+        /// Number of TCP ping client-server pod pairs for network tests
         #[clap(long, default_value = "1")]
         net_pod_pairs: u32,
+        /// Number of parallel streams per network client (like iperf3 -P)
+        #[clap(long, default_value = "4")]
+        net_streams: u32,
+        /// Packet payload size in bytes for network tests
+        #[clap(long, default_value = "64")]
+        net_packet_size: u32,
 
         /// Number of I/O benchmark pods per tenant for storage tests
         #[clap(long, default_value = "1")]
@@ -357,12 +363,18 @@ struct NetworkYamlConfig {
     /// Enable network fairness test
     #[serde(default)]
     enabled: Option<bool>,
-    /// Override rate for network tests
+    /// Override rate for network tests (packets/s)
     #[serde(default)]
     rate: Option<f64>,
-    /// Number of iperf3 client-server pod pairs
+    /// Number of TCP ping client-server pod pairs
     #[serde(default)]
     pod_pairs: Option<u32>,
+    /// Number of parallel streams per client (like iperf3 -P)
+    #[serde(default)]
+    streams: Option<u32>,
+    /// Packet payload size in bytes
+    #[serde(default)]
+    packet_size_bytes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -672,6 +684,8 @@ async fn main() -> anyhow::Result<()> {
             wl_threads,
             wl_max_prime,
             net_pod_pairs,
+            net_streams,
+            net_packet_size,
             st_pods,
             st_block_size,
             st_file_size,
@@ -729,6 +743,14 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .and_then(|c| c.network.pod_pairs)
                 .unwrap_or(net_pod_pairs);
+            let net_streams = yaml_config
+                .as_ref()
+                .and_then(|c| c.network.streams)
+                .unwrap_or(net_streams);
+            let net_packet_size = yaml_config
+                .as_ref()
+                .and_then(|c| c.network.packet_size_bytes)
+                .unwrap_or(net_packet_size);
 
             // Storage settings
             let st_rate = st_rate.or_else(|| yaml_config.as_ref().and_then(|c| c.storage.rate));
@@ -873,19 +895,24 @@ async fn main() -> anyhow::Result<()> {
             if run_network {
                 let effective_rate = net_rate.unwrap_or(rate_limit);
                 println!("\n═══════════════════════════════════════════════════════════");
-                println!("Network Fairness Assessment");
+                println!("Network Fairness Assessment (TCP Ping)");
                 println!("  Pod pairs per tenant: {}", net_pod_pairs);
-                println!(
-                    "  Baseline bandwidth: {}Mbps",
-                    rate_to_bandwidth(effective_rate).unwrap_or(f64::INFINITY)
-                );
+                println!("  Parallel streams per client: {}", net_streams);
+                println!("  Packet size: {} bytes", net_packet_size);
+                if matches!(rate_strategy, RateLimitStrategy::Unlimited) {
+                    println!("  Packet rate: unlimited");
+                } else {
+                    println!("  Packet rate: {} packets/s", effective_rate);
+                }
                 if net_rate.is_some() {
-                    println!("  Rate limit: {} req/s (custom)", effective_rate);
+                    println!("  (using custom rate)");
                 }
                 println!("═══════════════════════════════════════════════════════════");
 
                 let net_config = FairnessNetworkConfig {
                     pod_pairs: net_pod_pairs,
+                    streams: net_streams,
+                    packet_size: net_packet_size,
                 };
                 let net_assessor = FairnessNetworkAssessor::new(net_config);
 
