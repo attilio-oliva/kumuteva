@@ -199,9 +199,12 @@ enum Commands {
         /// Default request rate limit (requests/second) - only used with non-unlimited strategies
         #[clap(long = "rate", default_value = "10.0")]
         rate_limit: f64,
-        /// Load multiplier for malicious tenant (e.g., 10.0 = 10x normal load)
-        #[clap(long, default_value = "10.0")]
+        /// Rate multiplier for malicious tenant (e.g., 10.0 = 10x normal rate)
+        #[clap(long, default_value = "1.0")]
         load_multiplier: f64,
+        /// Pod multiplier for malicious tenant (e.g., 2.0 = 2x pods)
+        #[clap(long, default_value = "10.0")]
+        pod_multiplier: f64,
 
         /// Control plane specific rate limit (overrides --rate-limit for CP tests)
         #[clap(long)]
@@ -338,9 +341,12 @@ struct GlobalConfig {
     /// Default request rate (requests/second)
     #[serde(default)]
     rate: Option<f64>,
-    /// Load multiplier for malicious tenant
+    /// Rate multiplier for malicious tenant
     #[serde(default)]
     load_multiplier: Option<f64>,
+    /// Pod multiplier for malicious tenant
+    #[serde(default)]
+    pod_multiplier: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -675,6 +681,7 @@ async fn main() -> anyhow::Result<()> {
             rate_strategy,
             rate_limit,
             load_multiplier,
+            pod_multiplier,
             cp_rate,
             net_rate,
             st_rate,
@@ -728,6 +735,10 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .and_then(|c| c.global.load_multiplier)
                 .unwrap_or(load_multiplier);
+            let pod_multiplier = yaml_config
+                .as_ref()
+                .and_then(|c| c.global.pod_multiplier)
+                .unwrap_or(pod_multiplier);
 
             // Control plane settings
             let cp_rate =
@@ -844,7 +855,8 @@ async fn main() -> anyhow::Result<()> {
                     .test_duration(std::time::Duration::from_secs(test_duration))
                     .rate(effective_rate)
                     .strategy(rate_strategy.into())
-                    .malicious_multiplier(load_multiplier);
+                    .malicious_multiplier(load_multiplier)
+                    .pod_multiplier(pod_multiplier);
 
                 if export_csv {
                     builder = builder.export_csv(&output_dir);
@@ -863,7 +875,8 @@ async fn main() -> anyhow::Result<()> {
             if !matches!(rate_strategy, RateLimitStrategy::Unlimited) {
                 println!("  Rate limit: {} req/s", rate_limit);
             }
-            println!("  Load multiplier: {}x", load_multiplier);
+            println!("  Rate multiplier: {}x", load_multiplier);
+            println!("  Pod multiplier: {}x", pod_multiplier);
             println!();
 
             let mut results = Vec::new();

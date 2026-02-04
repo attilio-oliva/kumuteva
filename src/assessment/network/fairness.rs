@@ -33,7 +33,7 @@ impl Default for FairnessNetworkConfig {
     fn default() -> Self {
         Self {
             pod_pairs: 1,
-            streams: 4, // Default to 4 parallel streams like iperf3
+            streams: 4,      // Default to 4 parallel streams like iperf3
             packet_size: 64, // Default 64 bytes payload
         }
     }
@@ -83,8 +83,22 @@ impl FairnessNetworkAssessor {
         let streams = self.config.streams;
         let packet_size = self.config.packet_size;
         tokio::try_join!(
-            create_tcp_ping_clients(&t1_clone, &t1_servers, duration_secs, t1_rate, streams, packet_size),
-            create_tcp_ping_clients(&t2_clone, &t2_servers, duration_secs, t2_rate, streams, packet_size)
+            create_tcp_ping_clients(
+                &t1_clone,
+                &t1_servers,
+                duration_secs,
+                t1_rate,
+                streams,
+                packet_size
+            ),
+            create_tcp_ping_clients(
+                &t2_clone,
+                &t2_servers,
+                duration_secs,
+                t2_rate,
+                streams,
+                packet_size
+            )
         )?;
 
         // Wait for completion (in parallel across tenants)
@@ -161,7 +175,7 @@ impl FairnessAssessor for FairnessNetworkAssessor {
             Some(config.malicious_rate())
         };
         let malicious_pairs =
-            (self.config.pod_pairs as f64 * config.malicious_load_multiplier) as u32;
+            (self.config.pod_pairs as f64 * config.malicious_pod_multiplier) as u32;
 
         self.run_phase(
             tenant1,

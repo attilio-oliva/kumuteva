@@ -148,7 +148,7 @@ impl FairnessAssessor for FairnessStorageAssessor {
     ) -> Result<PhaseResult> {
         let t1_iops = rate_to_iops(config.tenant1_rate);
         let t2_iops = rate_to_iops(config.malicious_rate());
-        let malicious_pods = (self.config.pods as f64 * config.malicious_load_multiplier) as u32;
+        let malicious_pods = (self.config.pods as f64 * config.malicious_pod_multiplier) as u32;
 
         self.run_phase(
             tenant1,

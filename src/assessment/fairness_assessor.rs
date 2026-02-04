@@ -130,8 +130,10 @@ pub struct FairnessConfig {
     pub baseline_duration: Duration,
     /// Duration for unbalanced test phase (malicious tenant under heavy load)
     pub test_duration: Duration,
-    /// Load multiplier for malicious tenant (e.g., 10.0 = 10x load)
+    /// Load multiplier for malicious tenant rate (e.g., 10.0 = 10x rate)
     pub malicious_load_multiplier: f64,
+    /// Pod multiplier for malicious tenant (e.g., 2.0 = 2x pods)
+    pub malicious_pod_multiplier: f64,
     /// Request rate for tenant1 (regular tenant) in ops/sec
     pub tenant1_rate: f64,
     /// Request rate for tenant2 (malicious tenant) in ops/sec
@@ -146,6 +148,7 @@ impl Default for FairnessConfig {
             baseline_duration: Duration::from_secs(30),
             test_duration: Duration::from_secs(60),
             malicious_load_multiplier: 10.0,
+            malicious_pod_multiplier: 1.0,
             tenant1_rate: 10.0,
             tenant2_rate: 10.0,
             strategy: RateLimitStrategy::Unlimited,
@@ -618,6 +621,7 @@ pub struct FairnessRunnerBuilder {
     baseline_duration: Option<Duration>,
     test_duration: Option<Duration>,
     malicious_multiplier: Option<f64>,
+    pod_multiplier: Option<f64>,
     rate: Option<f64>,
     strategy: Option<RateLimitStrategy>,
     export_csv: Option<String>,
@@ -643,6 +647,11 @@ impl FairnessRunnerBuilder {
         self
     }
 
+    pub fn pod_multiplier(mut self, m: f64) -> Self {
+        self.pod_multiplier = Some(m);
+        self
+    }
+
     pub fn rate(mut self, r: f64) -> Self {
         self.rate = Some(r);
         self
@@ -663,6 +672,7 @@ impl FairnessRunnerBuilder {
             baseline_duration: self.baseline_duration.unwrap_or(Duration::from_secs(30)),
             test_duration: self.test_duration.unwrap_or(Duration::from_secs(60)),
             malicious_load_multiplier: self.malicious_multiplier.unwrap_or(10.0),
+            malicious_pod_multiplier: self.pod_multiplier.unwrap_or(1.0),
             tenant1_rate: self.rate.unwrap_or(10.0),
             tenant2_rate: self.rate.unwrap_or(10.0),
             strategy: self.strategy.unwrap_or_default(),

@@ -149,7 +149,7 @@ impl FairnessAssessor for FairnessWorkloadAssessor {
             Some(config.malicious_rate())
         };
 
-        let malicious_pods = (self.config.pods as f64 * config.malicious_load_multiplier) as u32;
+        let malicious_pods = (self.config.pods as f64 * config.malicious_pod_multiplier) as u32;
 
         self.run_phase(
             tenant1,
