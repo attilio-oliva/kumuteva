@@ -191,12 +191,25 @@ enum Commands {
         /// Rate limiting strategy for the runner
         #[clap(long, default_value = "unlimited", value_enum)]
         rate_strategy: RateLimitStrategy,
-        /// Request rate limit (requests/sec) - only used with non-unlimited strategies
-        #[clap(long, default_value = "10.0")]
+        /// Default request rate limit (requests/second) - only used with non-unlimited strategies
+        #[clap(long = "rate", default_value = "10.0")]
         rate_limit: f64,
         /// Load multiplier for malicious tenant (e.g., 10.0 = 10x normal load)
         #[clap(long, default_value = "10.0")]
         load_multiplier: f64,
+
+        /// Control plane specific rate limit (overrides --rate-limit for CP tests)
+        #[clap(long)]
+        cp_rate: Option<f64>,
+        /// Network specific rate limit (overrides --rate-limit for network tests)
+        #[clap(long)]
+        net_rate: Option<f64>,
+        /// Storage specific rate limit (overrides --rate-limit for storage tests)
+        #[clap(long)]
+        st_rate: Option<f64>,
+        /// Workload specific rate limit (overrides --rate-limit for workload tests)
+        #[clap(long)]
+        wl_rate: Option<f64>,
 
         /// Number of concurrent requesters for control plane tests
         #[clap(long, default_value = "1")]
@@ -491,6 +504,10 @@ async fn main() -> anyhow::Result<()> {
             rate_strategy,
             rate_limit,
             load_multiplier,
+            cp_rate,
+            net_rate,
+            st_rate,
+            wl_rate,
             cp_requesters,
             wl_pods,
             wl_threads,
@@ -524,19 +541,22 @@ async fn main() -> anyhow::Result<()> {
                 namespace: tenant2_namespace,
             });
 
-            // Build the fairness runner with the specified configuration
-            let mut runner_builder = FairnessRunnerBuilder::new()
-                .baseline_duration(std::time::Duration::from_secs(baseline_duration))
-                .test_duration(std::time::Duration::from_secs(test_duration))
-                .rate(rate_limit)
-                .strategy(rate_strategy.into())
-                .malicious_multiplier(load_multiplier);
+            // Helper to build a fairness runner with optional system-specific rate
+            let build_runner = |system_rate: Option<f64>| {
+                let effective_rate = system_rate.unwrap_or(rate_limit);
+                let mut builder = FairnessRunnerBuilder::new()
+                    .baseline_duration(std::time::Duration::from_secs(baseline_duration))
+                    .test_duration(std::time::Duration::from_secs(test_duration))
+                    .rate(effective_rate)
+                    .strategy(rate_strategy.into())
+                    .malicious_multiplier(load_multiplier);
 
-            if export_csv {
-                runner_builder = runner_builder.export_csv(&output_dir);
-            }
+                if export_csv {
+                    builder = builder.export_csv(&output_dir);
+                }
 
-            let runner = runner_builder.build();
+                builder.build()
+            };
 
             println!("Fairness Test Configuration:");
             println!("  Baseline duration: {} seconds", baseline_duration);
@@ -552,9 +572,13 @@ async fn main() -> anyhow::Result<()> {
 
             // Control Plane fairness
             if run_cp {
+                let effective_rate = cp_rate.unwrap_or(rate_limit);
                 println!("═══════════════════════════════════════════════════════════");
                 println!("Control Plane Fairness Assessment");
                 println!("  Workers: {}", cp_requesters);
+                if cp_rate.is_some() {
+                    println!("  Rate limit: {} req/s (custom)", effective_rate);
+                }
                 println!("═══════════════════════════════════════════════════════════");
 
                 let cp_config = FairnessControlPlaneConfig {
@@ -562,6 +586,7 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let cp_assessor = FairnessControlPlaneAssessor::new(cp_config);
 
+                let runner = build_runner(cp_rate);
                 let result = runner
                     .run(&cp_assessor, tenant1_config.clone(), tenant2_config.clone())
                     .await?;
@@ -570,13 +595,17 @@ async fn main() -> anyhow::Result<()> {
 
             // Network fairness
             if run_network {
+                let effective_rate = net_rate.unwrap_or(rate_limit);
                 println!("\n═══════════════════════════════════════════════════════════");
                 println!("Network Fairness Assessment");
                 println!("  Pod pairs per tenant: {}", net_pod_pairs);
                 println!(
                     "  Baseline bandwidth: {}Mbps",
-                    rate_to_bandwidth(rate_limit).unwrap_or(f64::INFINITY)
+                    rate_to_bandwidth(effective_rate).unwrap_or(f64::INFINITY)
                 );
+                if net_rate.is_some() {
+                    println!("  Rate limit: {} req/s (custom)", effective_rate);
+                }
                 println!("═══════════════════════════════════════════════════════════");
 
                 let net_config = FairnessNetworkConfig {
@@ -584,6 +613,7 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let net_assessor = FairnessNetworkAssessor::new(net_config);
 
+                let runner = build_runner(net_rate);
                 let result = runner
                     .run(
                         &net_assessor,
@@ -596,12 +626,16 @@ async fn main() -> anyhow::Result<()> {
 
             // Storage fairness
             if run_storage {
+                let effective_rate = st_rate.unwrap_or(rate_limit);
                 println!("\n═══════════════════════════════════════════════════════════");
                 println!("Storage Fairness Assessment");
                 println!(
                     "  Pods: {}, Block size: {}KB, File size: {}MB, Scenario: {:?}",
                     st_pods, st_block_size, st_file_size, st_scenario
                 );
+                if st_rate.is_some() {
+                    println!("  Rate limit: {} req/s (custom)", effective_rate);
+                }
                 println!("═══════════════════════════════════════════════════════════");
 
                 let storage_config = FairnessStorageConfig {
@@ -612,6 +646,7 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let storage_assessor = FairnessStorageAssessor::new(storage_config);
 
+                let runner = build_runner(st_rate);
                 let result = runner
                     .run(
                         &storage_assessor,
@@ -624,12 +659,16 @@ async fn main() -> anyhow::Result<()> {
 
             // Workload fairness
             if run_workload {
+                let effective_rate = wl_rate.unwrap_or(rate_limit);
                 println!("\n═══════════════════════════════════════════════════════════");
                 println!("Workload (CPU) Fairness Assessment");
                 println!(
                     "  Pods: {}, Threads: {}, Max prime: {}",
                     wl_pods, wl_threads, wl_max_prime
                 );
+                if wl_rate.is_some() {
+                    println!("  Rate limit: {} req/s (custom)", effective_rate);
+                }
                 println!("═══════════════════════════════════════════════════════════");
 
                 let wl_config = FairnessWorkloadConfig {
@@ -639,6 +678,7 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let wl_assessor = FairnessWorkloadAssessor::new(wl_config);
 
+                let runner = build_runner(wl_rate);
                 let result = runner
                     .run(&wl_assessor, tenant1_config.clone(), tenant2_config.clone())
                     .await?;
