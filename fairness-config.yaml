@@ -1,0 +1,36 @@
+apiVersion: v1
+
+global:
+  baselineDurationSeconds: 10
+  testDurationSeconds: 10
+  rateStrategy: fixed-delay
+  rate: 10.0
+  loadMultiplier: 1.0
+  podMultiplier: 10.0
+
+controlPlane:
+  rate: 20.0
+  requesters: 1
+
+network:
+  rate: 10000.0 # Packets per second
+  packetSizeBytes: 1000
+  streams: 5
+  podPairs: 1
+
+storage:
+  rate: 50.0
+  pods: 1
+  blockSizeKb: 4
+  fileSizeMb: 100
+  scenario: random 
+
+workload:
+  rate: 25.0
+  pods: 1
+  threads: 1
+  maxPrime: 500000
+
+export:
+  csv: true
+  outputDir: fairness_results
