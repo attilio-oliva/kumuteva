@@ -12,6 +12,7 @@ use cluster::TenantsPortMapping;
 use cluster::{ControlPlaneIsolation, KindCluster, KubernetesClient, KubernetesClusterBuilder};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
+use serde::Deserialize;
 use tracing::Level;
 
 use crate::assessment::{
@@ -161,6 +162,10 @@ enum Commands {
         #[clap(value_name = "tenant2-kubeconfig")]
         tenant2_kubeconfig_path: PathBuf,
 
+        /// Path to YAML configuration file (CLI options override file settings)
+        #[clap(long = "config", short = 'f')]
+        config_file: Option<PathBuf>,
+
         /// Namespace for tenant1
         #[clap(long = "tenant1-ns", default_value = "tenant1")]
         tenant1_namespace: String,
@@ -278,6 +283,159 @@ impl From<RateLimitStrategy> for FairnessRateLimitStrategy {
             RateLimitStrategy::FixedDelay => FairnessRateLimitStrategy::FixedDelay,
             RateLimitStrategy::Adaptive => FairnessRateLimitStrategy::Adaptive,
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// YAML Configuration Structures for Fairness Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Root configuration structure for fairness tests loaded from YAML
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct FairnessYamlConfig {
+    /// API version for config format compatibility
+    #[serde(default)]
+    api_version: Option<String>,
+    /// Global settings that apply to all subsystems
+    #[serde(default)]
+    global: GlobalConfig,
+    /// Control plane specific configuration
+    #[serde(default, rename = "controlPlane")]
+    control_plane: ControlPlaneYamlConfig,
+    /// Network specific configuration
+    #[serde(default)]
+    network: NetworkYamlConfig,
+    /// Storage specific configuration
+    #[serde(default)]
+    storage: StorageYamlConfig,
+    /// Workload (CPU) specific configuration
+    #[serde(default)]
+    workload: WorkloadYamlConfig,
+    /// Export settings
+    #[serde(default)]
+    export: ExportYamlConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GlobalConfig {
+    /// Duration for baseline measurement in seconds
+    #[serde(default)]
+    baseline_duration_seconds: Option<u64>,
+    /// Duration for test phase in seconds
+    #[serde(default)]
+    test_duration_seconds: Option<u64>,
+    /// Rate limiting strategy: "unlimited", "fixedDelay", or "adaptive"
+    #[serde(default)]
+    rate_strategy: Option<String>,
+    /// Default request rate (requests/second)
+    #[serde(default)]
+    rate: Option<f64>,
+    /// Load multiplier for malicious tenant
+    #[serde(default)]
+    load_multiplier: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ControlPlaneYamlConfig {
+    /// Enable control plane fairness test
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// Override rate for control plane tests
+    #[serde(default)]
+    rate: Option<f64>,
+    /// Number of concurrent requesters
+    #[serde(default)]
+    requesters: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NetworkYamlConfig {
+    /// Enable network fairness test
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// Override rate for network tests
+    #[serde(default)]
+    rate: Option<f64>,
+    /// Number of iperf3 client-server pod pairs
+    #[serde(default)]
+    pod_pairs: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct StorageYamlConfig {
+    /// Enable storage fairness test
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// Override rate for storage tests
+    #[serde(default)]
+    rate: Option<f64>,
+    /// Number of I/O benchmark pods
+    #[serde(default)]
+    pods: Option<u32>,
+    /// I/O block size in KB
+    #[serde(default)]
+    block_size_kb: Option<u32>,
+    /// File size in MB
+    #[serde(default)]
+    file_size_mb: Option<u32>,
+    /// Test scenario: "random" or "sequential"
+    #[serde(default)]
+    scenario: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WorkloadYamlConfig {
+    /// Enable workload fairness test
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// Override rate for workload tests
+    #[serde(default)]
+    rate: Option<f64>,
+    /// Number of benchmark pods
+    #[serde(default)]
+    pods: Option<u32>,
+    /// Number of CPU threads per pod
+    #[serde(default)]
+    threads: Option<u32>,
+    /// Max prime number for benchmark
+    #[serde(default)]
+    max_prime: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ExportYamlConfig {
+    /// Enable CSV export
+    #[serde(default)]
+    csv: Option<bool>,
+    /// Output directory for exports
+    #[serde(default)]
+    output_dir: Option<String>,
+}
+
+impl FairnessYamlConfig {
+    /// Load configuration from a YAML file
+    fn load_from_file(path: &PathBuf) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let config: FairnessYamlConfig = serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse YAML config: {}", path.display()))?;
+        Ok(config)
+    }
+}
+
+fn parse_rate_strategy_from_str(s: &str) -> Option<RateLimitStrategy> {
+    match s.to_lowercase().as_str() {
+        "unlimited" => Some(RateLimitStrategy::Unlimited),
+        "fixeddelay" | "fixed_delay" | "fixed-delay" => Some(RateLimitStrategy::FixedDelay),
+        "adaptive" => Some(RateLimitStrategy::Adaptive),
+        _ => None,
     }
 }
 
@@ -493,6 +651,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Fairness {
             tenant1_kubeconfig_path,
             tenant2_kubeconfig_path,
+            config_file,
             tenant1_namespace,
             tenant2_namespace,
             control_plane,
@@ -524,12 +683,126 @@ async fn main() -> anyhow::Result<()> {
             setup_logging(verbose)?;
             println!("Running fairness assessment...\n");
 
-            // Determine which subsystems to test
-            let run_all = !control_plane && !storage && !network && !workload;
-            let run_cp = control_plane || run_all;
-            let run_storage = storage || run_all;
-            let run_network = network || run_all;
-            let run_workload = workload || run_all;
+            // Load YAML config if provided
+            let yaml_config = if let Some(ref config_path) = config_file {
+                println!("Loading configuration from: {}\n", config_path.display());
+                Some(FairnessYamlConfig::load_from_file(config_path)?)
+            } else {
+                None
+            };
+
+            // Merge CLI and YAML config (CLI takes precedence)
+            // Global settings
+            let baseline_duration = yaml_config
+                .as_ref()
+                .and_then(|c| c.global.baseline_duration_seconds)
+                .unwrap_or(baseline_duration);
+            let test_duration = yaml_config
+                .as_ref()
+                .and_then(|c| c.global.test_duration_seconds)
+                .unwrap_or(test_duration);
+            let rate_strategy = yaml_config
+                .as_ref()
+                .and_then(|c| c.global.rate_strategy.as_ref())
+                .and_then(|s| parse_rate_strategy_from_str(s))
+                .unwrap_or(rate_strategy);
+            let rate_limit = yaml_config
+                .as_ref()
+                .and_then(|c| c.global.rate)
+                .unwrap_or(rate_limit);
+            let load_multiplier = yaml_config
+                .as_ref()
+                .and_then(|c| c.global.load_multiplier)
+                .unwrap_or(load_multiplier);
+
+            // Control plane settings
+            let cp_rate =
+                cp_rate.or_else(|| yaml_config.as_ref().and_then(|c| c.control_plane.rate));
+            let cp_requesters = yaml_config
+                .as_ref()
+                .and_then(|c| c.control_plane.requesters)
+                .unwrap_or(cp_requesters);
+
+            // Network settings
+            let net_rate = net_rate.or_else(|| yaml_config.as_ref().and_then(|c| c.network.rate));
+            let net_pod_pairs = yaml_config
+                .as_ref()
+                .and_then(|c| c.network.pod_pairs)
+                .unwrap_or(net_pod_pairs);
+
+            // Storage settings
+            let st_rate = st_rate.or_else(|| yaml_config.as_ref().and_then(|c| c.storage.rate));
+            let st_pods = yaml_config
+                .as_ref()
+                .and_then(|c| c.storage.pods)
+                .unwrap_or(st_pods);
+            let st_block_size = yaml_config
+                .as_ref()
+                .and_then(|c| c.storage.block_size_kb)
+                .unwrap_or(st_block_size);
+            let st_file_size = yaml_config
+                .as_ref()
+                .and_then(|c| c.storage.file_size_mb)
+                .unwrap_or(st_file_size);
+            let st_scenario = yaml_config
+                .as_ref()
+                .and_then(|c| c.storage.scenario.as_ref())
+                .and_then(|s| parse_storage_scenario(s).ok())
+                .unwrap_or(st_scenario);
+
+            // Workload settings
+            let wl_rate = wl_rate.or_else(|| yaml_config.as_ref().and_then(|c| c.workload.rate));
+            let wl_pods = yaml_config
+                .as_ref()
+                .and_then(|c| c.workload.pods)
+                .unwrap_or(wl_pods);
+            let wl_threads = yaml_config
+                .as_ref()
+                .and_then(|c| c.workload.threads)
+                .unwrap_or(wl_threads);
+            let wl_max_prime = yaml_config
+                .as_ref()
+                .and_then(|c| c.workload.max_prime)
+                .unwrap_or(wl_max_prime);
+
+            // Export settings
+            let export_csv = export_csv
+                || yaml_config
+                    .as_ref()
+                    .and_then(|c| c.export.csv)
+                    .unwrap_or(false);
+            let output_dir = yaml_config
+                .as_ref()
+                .and_then(|c| c.export.output_dir.clone())
+                .unwrap_or(output_dir);
+
+            // Determine which subsystems to test (CLI flags override YAML enabled flags)
+            let yaml_cp_enabled = yaml_config.as_ref().and_then(|c| c.control_plane.enabled);
+            let yaml_net_enabled = yaml_config.as_ref().and_then(|c| c.network.enabled);
+            let yaml_st_enabled = yaml_config.as_ref().and_then(|c| c.storage.enabled);
+            let yaml_wl_enabled = yaml_config.as_ref().and_then(|c| c.workload.enabled);
+
+            let any_cli_flag = control_plane || storage || network || workload;
+            let any_yaml_flag = yaml_cp_enabled.is_some()
+                || yaml_net_enabled.is_some()
+                || yaml_st_enabled.is_some()
+                || yaml_wl_enabled.is_some();
+
+            let (run_cp, run_storage, run_network, run_workload) = if any_cli_flag {
+                // CLI flags specified - use them directly
+                (control_plane, storage, network, workload)
+            } else if any_yaml_flag {
+                // No CLI flags but YAML has enabled settings
+                (
+                    yaml_cp_enabled.unwrap_or(false),
+                    yaml_st_enabled.unwrap_or(false),
+                    yaml_net_enabled.unwrap_or(false),
+                    yaml_wl_enabled.unwrap_or(false),
+                )
+            } else {
+                // No flags at all - run everything
+                (true, true, true, true)
+            };
 
             // Load tenant configurations
             let tenant1_config = Arc::new(TenantClusterConfig {
@@ -559,6 +832,9 @@ async fn main() -> anyhow::Result<()> {
             };
 
             println!("Fairness Test Configuration:");
+            if config_file.is_some() {
+                println!("  Config file: {}", config_file.as_ref().unwrap().display());
+            }
             println!("  Baseline duration: {} seconds", baseline_duration);
             println!("  Test duration: {} seconds", test_duration);
             println!("  Rate strategy: {:?}", rate_strategy);
