@@ -5,6 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Timeout for waiting on pod deletion during cleanup (prevents hanging)
+const POD_DELETION_TIMEOUT_SECS: u64 = 60;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
@@ -193,14 +196,21 @@ fn fio_pod(
         FairnessStorageScenario::SequentialIO => ("seq-rw", "--ioengine=sync --rw=rw"),
     };
 
+    // Use --write_lat_log to capture per-IO latencies
+    // Log format: time (msec), latency (nsec), direction (0=read, 1=write), block size, offset, command priority
+    // After fio completes, we cat the latency logs and prefix with LATLOG: for easy parsing
     let command = format!(
         "apk add --no-cache fio && \
          mkdir -p /data && \
          fio --name={} {} \
          --bs={}k --size={}m --numjobs=1 \
-         --runtime={} --time_based=1 --group_reporting=1 \
+         --runtime={} --time_based=1 \
          --filename=/data/fio-test-file \
-         --output-format=json{} 2>&1",
+         --write_lat_log=/data/latency \
+         --log_avg_msec=0{} 2>&1 && \
+         echo 'LATLOG_START' && \
+         cat /data/latency_clat.*.log 2>/dev/null || cat /data/latency_clat.log 2>/dev/null || echo 'NO_LAT_LOG' && \
+         echo 'LATLOG_END'",
         job_name, extra_args, config.block_size_kb, config.file_size_mb, duration_secs, rate_param
     );
 
@@ -328,45 +338,59 @@ async fn collect_results(tenant: &TenantClusterConfig, pods: u32) -> Result<Vec<
             .get_pod_logs(&name, &tenant.namespace)
             .await?;
 
-        if let Some(latency) = parse_fio_latency(&logs) {
-            points.push(MetricPoint {
-                timestamp_secs: 0.0,
-                latency_ms: latency,
-                is_error: false,
-                label: Some(format!("fio-{}", i)),
-            });
-        }
+        let pod_points = parse_fio_latency_log(&logs, i);
+        points.extend(pod_points);
     }
 
     Ok(points)
 }
 
-fn parse_fio_latency(logs: &str) -> Option<f64> {
-    let json_start = logs.find('{')?;
-    let json_end = logs.rfind('}')?;
-    let json_str = &logs[json_start..=json_end];
+/// Parse fio latency log output
+/// Log format: time (msec), latency (nsec), direction (0=read, 1=write), block size, offset, command priority
+fn parse_fio_latency_log(logs: &str, pod_index: u32) -> Vec<MetricPoint> {
+    let mut points = Vec::new();
 
-    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    // Find the latency log section between LATLOG_START and LATLOG_END
+    let start_marker = "LATLOG_START";
+    let end_marker = "LATLOG_END";
 
-    // Try to get clat (completion latency) from jobs
-    if let Some(jobs) = v["jobs"].as_array() {
-        if let Some(job) = jobs.first() {
-            // Try read latency
-            if let Some(mean) = job["read"]["clat_ns"]["mean"].as_f64() {
-                if mean > 0.0 {
-                    return Some(mean / 1_000_000.0); // ns to ms
-                }
-            }
-            // Try write latency
-            if let Some(mean) = job["write"]["clat_ns"]["mean"].as_f64() {
-                if mean > 0.0 {
-                    return Some(mean / 1_000_000.0);
-                }
+    let start_pos = match logs.find(start_marker) {
+        Some(pos) => pos + start_marker.len(),
+        None => return points,
+    };
+
+    let end_pos = match logs[start_pos..].find(end_marker) {
+        Some(pos) => start_pos + pos,
+        None => logs.len(),
+    };
+
+    let log_section = &logs[start_pos..end_pos];
+
+    // Parse each line: time_msec, latency_nsec, direction, block_size, offset, ...
+    for line in log_section.lines() {
+        let line = line.trim();
+        if line.is_empty() || line == "NO_LAT_LOG" {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 2 {
+            // First field: time in milliseconds since start
+            // Second field: latency in nanoseconds
+            if let (Ok(time_ms), Ok(latency_ns)) =
+                (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+            {
+                points.push(MetricPoint {
+                    timestamp_secs: time_ms / 1000.0,     // Convert ms to seconds
+                    latency_ms: latency_ns / 1_000_000.0, // Convert ns to ms
+                    is_error: false,
+                    label: Some(format!("fio-{}", pod_index)),
+                });
             }
         }
     }
 
-    None
+    points
 }
 
 async fn cleanup_pods(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
@@ -381,12 +405,16 @@ async fn cleanup_pods(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
 
     // Then, wait for all pods to be fully deleted to avoid "AlreadyExists" errors
     // when creating new pods with the same names in subsequent phases
+    // Use timeout to prevent hanging if pods are stuck in Terminating state
     for i in 0..pods {
         let name = format!("storage-fairness-{}", i);
-        let _ = tenant
-            .cluster
-            .wait_for_pod_deletion(&name, &tenant.namespace)
-            .await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(POD_DELETION_TIMEOUT_SECS),
+            tenant
+                .cluster
+                .wait_for_pod_deletion(&name, &tenant.namespace),
+        )
+        .await;
     }
 
     Ok(())
