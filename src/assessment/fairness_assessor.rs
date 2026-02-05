@@ -61,7 +61,7 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Create a rate limiter with the given strategy and target rate (ops/sec)
+    /// Create a rate limiter with the given strategy and target rate (ops/s)
     pub fn new(strategy: RateLimitStrategy, rate: f64) -> Self {
         let interval = if rate > 0.0 {
             Duration::from_secs_f64(1.0 / rate)
@@ -485,7 +485,7 @@ impl FairnessRunner {
 
         // Phase 1: Baseline
         println!(
-            "  {} Baseline ({} sec)...",
+            "  {} Baseline ({}s)...",
             "→".dimmed(),
             self.config.baseline_duration.as_secs()
         );
@@ -500,10 +500,10 @@ impl FairnessRunner {
 
         // Phase 2: Unbalanced
         println!(
-            "  {} Unbalanced ({} sec, {}x load on tenant2)...",
+            "  {} Unbalanced ({}s, {}x effective load on tenant2)...",
             "→".dimmed(),
             self.config.test_duration.as_secs(),
-            self.config.malicious_load_multiplier
+            self.config.malicious_load_multiplier * self.config.malicious_pod_multiplier
         );
         let unbalanced = assessor
             .run_unbalanced(tenant1, tenant2, &self.config)
@@ -554,20 +554,22 @@ impl FairnessRunner {
             .as_secs();
 
         // Export baseline
-        let path = format!(
+        let baseline_path = format!(
             "{}/{}_baseline_{}.csv",
             self.output_dir, subsystem, timestamp
         );
-        write_csv(&path, &result.baseline).await?;
+        write_csv(&baseline_path, &result.baseline).await?;
 
         // Export unbalanced
-        let path = format!(
+        let unbalanced_path = format!(
             "{}/{}_unbalanced_{}.csv",
             self.output_dir, subsystem, timestamp
         );
-        write_csv(&path, &result.unbalanced).await?;
+        write_csv(&unbalanced_path, &result.unbalanced).await?;
 
         println!("  📁 Exported to {}/", self.output_dir);
+        println!("      - {}", baseline_path);
+        println!("      - {}", unbalanced_path);
         Ok(())
     }
 }

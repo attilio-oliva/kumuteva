@@ -5,6 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Timeout for waiting on pod deletion during cleanup (prevents hanging)
+const POD_DELETION_TIMEOUT_SECS: u64 = 60;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
@@ -706,18 +709,21 @@ async fn cleanup_pods(tenant: &TenantClusterConfig, pairs: u32) -> Result<()> {
     }
 
     // Wait for pods to be fully deleted to avoid "AlreadyExists" errors
+    // Use timeout to prevent hanging if pods are stuck in Terminating state
     for i in 0..pairs {
         let server_name = format!("net-fairness-srv-{}", i);
         let client_name = format!("net-fairness-cli-{}", i);
 
-        let _ = tenant
-            .cluster
-            .wait_for_pod_deletion(&server_name, &tenant.namespace)
-            .await;
-        let _ = tenant
-            .cluster
-            .wait_for_pod_deletion(&client_name, &tenant.namespace)
-            .await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(POD_DELETION_TIMEOUT_SECS),
+            tenant.cluster.wait_for_pod_deletion(&server_name, &tenant.namespace),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(POD_DELETION_TIMEOUT_SECS),
+            tenant.cluster.wait_for_pod_deletion(&client_name, &tenant.namespace),
+        )
+        .await;
     }
 
     Ok(())

@@ -1001,17 +1001,23 @@ impl KubernetesClient {
     pub async fn wait_for_pod_deletion(&self, pod_name: &str, namespace: &str) -> Result<()> {
         let api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
-        let pod_exists = api.get(pod_name).await.is_ok();
+        // Check if pod exists and get its resource version for proper watching
+        let pod = match api.get(pod_name).await {
+            Ok(pod) => pod,
+            Err(_) => return Ok(()), // Pod doesn't exist, we're done
+        };
 
-        if !pod_exists {
-            return Ok(());
-        }
+        // Get the resource version to watch from the current state
+        let resource_version = pod
+            .metadata
+            .resource_version
+            .unwrap_or_else(|| "0".to_string());
 
         let lp = WatchParams::default()
             .fields(&format!("metadata.name={}", pod_name))
-            .timeout(290); // upper bound of how long we watch for
+            .timeout(60); // Reduced timeout, we'll poll if watch expires
 
-        let mut stream = api.watch(&lp, "0").await?.boxed();
+        let mut stream = api.watch(&lp, &resource_version).await?.boxed();
 
         while let Some(event) = stream.try_next().await? {
             match event {
@@ -1019,13 +1025,19 @@ impl KubernetesClient {
                     return Ok(());
                 }
                 _ => {
-                    // Fallback, check pod existence by fetching the latest version.
+                    // Check pod existence by fetching the latest version
                     if api.get(pod_name).await.is_err() {
                         return Ok(());
                     }
                 }
             }
         }
+
+        // Watch expired, do a final check
+        if api.get(pod_name).await.is_err() {
+            return Ok(());
+        }
+
         Err(Error::msg("Pod was not deleted in time"))
     }
 
