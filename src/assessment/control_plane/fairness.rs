@@ -9,7 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::ConfigMap;
-use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::Api;
 
 use crate::assessment::fairness_assessor::{
@@ -48,6 +48,23 @@ impl FairnessControlPlaneAssessor {
         Self { config }
     }
 
+    /// Cleanup resources created by the test
+    async fn cleanup_resources(&self, tenant: &TenantClusterConfig) -> Result<()> {
+        let client = tenant.cluster.client().clone();
+        let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &tenant.namespace);
+        let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &tenant.namespace);
+
+        let lp = ListParams::default().labels("kumuteva.io/test=control-plane");
+
+        let _ = cm_api
+            .delete_collection(&DeleteParams::default(), &lp)
+            .await;
+        let _ = deploy_api
+            .delete_collection(&DeleteParams::default(), &lp)
+            .await;
+        Ok(())
+    }
+
     /// Run workload for a single tenant
     async fn run_tenant(
         &self,
@@ -78,12 +95,17 @@ impl FairnessControlPlaneAssessor {
             // This ensures we can meet the target rate even if latency > interval
             let handle = tokio::spawn(async move {
                 let mut points = Vec::new();
+                let labels = std::collections::BTreeMap::from([
+                    ("kumuteva.io/test".to_string(), "control-plane".to_string()),
+                    ("app".to_string(), name.clone()),
+                ]);
 
                 // 1. Create ConfigMap
                 let cm = ConfigMap {
                     metadata: kube::api::ObjectMeta {
                         name: Some(name.clone()),
                         namespace: Some(namespace.clone()),
+                        labels: Some(labels.clone()),
                         ..Default::default()
                     },
                     data: Some([("key".to_string(), "value".to_string())].into()),
@@ -105,6 +127,7 @@ impl FairnessControlPlaneAssessor {
                     metadata: kube::api::ObjectMeta {
                         name: Some(name.clone()),
                         namespace: Some(namespace.clone()),
+                        labels: Some(labels.clone()),
                         ..Default::default()
                     },
                     spec: Some(k8s_openapi::api::apps::v1::DeploymentSpec {
@@ -239,6 +262,10 @@ impl FairnessControlPlaneAssessor {
         let t1 = tenant1.clone();
         let t2 = tenant2.clone();
 
+        // Cleanup before starting to ensure clean state
+        let _ = self.cleanup_resources(&t1).await;
+        let _ = self.cleanup_resources(&t2).await;
+
         let t1_handle = tokio::spawn(async move {
             let mut all_points = Vec::new();
             let mut handles = Vec::new();
@@ -310,6 +337,10 @@ impl FairnessControlPlaneAssessor {
         });
 
         let (t1_points, t2_points) = tokio::try_join!(t1_handle, t2_handle)?;
+
+        // Cleanup after finishing
+        let _ = self.cleanup_resources(&tenant1).await;
+        let _ = self.cleanup_resources(&tenant2).await;
 
         Ok(PhaseResult {
             tenant1: TenantMetrics::from_raw(t1_points),
