@@ -11,6 +11,7 @@ const POD_DELETION_TIMEOUT_SECS: u64 = 60;
 use anyhow::Result;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
+use tracing::info;
 
 use crate::assessment::fairness_assessor::{
     FairnessAssessor, FairnessConfig, MetricPoint, PhaseResult, RateLimitStrategy, TenantMetrics,
@@ -105,6 +106,7 @@ impl FairnessNetworkAssessor {
         )?;
 
         // Wait for completion (in parallel across tenants)
+        info!("Waiting for test completion ({} seconds)...", duration_secs);
         let t1_clone = tenant1.clone();
         let t2_clone = tenant2.clone();
         tokio::try_join!(
@@ -113,12 +115,23 @@ impl FairnessNetworkAssessor {
         )?;
 
         // Collect results
+        info!("Collecting results from pods...");
         let t1_points = collect_results(&tenant1, t1_pairs).await?;
         let t2_points = collect_results(&tenant2, t2_pairs).await?;
+        info!(
+            "Collected {} points for Tenant 1 and {} points for Tenant 2",
+            t1_points.len(),
+            t2_points.len()
+        );
 
         // Cleanup
-        cleanup_pods(&tenant1, t1_pairs).await?;
-        cleanup_pods(&tenant2, t2_pairs).await?;
+        info!("Cleaning up pods...");
+        tokio::try_join!(
+            cleanup_pods(&tenant1, t1_pairs),
+            cleanup_pods(&tenant2, t2_pairs)
+        )?;
+
+        info!("Cleanup completed.");
 
         Ok(PhaseResult {
             tenant1: TenantMetrics::from_raw(t1_points),
@@ -625,19 +638,21 @@ async fn wait_for_completion(tenant: &TenantClusterConfig, pairs: u32) -> Result
     for i in 0..pairs {
         let name = format!("net-fairness-cli-{}", i);
 
-        let is_completed = |pod: &Pod| -> bool {
-            pod.status
-                .as_ref()
-                .and_then(|s| s.phase.as_ref())
-                .map(|p| p == "Succeeded" || p == "Failed")
-                .unwrap_or(false)
+        let is_pod_completed = async |pod_name: &str| -> bool {
+            if let Ok(pod) = api.get(pod_name).await {
+                return pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.phase.as_ref())
+                    .map(|p| p == "Succeeded" || p == "Failed")
+                    .unwrap_or(false);
+            }
+            false
         };
 
         // First check if pod already completed
-        if let Ok(pod) = api.get(&name).await {
-            if is_completed(&pod) {
-                continue;
-            }
+        if is_pod_completed(&name).await {
+            continue;
         }
 
         // Watch for completion
@@ -647,14 +662,13 @@ async fn wait_for_completion(tenant: &TenantClusterConfig, pairs: u32) -> Result
 
         let mut stream = api.watch(&wp, "0").await?.boxed();
 
-        while let Some(event) = stream.try_next().await? {
-            if let kube::api::WatchEvent::Modified(pod) = event {
-                if is_completed(&pod) {
-                    break;
-                }
+        while let Some(_event) = stream.try_next().await? {
+            if is_pod_completed(&name).await {
+                break;
             }
         }
     }
+    info!("All pods have completed their tests and terminated.");
 
     Ok(())
 }
@@ -693,20 +707,30 @@ async fn collect_results(tenant: &TenantClusterConfig, pairs: u32) -> Result<Vec
 }
 
 async fn cleanup_pods(tenant: &TenantClusterConfig, pairs: u32) -> Result<()> {
-    // First, initiate deletion for all pods
-    for i in 0..pairs {
-        let server_name = format!("net-fairness-srv-{}", i);
-        let client_name = format!("net-fairness-cli-{}", i);
+    // First, initiate deletion for all pods in parallel (without waiting for the one before with another id to finish)
 
-        let _ = tenant
-            .cluster
-            .delete_pod_in_namespace(&server_name, &tenant.namespace)
-            .await;
-        let _ = tenant
-            .cluster
-            .delete_pod_in_namespace(&client_name, &tenant.namespace)
-            .await;
-    }
+    tokio::try_join!(
+        async {
+            for i in 0..pairs {
+                let server_name = format!("net-fairness-srv-{}", i);
+                tenant
+                    .cluster
+                    .delete_pod_in_namespace(&server_name, &tenant.namespace)
+                    .await?;
+            }
+            anyhow::Ok(())
+        },
+        async {
+            for i in 0..pairs {
+                let client_name = format!("net-fairness-cli-{}", i);
+                tenant
+                    .cluster
+                    .delete_pod_in_namespace(&client_name, &tenant.namespace)
+                    .await?;
+            }
+            anyhow::Ok(())
+        }
+    )?;
 
     // Wait for pods to be fully deleted to avoid "AlreadyExists" errors
     // Use timeout to prevent hanging if pods are stuck in Terminating state
@@ -714,16 +738,15 @@ async fn cleanup_pods(tenant: &TenantClusterConfig, pairs: u32) -> Result<()> {
         let server_name = format!("net-fairness-srv-{}", i);
         let client_name = format!("net-fairness-cli-{}", i);
 
-        let _ = tokio::time::timeout(
-            Duration::from_secs(POD_DELETION_TIMEOUT_SECS),
-            tenant.cluster.wait_for_pod_deletion(&server_name, &tenant.namespace),
-        )
-        .await;
-        let _ = tokio::time::timeout(
-            Duration::from_secs(POD_DELETION_TIMEOUT_SECS),
-            tenant.cluster.wait_for_pod_deletion(&client_name, &tenant.namespace),
-        )
-        .await;
+        tenant
+            .cluster
+            .wait_for_pod_deletion(&server_name, &tenant.namespace)
+            .await?;
+
+        tenant
+            .cluster
+            .wait_for_pod_deletion(&client_name, &tenant.namespace)
+            .await?;
     }
 
     Ok(())

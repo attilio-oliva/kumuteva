@@ -21,6 +21,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use colored::Colorize;
 use tokio::sync::Mutex;
+use tracing::info;
 
 use crate::assessment::TenantClusterConfig;
 
@@ -515,6 +516,7 @@ impl FairnessRunner {
         );
 
         // Calculate degradation
+        info!("Calculating degradation...");
         let degradation = FairnessResult::calculate_degradation(
             baseline.tenant1.avg_latency_ms,
             unbalanced.tenant1.avg_latency_ms,
@@ -536,6 +538,8 @@ impl FairnessRunner {
 
         // Export CSV if enabled
         if self.export_csv {
+            info!("Exporting results to CSV...");
+            info!("  Output directory: {}", self.output_dir);
             self.export_to_csv(&result).await?;
         }
 
@@ -544,7 +548,6 @@ impl FairnessRunner {
 
     async fn export_to_csv(&self, result: &FairnessResult) -> Result<()> {
         use tokio::fs;
-        use tokio::io::AsyncWriteExt;
 
         fs::create_dir_all(&self.output_dir).await?;
 
@@ -558,6 +561,7 @@ impl FairnessRunner {
             "{}/{}_baseline_{}.csv",
             self.output_dir, subsystem, timestamp
         );
+        info!("Exporting baseline metrics to {}", baseline_path);
         write_csv(&baseline_path, &result.baseline).await?;
 
         // Export unbalanced
@@ -565,6 +569,7 @@ impl FairnessRunner {
             "{}/{}_unbalanced_{}.csv",
             self.output_dir, subsystem, timestamp
         );
+        info!("Exporting unbalanced metrics to {}", unbalanced_path);
         write_csv(&unbalanced_path, &result.unbalanced).await?;
 
         println!("  📁 Exported to {}/", self.output_dir);

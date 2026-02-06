@@ -4,6 +4,7 @@ mod external_crds;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use assessment::TenantClusterConfig;
@@ -29,15 +30,50 @@ use crate::assessment::{
 
 use crate::cluster::{HostClusterType, K3sCluster, PreExistingCluster};
 
-#[derive(Debug, Parser)]
-#[clap(name = "multi-tenancy-verifier")]
-pub struct Cli {
-    #[clap(subcommand)]
-    command: Commands,
+// ═══════════════════════════════════════════════════════════════════════════
+// DEFAULTS & CONFIGURATION CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod defaults {
+    use super::{RateLimitStrategy, StorageScenario};
+
+    // We define STR variants for clap help text (concat! macro requires literals/str constants)
+    // and typed variants for actual logic.
+
+    pub const BASELINE_DURATION: u64 = 30;
+    pub const TEST_DURATION: u64 = 60;
+
+    pub const RATE_STRATEGY: RateLimitStrategy = RateLimitStrategy::Unlimited;
+
+    pub const RATE: f64 = 10.0;
+    pub const LOAD_MULT: f64 = 1.0;
+    pub const POD_MULT: f64 = 10.0;
+
+    // Subsystem defaults
+    pub const CP_REQUESTERS: usize = 1;
+
+    pub const WL_PODS: u32 = 1;
+    pub const WL_THREADS: u32 = 1;
+    pub const WL_PRIME: u32 = 500_000;
+
+    pub const NET_POD_PAIRS: u32 = 1;
+    pub const NET_STREAMS: u32 = 4;
+    pub const NET_PACKET_SIZE: u32 = 512;
+
+    pub const ST_PODS: u32 = 1;
+    pub const ST_BLOCK_SIZE: u32 = 4;
+    pub const ST_FILE_SIZE: u32 = 100;
+    pub const ST_SCENARIO: StorageScenario = StorageScenario::Random;
+
+    pub const OUTPUT_DIR: &str = "fairness_results";
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TYPES & ENUMS
+// ═══════════════════════════════════════════════════════════════════════════
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum ClusterEnvironmentType {
+pub enum ClusterEnvironmentType {
     #[clap(name = "native", alias = "na")]
     Native,
     #[clap(name = "capsule", alias = "cap", alias = "caps")]
@@ -78,14 +114,475 @@ enum ChosenClusterProvider {
     None,
 }
 
-impl ChosenClusterProvider {
-    fn as_str(&self) -> &str {
-        match self {
-            ChosenClusterProvider::Kind => "kind",
-            ChosenClusterProvider::K3s => "k3s",
-            ChosenClusterProvider::None => "none",
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq)]
+pub enum StorageScenario {
+    Random,
+    Sequential,
+}
+
+impl From<StorageScenario> for FairnessStorageScenario {
+    fn from(scenario: StorageScenario) -> Self {
+        match scenario {
+            StorageScenario::Random => FairnessStorageScenario::RandomIO,
+            StorageScenario::Sequential => FairnessStorageScenario::SequentialIO,
         }
     }
+}
+
+fn parse_storage_scenario_from_str(s: &str) -> Option<StorageScenario> {
+    match s.to_lowercase().as_str() {
+        "random" => Some(StorageScenario::Random),
+        "sequential" | "seq" => Some(StorageScenario::Sequential),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq)]
+pub enum RateLimitStrategy {
+    Unlimited,
+    FixedDelay,
+    Adaptive,
+}
+
+impl From<RateLimitStrategy> for FairnessRateLimitStrategy {
+    fn from(strategy: RateLimitStrategy) -> Self {
+        match strategy {
+            RateLimitStrategy::Unlimited => FairnessRateLimitStrategy::Unlimited,
+            RateLimitStrategy::FixedDelay => FairnessRateLimitStrategy::FixedDelay,
+            RateLimitStrategy::Adaptive => FairnessRateLimitStrategy::Adaptive,
+        }
+    }
+}
+
+fn parse_rate_strategy_from_str(s: &str) -> Option<RateLimitStrategy> {
+    match s.to_lowercase().as_str() {
+        "unlimited" => Some(RateLimitStrategy::Unlimited),
+        "fixeddelay" | "fixed_delay" | "fixed-delay" => Some(RateLimitStrategy::FixedDelay),
+        "adaptive" => Some(RateLimitStrategy::Adaptive),
+        _ => None,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIGURATION LAYERS (BUILDER PATTERN)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The Final, Clean Configuration Struct
+#[derive(Debug, Clone)]
+pub struct FairnessConfig {
+    pub baseline_duration: Duration,
+    pub test_duration: Duration,
+    pub rate_strategy: RateLimitStrategy,
+    pub rate_limit: f64,
+    pub load_multiplier: f64,
+    pub pod_multiplier: f64,
+
+    // Subsystem enable flags
+    pub run_cp: bool,
+    pub run_storage: bool,
+    pub run_network: bool,
+    pub run_workload: bool,
+
+    // Subsystem configs
+    pub cp_rate: f64,
+    pub cp_requesters: usize,
+
+    pub net_rate: f64,
+    pub net_pod_pairs: u32,
+    pub net_streams: u32,
+    pub net_packet_size: u32,
+
+    pub st_rate: f64,
+    pub st_pods: u32,
+    pub st_block_size: u32,
+    pub st_file_size: u32,
+    pub st_scenario: StorageScenario,
+
+    pub wl_rate: f64,
+    pub wl_pods: u32,
+    pub wl_threads: u32,
+    pub wl_max_prime: u32,
+
+    pub export_csv: bool,
+    pub output_dir: String,
+}
+
+/// Layer 1: YAML Configuration
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct FairnessYamlLayer {
+    #[serde(default)]
+    global: GlobalConfigYaml,
+    #[serde(default)]
+    control_plane: ControlPlaneConfigYaml,
+    #[serde(default)]
+    network: NetworkConfigYaml,
+    #[serde(default)]
+    storage: StorageConfigYaml,
+    #[serde(default)]
+    workload: WorkloadConfigYaml,
+    #[serde(default)]
+    export: ExportConfigYaml,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GlobalConfigYaml {
+    baseline_duration_seconds: Option<u64>,
+    test_duration_seconds: Option<u64>,
+    rate_strategy: Option<String>,
+    rate: Option<f64>,
+    load_multiplier: Option<f64>,
+    pod_multiplier: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ControlPlaneConfigYaml {
+    enabled: Option<bool>,
+    rate: Option<f64>,
+    requesters: Option<usize>,
+}
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NetworkConfigYaml {
+    enabled: Option<bool>,
+    rate: Option<f64>,
+    pod_pairs: Option<u32>,
+    streams: Option<u32>,
+    packet_size_bytes: Option<u32>,
+}
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct StorageConfigYaml {
+    enabled: Option<bool>,
+    rate: Option<f64>,
+    pods: Option<u32>,
+    block_size_kb: Option<u32>,
+    file_size_mb: Option<u32>,
+    scenario: Option<String>,
+}
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WorkloadConfigYaml {
+    enabled: Option<bool>,
+    rate: Option<f64>,
+    pods: Option<u32>,
+    threads: Option<u32>,
+    max_prime: Option<u32>,
+}
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ExportConfigYaml {
+    csv: Option<bool>,
+    output_dir: Option<String>,
+}
+
+/// Layer 2: CLI Configuration
+#[derive(Debug, Parser, Default)]
+pub struct FairnessCliLayer {
+    /// Path to tenant1 kubeconfig file (regular tenant) [required]
+    #[clap(value_name = "tenant1-kubeconfig")]
+    pub tenant1_kubeconfig_path: PathBuf,
+    /// Path to tenant2 kubeconfig file (malicious tenant) [required]
+    #[clap(value_name = "tenant2-kubeconfig")]
+    pub tenant2_kubeconfig_path: PathBuf,
+
+    /// Path to YAML configuration file
+    #[clap(long = "config", short = 'f')]
+    pub config_file: Option<PathBuf>,
+
+    /// Namespace for tenant1
+    #[clap(long = "tenant1-ns", default_value = "tenant1")]
+    pub tenant1_namespace: String,
+    /// Namespace for tenant2
+    #[clap(long = "tenant2-ns", default_value = "tenant2")]
+    pub tenant2_namespace: String,
+
+    // Flags (Implicit booleans)
+    #[clap(long = "control-plane", alias = "cp")]
+    pub control_plane: bool,
+    #[clap(long = "storage", alias = "st")]
+    pub storage: bool,
+    #[clap(long = "network", alias = "net")]
+    pub network: bool,
+    #[clap(long = "workload", alias = "wl")]
+    pub workload: bool,
+
+    /// Duration of baseline phase in seconds (balanced scenario) [default: 30s]
+    #[clap(long)]
+    pub baseline_duration: Option<u64>,
+
+    /// Duration of test phase in seconds (unbalanced scenario) [default: 60s]
+    #[clap(long)]
+    pub test_duration: Option<u64>,
+
+    /// Rate strategy [default: unlimited]
+    #[clap(long, value_enum)]
+    pub rate_strategy: Option<RateLimitStrategy>,
+
+    /// Overall request rate limit for malicious tenant (applies to all subsystems unless overridden) [default: 10.0 req/s]
+    #[clap(long = "rate")]
+    pub rate_limit: Option<f64>,
+
+    /// Malicious load multiplier (how much moore req/s per pod) [default: 1.0]
+    #[clap(long)]
+    pub load_multiplier: Option<f64>,
+
+    /// Malicious pod multiplier [default: 10]
+    #[clap(long)]
+    pub pod_multiplier: Option<f64>,
+
+    // Subsystem Overrides
+    /// Custom rate limit for control plane assessment (overrides global rate)
+    #[clap(long)]
+    pub cp_rate: Option<f64>,
+    /// Custom rate limit for network assessment (overrides global rate)
+    #[clap(long)]
+    pub net_rate: Option<f64>,
+    /// Custom rate limit for storage assessment (overrides global rate)
+    #[clap(long)]
+    pub st_rate: Option<f64>,
+    /// Custom rate limit for workload assessment (overrides global rate)
+    #[clap(long)]
+    pub wl_rate: Option<f64>,
+
+    // Subsystem Details
+    /// Number of concurrent requesters for control plane assessment [default: 1]
+    #[clap(long)]
+    pub cp_requesters: Option<usize>,
+
+    /// Number of workload pods to run in parallel [default: 1]
+    #[clap(long)]
+    pub wl_pods: Option<u32>,
+    /// Number of threads per workload pod [default: 1]
+    #[clap(long)]
+    pub wl_threads: Option<u32>,
+    /// Max prime number for CPU stress in workload assessment [default: 500000]
+    #[clap(long)]
+    pub wl_max_prime: Option<u32>,
+
+    /// Number of network pod pairs (client/server) [default: 1]
+    #[clap(long)]
+    pub net_pod_pairs: Option<u32>,
+    /// Number of network streams per pod pair [default: 4]
+    #[clap(long)]
+    pub net_streams: Option<u32>,
+    /// Network packet size in bytes [default: 512]
+    #[clap(long)]
+    pub net_packet_size: Option<u32>,
+
+    /// Number of storage pods to run in parallel [default: 1]
+    #[clap(long)]
+    pub st_pods: Option<u32>,
+    /// Storage block size in KB [default: 4]
+    #[clap(long)]
+    pub st_block_size: Option<u32>,
+    /// Storage file size in MB [default: 100]
+    #[clap(long)]
+    pub st_file_size: Option<u32>,
+    /// Storage scenario [default: random]
+    #[clap(long, value_enum)]
+    pub st_scenario: Option<StorageScenario>,
+
+    // Export
+    /// Export results to CSV file(s) [default: false]
+    #[clap(long)]
+    pub export_csv: bool,
+
+    /// Output directory for CSV export [default: fairness_results]
+    #[clap(short = 'o', long)]
+    pub output_dir: Option<String>,
+
+    /// Enable verbose output [default: false]
+    #[clap(long, default_value = "false")]
+    pub verbose: bool,
+}
+
+/// The Builder Logic
+#[derive(Default)]
+pub struct FairnessConfigBuilder {
+    yaml: Option<FairnessYamlLayer>,
+    cli: Option<FairnessCliLayer>,
+}
+
+impl FairnessConfigBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_yaml(mut self, path: Option<&PathBuf>) -> anyhow::Result<Self> {
+        if let Some(p) = path {
+            let content = std::fs::read_to_string(p)
+                .with_context(|| format!("Failed to read config file: {}", p.display()))?;
+            let yaml: FairnessYamlLayer = serde_yaml::from_str(&content)
+                .with_context(|| format!("Failed to parse YAML config: {}", p.display()))?;
+            self.yaml = Some(yaml);
+        }
+        Ok(self)
+    }
+
+    pub fn with_cli(mut self, cli: FairnessCliLayer) -> Self {
+        self.cli = Some(cli);
+        self
+    }
+
+    pub fn build(self) -> FairnessConfig {
+        let cli = self.cli.unwrap_or_default();
+        let yaml = self.yaml.unwrap_or_default();
+
+        // 1. Resolve Global Settings
+        let baseline_duration = cli
+            .baseline_duration
+            .or(yaml.global.baseline_duration_seconds)
+            .unwrap_or(defaults::BASELINE_DURATION);
+
+        let test_duration = cli
+            .test_duration
+            .or(yaml.global.test_duration_seconds)
+            .unwrap_or(defaults::TEST_DURATION);
+
+        let rate_strategy = cli
+            .rate_strategy
+            .or_else(|| {
+                yaml.global
+                    .rate_strategy
+                    .as_deref()
+                    .and_then(parse_rate_strategy_from_str)
+            })
+            .unwrap_or(defaults::RATE_STRATEGY);
+
+        let rate_limit = cli
+            .rate_limit
+            .or(yaml.global.rate)
+            .unwrap_or(defaults::RATE);
+
+        let load_multiplier = cli
+            .load_multiplier
+            .or(yaml.global.load_multiplier)
+            .unwrap_or(defaults::LOAD_MULT);
+
+        let pod_multiplier = cli
+            .pod_multiplier
+            .or(yaml.global.pod_multiplier)
+            .unwrap_or(defaults::POD_MULT);
+
+        // 2. Resolve Execution Flags
+        let any_cli_flag = cli.control_plane || cli.storage || cli.network || cli.workload;
+        let any_yaml_flag = yaml.control_plane.enabled.is_some()
+            || yaml.network.enabled.is_some()
+            || yaml.storage.enabled.is_some()
+            || yaml.workload.enabled.is_some();
+
+        let (run_cp, run_st, run_net, run_wl) = if any_cli_flag {
+            (cli.control_plane, cli.storage, cli.network, cli.workload)
+        } else if any_yaml_flag {
+            (
+                yaml.control_plane.enabled.unwrap_or(false),
+                yaml.storage.enabled.unwrap_or(false),
+                yaml.network.enabled.unwrap_or(false),
+                yaml.workload.enabled.unwrap_or(false),
+            )
+        } else {
+            (true, true, true, true)
+        };
+
+        // 3. Resolve Subsystems
+
+        // Storage
+        let st_scenario = cli
+            .st_scenario
+            .or_else(|| {
+                yaml.storage
+                    .scenario
+                    .as_deref()
+                    .and_then(parse_storage_scenario_from_str)
+            })
+            .unwrap_or(defaults::ST_SCENARIO);
+
+        FairnessConfig {
+            baseline_duration: Duration::from_secs(baseline_duration),
+            test_duration: Duration::from_secs(test_duration),
+            rate_strategy,
+            rate_limit,
+            load_multiplier,
+            pod_multiplier,
+
+            run_cp,
+            run_storage: run_st,
+            run_network: run_net,
+            run_workload: run_wl,
+
+            cp_rate: cli
+                .cp_rate
+                .or(yaml.control_plane.rate)
+                .unwrap_or(rate_limit),
+            cp_requesters: cli
+                .cp_requesters
+                .or(yaml.control_plane.requesters)
+                .unwrap_or(defaults::CP_REQUESTERS),
+
+            net_rate: cli.net_rate.or(yaml.network.rate).unwrap_or(rate_limit),
+            net_pod_pairs: cli
+                .net_pod_pairs
+                .or(yaml.network.pod_pairs)
+                .unwrap_or(defaults::NET_POD_PAIRS),
+            net_streams: cli
+                .net_streams
+                .or(yaml.network.streams)
+                .unwrap_or(defaults::NET_STREAMS),
+            net_packet_size: cli
+                .net_packet_size
+                .or(yaml.network.packet_size_bytes)
+                .unwrap_or(defaults::NET_PACKET_SIZE),
+
+            st_rate: cli.st_rate.or(yaml.storage.rate).unwrap_or(rate_limit),
+            st_pods: cli
+                .st_pods
+                .or(yaml.storage.pods)
+                .unwrap_or(defaults::ST_PODS),
+            st_block_size: cli
+                .st_block_size
+                .or(yaml.storage.block_size_kb)
+                .unwrap_or(defaults::ST_BLOCK_SIZE),
+            st_file_size: cli
+                .st_file_size
+                .or(yaml.storage.file_size_mb)
+                .unwrap_or(defaults::ST_FILE_SIZE),
+            st_scenario,
+
+            wl_rate: cli.wl_rate.or(yaml.workload.rate).unwrap_or(rate_limit),
+            wl_pods: cli
+                .wl_pods
+                .or(yaml.workload.pods)
+                .unwrap_or(defaults::WL_PODS),
+            wl_threads: cli
+                .wl_threads
+                .or(yaml.workload.threads)
+                .unwrap_or(defaults::WL_THREADS),
+            wl_max_prime: cli
+                .wl_max_prime
+                .or(yaml.workload.max_prime)
+                .unwrap_or(defaults::WL_PRIME),
+
+            export_csv: cli.export_csv || yaml.export.csv.unwrap_or(false),
+            output_dir: cli
+                .output_dir
+                .or(yaml.export.output_dir)
+                .unwrap_or_else(|| defaults::OUTPUT_DIR.to_string()),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLI MAIN STRUCTURES
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Parser)]
+#[clap(name = "multi-tenancy-verifier")]
+pub struct Cli {
+    #[clap(subcommand)]
+    command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,13 +595,11 @@ enum Commands {
         existing_cluster_kubeconfig: Option<PathBuf>,
 
         /// Output directory for generated kubeconfig files
-        /// If not specified, defaults to /tmp
         #[clap(long = "output", short = 'o')]
         output_dir: Option<PathBuf>,
 
         /// Name of the cluster to use or create.
-        /// It is used as a prefix and followed by the environment type (e.g. test-vcluster).
-        #[clap(long, default_value = "kumuteva")]
+        #[clap(long)]
         cluster_name: String,
 
         /// Multitenancy solution for handling tenant clusters
@@ -154,333 +649,11 @@ enum Commands {
         verbose: bool,
     },
     /// Run fairness assessment tests between two tenants
-    Fairness {
-        /// Path to tenant1 kubeconfig file (regular tenant) [required]
-        #[clap(value_name = "tenant1-kubeconfig")]
-        tenant1_kubeconfig_path: PathBuf,
-        /// Path to tenant2 kubeconfig file (malicious tenant) [required]
-        #[clap(value_name = "tenant2-kubeconfig")]
-        tenant2_kubeconfig_path: PathBuf,
-
-        /// Path to YAML configuration file (CLI options override file settings)
-        #[clap(long = "config", short = 'f')]
-        config_file: Option<PathBuf>,
-
-        /// Namespace for tenant1
-        #[clap(long = "tenant1-ns", default_value = "tenant1")]
-        tenant1_namespace: String,
-        /// Namespace for tenant2
-        #[clap(long = "tenant2-ns", default_value = "tenant2")]
-        tenant2_namespace: String,
-
-        /// Assess control plane fairness
-        #[clap(long = "control-plane", alias = "cp")]
-        control_plane: bool,
-        /// Assess storage fairness
-        #[clap(long = "storage", alias = "st")]
-        storage: bool,
-        /// Assess network fairness
-        #[clap(long = "network", alias = "net")]
-        network: bool,
-        /// Assess workload (CPU) fairness
-        #[clap(long = "workload", alias = "wl")]
-        workload: bool,
-
-        /// Duration for baseline measurement in seconds
-        #[clap(long, default_value = "30")]
-        baseline_duration: u64,
-        /// Duration for unbalanced test phase in seconds
-        #[clap(long, default_value = "60")]
-        test_duration: u64,
-
-        /// Rate limiting strategy for the runner
-        #[clap(long, default_value = "unlimited", value_enum)]
-        rate_strategy: RateLimitStrategy,
-        /// Default request rate limit (requests/second) - only used with non-unlimited strategies
-        #[clap(long = "rate", default_value = "10.0")]
-        rate_limit: f64,
-        /// Rate multiplier for malicious tenant (e.g., 10.0 = 10x normal rate)
-        #[clap(long, default_value = "1.0")]
-        load_multiplier: f64,
-        /// Pod multiplier for malicious tenant (e.g., 2.0 = 2x pods)
-        #[clap(long, default_value = "10.0")]
-        pod_multiplier: f64,
-
-        /// Control plane specific rate limit (overrides --rate-limit for CP tests)
-        #[clap(long)]
-        cp_rate: Option<f64>,
-        /// Network specific rate limit (overrides --rate-limit for network tests)
-        #[clap(long)]
-        net_rate: Option<f64>,
-        /// Storage specific rate limit (overrides --rate-limit for storage tests)
-        #[clap(long)]
-        st_rate: Option<f64>,
-        /// Workload specific rate limit (overrides --rate-limit for workload tests)
-        #[clap(long)]
-        wl_rate: Option<f64>,
-
-        /// Number of concurrent requesters for control plane tests
-        #[clap(long, default_value = "1")]
-        cp_requesters: usize,
-
-        /// Number of benchmark pods per tenant for workload tests
-        #[clap(long, default_value = "1")]
-        wl_pods: u32,
-        /// Number of CPU threads per workload benchmark pod
-        #[clap(long, default_value = "1")]
-        wl_threads: u32,
-        /// Max prime number for workload benchmark (higher = longer task)
-        #[clap(long, default_value = "500000")]
-        wl_max_prime: u32,
-
-        /// Number of TCP ping client-server pod pairs for network tests
-        #[clap(long, default_value = "1")]
-        net_pod_pairs: u32,
-        /// Number of parallel streams per network client (like iperf3 -P)
-        #[clap(long, default_value = "4")]
-        net_streams: u32,
-        /// Packet payload size in bytes for network tests
-        #[clap(long, default_value = "64")]
-        net_packet_size: u32,
-
-        /// Number of I/O benchmark pods per tenant for storage tests
-        #[clap(long, default_value = "1")]
-        st_pods: u32,
-        /// I/O block size in KB for storage tests
-        #[clap(long, default_value = "4")]
-        st_block_size: u32,
-        /// File size in MB for storage tests
-        #[clap(long, default_value = "100")]
-        st_file_size: u32,
-        /// Storage test scenario: random or sequential
-        #[clap(long, default_value = "random", value_parser = parse_storage_scenario)]
-        st_scenario: StorageScenario,
-
-        /// Export results to CSV files
-        #[clap(long)]
-        export_csv: bool,
-        /// Output directory for CSV export (default: fairness_results)
-        #[clap(long, default_value = "fairness_results")]
-        output_dir: String,
-
-        /// Enable verbose output
-        #[clap(long, default_value = "false")]
-        verbose: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum StorageScenario {
-    Random,
-    Sequential,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum RateLimitStrategy {
-    /// No rate limiting - run as fast as possible
-    Unlimited,
-    /// Fixed delay between requests
-    FixedDelay,
-    /// Adaptive rate adjustment based on feedback
-    Adaptive,
-}
-
-impl From<RateLimitStrategy> for FairnessRateLimitStrategy {
-    fn from(strategy: RateLimitStrategy) -> Self {
-        match strategy {
-            RateLimitStrategy::Unlimited => FairnessRateLimitStrategy::Unlimited,
-            RateLimitStrategy::FixedDelay => FairnessRateLimitStrategy::FixedDelay,
-            RateLimitStrategy::Adaptive => FairnessRateLimitStrategy::Adaptive,
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// YAML Configuration Structures for Fairness Tests
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Root configuration structure for fairness tests loaded from YAML
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct FairnessYamlConfig {
-    /// API version for config format compatibility
-    #[serde(default)]
-    api_version: Option<String>,
-    /// Global settings that apply to all subsystems
-    #[serde(default)]
-    global: GlobalConfig,
-    /// Control plane specific configuration
-    #[serde(default, rename = "controlPlane")]
-    control_plane: ControlPlaneYamlConfig,
-    /// Network specific configuration
-    #[serde(default)]
-    network: NetworkYamlConfig,
-    /// Storage specific configuration
-    #[serde(default)]
-    storage: StorageYamlConfig,
-    /// Workload (CPU) specific configuration
-    #[serde(default)]
-    workload: WorkloadYamlConfig,
-    /// Export settings
-    #[serde(default)]
-    export: ExportYamlConfig,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct GlobalConfig {
-    /// Duration for baseline measurement in seconds
-    #[serde(default)]
-    baseline_duration_seconds: Option<u64>,
-    /// Duration for test phase in seconds
-    #[serde(default)]
-    test_duration_seconds: Option<u64>,
-    /// Rate limiting strategy: "unlimited", "fixedDelay", or "adaptive"
-    #[serde(default)]
-    rate_strategy: Option<String>,
-    /// Default request rate (requests/second)
-    #[serde(default)]
-    rate: Option<f64>,
-    /// Rate multiplier for malicious tenant
-    #[serde(default)]
-    load_multiplier: Option<f64>,
-    /// Pod multiplier for malicious tenant
-    #[serde(default)]
-    pod_multiplier: Option<f64>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct ControlPlaneYamlConfig {
-    /// Enable control plane fairness test
-    #[serde(default)]
-    enabled: Option<bool>,
-    /// Override rate for control plane tests
-    #[serde(default)]
-    rate: Option<f64>,
-    /// Number of concurrent requesters
-    #[serde(default)]
-    requesters: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct NetworkYamlConfig {
-    /// Enable network fairness test
-    #[serde(default)]
-    enabled: Option<bool>,
-    /// Override rate for network tests (packets/s)
-    #[serde(default)]
-    rate: Option<f64>,
-    /// Number of TCP ping client-server pod pairs
-    #[serde(default)]
-    pod_pairs: Option<u32>,
-    /// Number of parallel streams per client (like iperf3 -P)
-    #[serde(default)]
-    streams: Option<u32>,
-    /// Packet payload size in bytes
-    #[serde(default)]
-    packet_size_bytes: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct StorageYamlConfig {
-    /// Enable storage fairness test
-    #[serde(default)]
-    enabled: Option<bool>,
-    /// Override rate for storage tests
-    #[serde(default)]
-    rate: Option<f64>,
-    /// Number of I/O benchmark pods
-    #[serde(default)]
-    pods: Option<u32>,
-    /// I/O block size in KB
-    #[serde(default)]
-    block_size_kb: Option<u32>,
-    /// File size in MB
-    #[serde(default)]
-    file_size_mb: Option<u32>,
-    /// Test scenario: "random" or "sequential"
-    #[serde(default)]
-    scenario: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct WorkloadYamlConfig {
-    /// Enable workload fairness test
-    #[serde(default)]
-    enabled: Option<bool>,
-    /// Override rate for workload tests
-    #[serde(default)]
-    rate: Option<f64>,
-    /// Number of benchmark pods
-    #[serde(default)]
-    pods: Option<u32>,
-    /// Number of CPU threads per pod
-    #[serde(default)]
-    threads: Option<u32>,
-    /// Max prime number for benchmark
-    #[serde(default)]
-    max_prime: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct ExportYamlConfig {
-    /// Enable CSV export
-    #[serde(default)]
-    csv: Option<bool>,
-    /// Output directory for exports
-    #[serde(default)]
-    output_dir: Option<String>,
-}
-
-impl FairnessYamlConfig {
-    /// Load configuration from a YAML file
-    fn load_from_file(path: &PathBuf) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: FairnessYamlConfig = serde_yaml::from_str(&content)
-            .with_context(|| format!("Failed to parse YAML config: {}", path.display()))?;
-        Ok(config)
-    }
-}
-
-fn parse_rate_strategy_from_str(s: &str) -> Option<RateLimitStrategy> {
-    match s.to_lowercase().as_str() {
-        "unlimited" => Some(RateLimitStrategy::Unlimited),
-        "fixeddelay" | "fixed_delay" | "fixed-delay" => Some(RateLimitStrategy::FixedDelay),
-        "adaptive" => Some(RateLimitStrategy::Adaptive),
-        _ => None,
-    }
-}
-
-fn parse_storage_scenario(s: &str) -> Result<StorageScenario, String> {
-    match s.to_lowercase().as_str() {
-        "random" => Ok(StorageScenario::Random),
-        "sequential" | "seq" => Ok(StorageScenario::Sequential),
-        _ => Err(format!(
-            "Invalid storage scenario: {}. Use 'random' or 'sequential'",
-            s
-        )),
-    }
-}
-
-impl From<StorageScenario> for FairnessStorageScenario {
-    fn from(scenario: StorageScenario) -> Self {
-        match scenario {
-            StorageScenario::Random => FairnessStorageScenario::RandomIO,
-            StorageScenario::Sequential => FairnessStorageScenario::SequentialIO,
-        }
-    }
+    Fairness(FairnessCliLayer),
 }
 
 #[derive(Debug, Parser)]
 struct Tenant1SetupConfig {
-    /// Short style: Provide tenant namespace and optional mapping.
-    /// Example: --tenant1 tenant1-namespace [TENANT1_MAPPING]
     #[clap(
         long = "tenant1",
         name = "tenant1",
@@ -489,29 +662,18 @@ struct Tenant1SetupConfig {
         conflicts_with_all = &["tenant1_ns", "tenant1_mapping"]
     )]
     tenant1_short: Option<Vec<String>>,
-
-    /// Long style: Tenant namespace.
     #[clap(
         long = "tenant1-ns",
         default_value = "tenant1",
         conflicts_with = "tenant1"
     )]
     tenant1_ns: String,
-
-    /// Long style: Port mapping in format containerPort:hostPort.
-    #[clap(
-        long = "tenant1-mapping",
-        value_parser = parse_mapping,
-        default_value = "30010:30001",
-        conflicts_with = "tenant1"
-    )]
+    #[clap(long = "tenant1-mapping", value_parser = parse_mapping, default_value = "30010:30001", conflicts_with = "tenant1")]
     tenant1_mapping: (u16, u16),
 }
 
 #[derive(Debug, Parser)]
 struct Tenant2SetupConfig {
-    /// Short style: Provide tenant namespace and optional mapping.
-    /// Example: --tenant2 tenant2-namespace [TENANT2_MAPPING]
     #[clap(
         long = "tenant2",
         name = "tenant2",
@@ -520,63 +682,19 @@ struct Tenant2SetupConfig {
         conflicts_with_all = &["tenant2_ns", "tenant2_mapping"]
     )]
     tenant2_short: Option<Vec<String>>,
-
-    /// Long style: Tenant namespace.
     #[clap(
         long = "tenant2-ns",
         default_value = "tenant2",
         conflicts_with = "tenant2"
     )]
     tenant2_ns: String,
-
-    /// Long style: Port mapping in format containerPort:hostPort.
-    #[clap(
-        long = "tenant2-mapping",
-        value_parser = parse_mapping,
-        default_value = "30020:30002",
-        conflicts_with = "tenant2"
-    )]
+    #[clap(long = "tenant2-mapping", value_parser = parse_mapping, default_value = "30020:30002", conflicts_with = "tenant2")]
     tenant2_mapping: (u16, u16),
 }
 
-fn resolve_tenant_config(
-    short: &Option<Vec<String>>,
-    default_ns: &str,
-    default_mapping: &(u16, u16),
-) -> anyhow::Result<(String, (u16, u16))> {
-    let tenant_ns = if let Some(short_values) = short {
-        short_values
-            .first()
-            .cloned()
-            .unwrap_or_else(|| default_ns.to_string())
-    } else {
-        String::from(default_ns)
-    };
-
-    let tenant_mapping = if let Some(short_values) = short {
-        if short_values.len() > 1 {
-            parse_mapping(&short_values[1])?
-        } else {
-            *default_mapping
-        }
-    } else {
-        *default_mapping
-    };
-
-    Ok((tenant_ns, tenant_mapping))
-}
-
-impl Tenant1SetupConfig {
-    fn get_config(&self) -> anyhow::Result<(String, (u16, u16))> {
-        resolve_tenant_config(&self.tenant1_short, &self.tenant1_ns, &self.tenant1_mapping)
-    }
-}
-
-impl Tenant2SetupConfig {
-    fn get_config(&self) -> anyhow::Result<(String, (u16, u16))> {
-        resolve_tenant_config(&self.tenant2_short, &self.tenant2_ns, &self.tenant2_mapping)
-    }
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -594,7 +712,6 @@ async fn main() -> anyhow::Result<()> {
             verbose,
         } => {
             setup_logging(verbose)?;
-
             println!("Setting up test environment...");
             let cluster_name = format!("{}-{}", cluster_name, kind.as_str());
             setup_test_environment(
@@ -622,36 +739,25 @@ async fn main() -> anyhow::Result<()> {
         } => {
             setup_logging(verbose)?;
             println!("Verifying cluster isolation...");
-
-            // Build assessment config: if no flags specified, run all; otherwise only specified ones
             let assessment_config =
                 AssessmentConfig::from_flags(control_plane, storage, network, workload);
             println!("Assessment config: {}", assessment_config);
 
-            let tenant1_config = TenantClusterConfig {
+            let tenant1_config = Arc::new(TenantClusterConfig {
                 cluster: KubernetesClient::load_with_retry(&tenant1_kubeconfig_path, 5).await?,
                 namespace: tenant1_namespace,
-            };
-            let tenant2_config = TenantClusterConfig {
+            });
+            let tenant2_config = Arc::new(TenantClusterConfig {
                 cluster: KubernetesClient::load_with_retry(&tenant2_kubeconfig_path, 5).await?,
                 namespace: tenant2_namespace,
-            };
+            });
 
-            let tenant1_config = Arc::new(tenant1_config);
-            let tenant2_config = Arc::new(tenant2_config);
+            let report =
+                assessment::assess_multitenancy(tenant1_config, tenant2_config, &assessment_config)
+                    .await
+                    .context("Failed to run multitenancy assessment")?;
 
-            let report = assessment::assess_multitenancy(
-                tenant1_config.clone(),
-                tenant2_config.clone(),
-                &assessment_config,
-            )
-            .await
-            .context("Failed to run multitenancy assessment")?;
-
-            println!();
-            println!("Cluster isolation assessment report:");
-
-            // Print individual subsystem reports if available
+            println!("\nCluster isolation assessment report:");
             if let Some(cp) = &report.control_plane {
                 println!("{}", cp);
             }
@@ -666,342 +772,181 @@ async fn main() -> anyhow::Result<()> {
             }
             println!("{}", report);
         }
-        Commands::Fairness {
-            tenant1_kubeconfig_path,
-            tenant2_kubeconfig_path,
-            config_file,
-            tenant1_namespace,
-            tenant2_namespace,
-            control_plane,
-            storage,
-            network,
-            workload,
-            baseline_duration,
-            test_duration,
-            rate_strategy,
-            rate_limit,
-            load_multiplier,
-            pod_multiplier,
-            cp_rate,
-            net_rate,
-            st_rate,
-            wl_rate,
-            cp_requesters,
-            wl_pods,
-            wl_threads,
-            wl_max_prime,
-            net_pod_pairs,
-            net_streams,
-            net_packet_size,
-            st_pods,
-            st_block_size,
-            st_file_size,
-            st_scenario,
-            export_csv,
-            output_dir,
-            verbose,
-        } => {
-            setup_logging(verbose)?;
+        Commands::Fairness(cli_args) => {
+            setup_logging(cli_args.verbose)?;
             println!("Running fairness assessment...\n");
 
-            // Load YAML config if provided
-            let yaml_config = if let Some(ref config_path) = config_file {
-                println!("Loading configuration from: {}\n", config_path.display());
-                Some(FairnessYamlConfig::load_from_file(config_path)?)
-            } else {
-                None
-            };
+            // Build Configuration (CLI > YAML > Defaults)
+            let config_path = cli_args.config_file.clone();
 
-            // Merge CLI and YAML config (CLI takes precedence)
-            // Global settings
-            let baseline_duration = yaml_config
-                .as_ref()
-                .and_then(|c| c.global.baseline_duration_seconds)
-                .unwrap_or(baseline_duration);
-            let test_duration = yaml_config
-                .as_ref()
-                .and_then(|c| c.global.test_duration_seconds)
-                .unwrap_or(test_duration);
-            let rate_strategy = yaml_config
-                .as_ref()
-                .and_then(|c| c.global.rate_strategy.as_ref())
-                .and_then(|s| parse_rate_strategy_from_str(s))
-                .unwrap_or(rate_strategy);
-            let rate_limit = yaml_config
-                .as_ref()
-                .and_then(|c| c.global.rate)
-                .unwrap_or(rate_limit);
-            let load_multiplier = yaml_config
-                .as_ref()
-                .and_then(|c| c.global.load_multiplier)
-                .unwrap_or(load_multiplier);
-            let pod_multiplier = yaml_config
-                .as_ref()
-                .and_then(|c| c.global.pod_multiplier)
-                .unwrap_or(pod_multiplier);
+            if let Some(ref path) = config_path {
+                println!("Loading configuration from: {}\n", path.display());
+            }
 
-            // Control plane settings
-            let cp_rate =
-                cp_rate.or_else(|| yaml_config.as_ref().and_then(|c| c.control_plane.rate));
-            let cp_requesters = yaml_config
-                .as_ref()
-                .and_then(|c| c.control_plane.requesters)
-                .unwrap_or(cp_requesters);
+            let t1_path = cli_args.tenant1_kubeconfig_path.clone();
+            let t2_path = cli_args.tenant2_kubeconfig_path.clone();
+            let t1_ns = cli_args.tenant1_namespace.clone();
+            let t2_ns = cli_args.tenant2_namespace.clone();
 
-            // Network settings
-            let net_rate = net_rate.or_else(|| yaml_config.as_ref().and_then(|c| c.network.rate));
-            let net_pod_pairs = yaml_config
-                .as_ref()
-                .and_then(|c| c.network.pod_pairs)
-                .unwrap_or(net_pod_pairs);
-            let net_streams = yaml_config
-                .as_ref()
-                .and_then(|c| c.network.streams)
-                .unwrap_or(net_streams);
-            let net_packet_size = yaml_config
-                .as_ref()
-                .and_then(|c| c.network.packet_size_bytes)
-                .unwrap_or(net_packet_size);
-
-            // Storage settings
-            let st_rate = st_rate.or_else(|| yaml_config.as_ref().and_then(|c| c.storage.rate));
-            let st_pods = yaml_config
-                .as_ref()
-                .and_then(|c| c.storage.pods)
-                .unwrap_or(st_pods);
-            let st_block_size = yaml_config
-                .as_ref()
-                .and_then(|c| c.storage.block_size_kb)
-                .unwrap_or(st_block_size);
-            let st_file_size = yaml_config
-                .as_ref()
-                .and_then(|c| c.storage.file_size_mb)
-                .unwrap_or(st_file_size);
-            let st_scenario = yaml_config
-                .as_ref()
-                .and_then(|c| c.storage.scenario.as_ref())
-                .and_then(|s| parse_storage_scenario(s).ok())
-                .unwrap_or(st_scenario);
-
-            // Workload settings
-            let wl_rate = wl_rate.or_else(|| yaml_config.as_ref().and_then(|c| c.workload.rate));
-            let wl_pods = yaml_config
-                .as_ref()
-                .and_then(|c| c.workload.pods)
-                .unwrap_or(wl_pods);
-            let wl_threads = yaml_config
-                .as_ref()
-                .and_then(|c| c.workload.threads)
-                .unwrap_or(wl_threads);
-            let wl_max_prime = yaml_config
-                .as_ref()
-                .and_then(|c| c.workload.max_prime)
-                .unwrap_or(wl_max_prime);
-
-            // Export settings
-            let export_csv = export_csv
-                || yaml_config
-                    .as_ref()
-                    .and_then(|c| c.export.csv)
-                    .unwrap_or(false);
-            let output_dir = yaml_config
-                .as_ref()
-                .and_then(|c| c.export.output_dir.clone())
-                .unwrap_or(output_dir);
-
-            // Determine which subsystems to test (CLI flags override YAML enabled flags)
-            let yaml_cp_enabled = yaml_config.as_ref().and_then(|c| c.control_plane.enabled);
-            let yaml_net_enabled = yaml_config.as_ref().and_then(|c| c.network.enabled);
-            let yaml_st_enabled = yaml_config.as_ref().and_then(|c| c.storage.enabled);
-            let yaml_wl_enabled = yaml_config.as_ref().and_then(|c| c.workload.enabled);
-
-            let any_cli_flag = control_plane || storage || network || workload;
-            let any_yaml_flag = yaml_cp_enabled.is_some()
-                || yaml_net_enabled.is_some()
-                || yaml_st_enabled.is_some()
-                || yaml_wl_enabled.is_some();
-
-            let (run_cp, run_storage, run_network, run_workload) = if any_cli_flag {
-                // CLI flags specified - use them directly
-                (control_plane, storage, network, workload)
-            } else if any_yaml_flag {
-                // No CLI flags but YAML has enabled settings
-                (
-                    yaml_cp_enabled.unwrap_or(false),
-                    yaml_st_enabled.unwrap_or(false),
-                    yaml_net_enabled.unwrap_or(false),
-                    yaml_wl_enabled.unwrap_or(false),
-                )
-            } else {
-                // No flags at all - run everything
-                (true, true, true, true)
-            };
+            let config = FairnessConfigBuilder::new()
+                .with_yaml(config_path.as_ref())?
+                .with_cli(cli_args)
+                .build(); // No args passed here, logic is internal to build()
 
             // Load tenant configurations
             let tenant1_config = Arc::new(TenantClusterConfig {
-                cluster: KubernetesClient::load_with_retry(&tenant1_kubeconfig_path, 5).await?,
-                namespace: tenant1_namespace,
+                cluster: KubernetesClient::load_with_retry(&t1_path, 5).await?,
+                namespace: t1_ns,
             });
             let tenant2_config = Arc::new(TenantClusterConfig {
-                cluster: KubernetesClient::load_with_retry(&tenant2_kubeconfig_path, 5).await?,
-                namespace: tenant2_namespace,
+                cluster: KubernetesClient::load_with_retry(&t2_path, 5).await?,
+                namespace: t2_ns,
             });
 
-            // Helper to build a fairness runner with optional system-specific rate
-            let build_runner = |system_rate: Option<f64>| {
-                let effective_rate = system_rate.unwrap_or(rate_limit);
-                let mut builder = FairnessRunnerBuilder::new()
-                    .baseline_duration(std::time::Duration::from_secs(baseline_duration))
-                    .test_duration(std::time::Duration::from_secs(test_duration))
-                    .rate(effective_rate)
-                    .strategy(rate_strategy.into())
-                    .malicious_multiplier(load_multiplier)
-                    .pod_multiplier(pod_multiplier);
-
-                if export_csv {
-                    builder = builder.export_csv(&output_dir);
-                }
-
-                builder.build()
-            };
-
             println!("Fairness Test Configuration:");
-            if config_file.is_some() {
-                println!("  Config file: {}", config_file.as_ref().unwrap().display());
+            println!(
+                "  Baseline duration: {} seconds",
+                config.baseline_duration.as_secs()
+            );
+            println!(
+                "  Test duration: {} seconds",
+                config.test_duration.as_secs()
+            );
+            println!("  Rate strategy: {:?}", config.rate_strategy);
+            if !matches!(config.rate_strategy, RateLimitStrategy::Unlimited) {
+                println!("  Rate limit: {} req/s", config.rate_limit);
             }
-            println!("  Baseline duration: {} seconds", baseline_duration);
-            println!("  Test duration: {} seconds", test_duration);
-            println!("  Rate strategy: {:?}", rate_strategy);
-            if !matches!(rate_strategy, RateLimitStrategy::Unlimited) {
-                println!("  Rate limit: {} req/s", rate_limit);
-            }
-            println!("  Rate multiplier: {}x", load_multiplier);
-            println!("  Pod multiplier: {}x", pod_multiplier);
+            println!("  Rate multiplier: {}x", config.load_multiplier);
+            println!("  Pod multiplier: {}x", config.pod_multiplier);
             println!();
 
             let mut results = Vec::new();
 
-            // Control Plane fairness
-            if run_cp {
-                let effective_rate = cp_rate.unwrap_or(rate_limit);
+            // Helper to build a runner for a specific subsystem
+            let create_runner = |rate: f64| {
+                let mut builder = FairnessRunnerBuilder::new()
+                    .baseline_duration(config.baseline_duration)
+                    .test_duration(config.test_duration)
+                    .rate(rate)
+                    .strategy(config.rate_strategy.into())
+                    .malicious_multiplier(config.load_multiplier)
+                    .pod_multiplier(config.pod_multiplier);
+
+                if config.export_csv {
+                    builder = builder.export_csv(&config.output_dir);
+                }
+                builder.build()
+            };
+
+            // Control Plane
+            if config.run_cp {
                 println!("═══════════════════════════════════════════════════════════");
                 println!("Control Plane Fairness Assessment");
-                println!("  Workers: {}", cp_requesters);
-                if cp_rate.is_some() {
-                    println!("  Rate limit: {} req/s (custom)", effective_rate);
+                println!("  Workers: {}", config.cp_requesters);
+                if config.cp_rate != config.rate_limit {
+                    println!("  Rate limit: {} req/s (custom)", config.cp_rate);
                 }
                 println!("═══════════════════════════════════════════════════════════");
 
-                let cp_config = FairnessControlPlaneConfig {
-                    workers: cp_requesters,
-                };
-                let cp_assessor = FairnessControlPlaneAssessor::new(cp_config);
-
-                let runner = build_runner(cp_rate);
-                let result = runner
-                    .run(&cp_assessor, tenant1_config.clone(), tenant2_config.clone())
-                    .await?;
-                results.push(("Control Plane", result));
+                let cp_assessor = FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
+                    workers: config.cp_requesters,
+                });
+                let runner = create_runner(config.cp_rate);
+                results.push((
+                    "Control Plane",
+                    runner
+                        .run(&cp_assessor, tenant1_config.clone(), tenant2_config.clone())
+                        .await?,
+                ));
             }
 
-            // Network fairness
-            if run_network {
-                let effective_rate = net_rate.unwrap_or(rate_limit);
+            // Network
+            if config.run_network {
                 println!("\n═══════════════════════════════════════════════════════════");
                 println!("Network Fairness Assessment (TCP Ping)");
-                println!("  Pod pairs per tenant: {}", net_pod_pairs);
-                println!("  Parallel streams per client: {}", net_streams);
-                println!("  Packet size: {} bytes", net_packet_size);
-                if matches!(rate_strategy, RateLimitStrategy::Unlimited) {
-                    println!("  Packet rate: unlimited");
-                } else {
-                    println!("  Packet rate: {} packets/s", effective_rate);
-                }
-                if net_rate.is_some() {
-                    println!("  (using custom rate)");
+                println!(
+                    "  Pod pairs: {}, Streams: {}, Pkt byte size: {}",
+                    config.net_pod_pairs, config.net_streams, config.net_packet_size
+                );
+                if config.net_rate != config.rate_limit {
+                    println!("  Rate limit: {} req/s (custom)", config.net_rate);
                 }
                 println!("═══════════════════════════════════════════════════════════");
 
-                let net_config = FairnessNetworkConfig {
-                    pod_pairs: net_pod_pairs,
-                    streams: net_streams,
-                    packet_size: net_packet_size,
-                };
-                let net_assessor = FairnessNetworkAssessor::new(net_config);
-
-                let runner = build_runner(net_rate);
-                let result = runner
-                    .run(
-                        &net_assessor,
-                        tenant1_config.clone(),
-                        tenant2_config.clone(),
-                    )
-                    .await?;
-                results.push(("Network", result));
+                let net_assessor = FairnessNetworkAssessor::new(FairnessNetworkConfig {
+                    pod_pairs: config.net_pod_pairs,
+                    streams: config.net_streams,
+                    packet_size: config.net_packet_size,
+                });
+                let runner = create_runner(config.net_rate);
+                results.push((
+                    "Network",
+                    runner
+                        .run(
+                            &net_assessor,
+                            tenant1_config.clone(),
+                            tenant2_config.clone(),
+                        )
+                        .await?,
+                ));
             }
 
-            // Storage fairness
-            if run_storage {
-                let effective_rate = st_rate.unwrap_or(rate_limit);
+            // Storage
+            if config.run_storage {
                 println!("\n═══════════════════════════════════════════════════════════");
                 println!("Storage Fairness Assessment");
                 println!(
-                    "  Pods: {}, Block size: {}KB, File size: {}MB, Scenario: {:?}",
-                    st_pods, st_block_size, st_file_size, st_scenario
+                    "  Pods: {}, Block: {}KB, File: {}MB, Scenario: {:?}",
+                    config.st_pods, config.st_block_size, config.st_file_size, config.st_scenario
                 );
-                if st_rate.is_some() {
-                    println!("  Rate limit: {} req/s (custom)", effective_rate);
+                if config.st_rate != config.rate_limit {
+                    println!("  Rate limit: {} req/s (custom)", config.st_rate);
                 }
                 println!("═══════════════════════════════════════════════════════════");
 
-                let storage_config = FairnessStorageConfig {
-                    pods: st_pods,
-                    block_size_kb: st_block_size,
-                    file_size_mb: st_file_size,
-                    scenario: st_scenario.into(),
-                };
-                let storage_assessor = FairnessStorageAssessor::new(storage_config);
-
-                let runner = build_runner(st_rate);
-                let result = runner
-                    .run(
-                        &storage_assessor,
-                        tenant1_config.clone(),
-                        tenant2_config.clone(),
-                    )
-                    .await?;
-                results.push(("Storage", result));
+                let st_assessor = FairnessStorageAssessor::new(FairnessStorageConfig {
+                    pods: config.st_pods,
+                    block_size_kb: config.st_block_size,
+                    file_size_mb: config.st_file_size,
+                    scenario: config.st_scenario.into(),
+                });
+                let runner = create_runner(config.st_rate);
+                results.push((
+                    "Storage",
+                    runner
+                        .run(&st_assessor, tenant1_config.clone(), tenant2_config.clone())
+                        .await?,
+                ));
             }
 
-            // Workload fairness
-            if run_workload {
-                let effective_rate = wl_rate.unwrap_or(rate_limit);
+            // Workload
+            if config.run_workload {
                 println!("\n═══════════════════════════════════════════════════════════");
                 println!("Workload (CPU) Fairness Assessment");
                 println!(
-                    "  Pods: {}, Threads: {}, Max prime: {}",
-                    wl_pods, wl_threads, wl_max_prime
+                    "  Pods: {}, Threads: {}, Prime: {}",
+                    config.wl_pods, config.wl_threads, config.wl_max_prime
                 );
-                if wl_rate.is_some() {
-                    println!("  Rate limit: {} req/s (custom)", effective_rate);
+                if config.wl_rate != config.rate_limit {
+                    println!("  Rate limit: {} req/s (custom)", config.wl_rate);
                 }
                 println!("═══════════════════════════════════════════════════════════");
 
-                let wl_config = FairnessWorkloadConfig {
-                    pods: wl_pods,
-                    threads: wl_threads,
-                    max_prime: wl_max_prime,
-                };
-                let wl_assessor = FairnessWorkloadAssessor::new(wl_config);
-
-                let runner = build_runner(wl_rate);
-                let result = runner
-                    .run(&wl_assessor, tenant1_config.clone(), tenant2_config.clone())
-                    .await?;
-                results.push(("Workload", result));
+                let wl_assessor = FairnessWorkloadAssessor::new(FairnessWorkloadConfig {
+                    pods: config.wl_pods,
+                    threads: config.wl_threads,
+                    max_prime: config.wl_max_prime,
+                });
+                let runner = create_runner(config.wl_rate);
+                results.push((
+                    "Workload",
+                    runner
+                        .run(&wl_assessor, tenant1_config.clone(), tenant2_config.clone())
+                        .await?,
+                ));
             }
 
-            // Print summary
+            // Summary
             println!("\n═══════════════════════════════════════════════════════════");
             println!("FAIRNESS ASSESSMENT SUMMARY");
             println!("═══════════════════════════════════════════════════════════\n");
@@ -1010,42 +955,41 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", result);
             }
 
-            // Calculate overall degradation
             if !results.is_empty() {
-                let avg_degradation: f64 = results
+                let avg_deg: f64 = results
                     .iter()
                     .map(|(_, r)| r.latency_degradation)
                     .sum::<f64>()
                     / results.len() as f64;
-
                 println!("\n───────────────────────────────────────────────────────────");
-                println!(
-                    "Overall Average Latency Degradation: {:.2}x",
-                    avg_degradation
-                );
+                println!("Overall Average Latency Degradation: {:.2}x", avg_deg);
 
-                if let Some((worst_name, worst_result)) = results.iter().max_by(|(_, a), (_, b)| {
-                    a.latency_degradation
-                        .partial_cmp(&b.latency_degradation)
+                if let Some((worst_name, worst_res)) = results.iter().max_by(|a, b| {
+                    a.1.latency_degradation
+                        .partial_cmp(&b.1.latency_degradation)
                         .unwrap()
                 }) {
                     println!(
                         "Worst Subsystem: {} ({:.2}x degradation, {})",
                         worst_name,
-                        worst_result.latency_degradation,
-                        worst_result.fairness_level()
+                        worst_res.latency_degradation,
+                        worst_res.fairness_level()
                     );
                 }
             }
 
-            if export_csv {
-                println!("\n📁 Results exported to: {}/", output_dir);
+            if config.export_csv {
+                println!("\n📁 Results exported to: {}/", config.output_dir);
             }
         }
     }
 
     Ok(())
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════
 
 async fn get_or_create_tenant_cluster(
     host_cluster: &HostClusterType,
@@ -1068,59 +1012,47 @@ async fn get_or_create_tenant_cluster(
     }
 
     println!("Creating {} cluster", tenant);
+    let builder =
+        KubernetesClusterBuilder::new(host_cluster.clone()).with_kubeconfig_path(kubeconfig_path);
 
     let tenant_cluster = match env_type {
         ClusterEnvironmentType::Capsule => {
-            KubernetesClusterBuilder::new(host_cluster.clone())
+            builder
                 .with_isolation_technology(ControlPlaneIsolation::Capsule(tenant.to_string()))
-                // .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
-                //     tenant.to_string(),
-                // ))
-                .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
         }
         ClusterEnvironmentType::CapsuleProxy => {
-            KubernetesClusterBuilder::new(host_cluster.clone())
+            builder
                 .with_isolation_technology(ControlPlaneIsolation::CapsuleProxy(tenant.to_string()))
-                .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
         }
         ClusterEnvironmentType::VCluster => {
-            KubernetesClusterBuilder::new(host_cluster.clone())
+            builder
                 .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant.to_string()))
-                // .with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
-                //     tenant.to_string(),
-                // ))
-                .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
         }
         ClusterEnvironmentType::KubeVirt => {
-            KubernetesClusterBuilder::new(host_cluster.clone())
+            builder
                 .with_isolation_technology(ControlPlaneIsolation::KubeVirt(tenant.to_string()))
-                .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
         }
         ClusterEnvironmentType::Kamaji => {
-            KubernetesClusterBuilder::new(host_cluster.clone())
+            builder
                 .with_isolation_technology(ControlPlaneIsolation::Kamaji(tenant.to_string()))
-                .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
         }
         ClusterEnvironmentType::Native => {
-            KubernetesClusterBuilder::new(host_cluster.clone())
+            builder
                 .with_isolation_technology(ControlPlaneIsolation::None(tenant.to_string()))
-                .with_kubeconfig_path(kubeconfig_path)
                 .build()
                 .await?
         }
-        _ => {
-            return Err(anyhow!("Unsupported cluster environment type"));
-        }
+        _ => return Err(anyhow!("Unsupported cluster environment type")),
     };
 
     Ok(tenant_cluster)
@@ -1135,8 +1067,17 @@ async fn setup_test_environment(
     tenant1: Tenant1SetupConfig,
     tenant2: Tenant2SetupConfig,
 ) -> anyhow::Result<()> {
-    let (tenant1_ns, tenant1_mapping) = tenant1.get_config()?;
-    let (tenant2_ns, tenant2_mapping) = tenant2.get_config()?;
+    let (tenant1_ns, tenant1_mapping) = resolve_tenant_config(
+        &tenant1.tenant1_short,
+        &tenant1.tenant1_ns,
+        &tenant1.tenant1_mapping,
+    )?;
+    let (tenant2_ns, tenant2_mapping) = resolve_tenant_config(
+        &tenant2.tenant2_short,
+        &tenant2.tenant2_ns,
+        &tenant2.tenant2_mapping,
+    )?;
+
     println!(
         "Tenant1: ns={}, port_mapping={{container={}, host={}}}",
         tenant1_ns, tenant1_mapping.0, tenant1_mapping.1
@@ -1147,108 +1088,120 @@ async fn setup_test_environment(
     );
 
     let output_dir = output_dir.unwrap_or_else(|| PathBuf::from("/tmp"));
-    std::fs::create_dir_all(&output_dir)
-        .context("Failed to create output directory for kubeconfig files")?;
+    std::fs::create_dir_all(&output_dir).context("Failed to create output directory")?;
 
     let port_mappings = TenantsPortMapping::from_tuple(tenant1_mapping, tenant2_mapping);
     let using_existing_cluster = existing_cluster_kubeconfig.is_some();
-    let cluster_kubeconfig = if let Some(existing_path) = existing_cluster_kubeconfig {
-        existing_path
-    } else {
-        output_dir.join(format!("{}.kubeconfig", cluster_name))
-    };
+    let cluster_kubeconfig = existing_cluster_kubeconfig
+        .unwrap_or_else(|| output_dir.join(format!("{}.kubeconfig", cluster_name)));
 
     let cluster_name = if using_existing_cluster {
-        // If using existing cluster, try to extract the name from the kubeconfig file path
         cluster_kubeconfig
             .file_stem()
-            .and_then(|os_str| os_str.to_str())
+            .and_then(|s| s.to_str())
             .unwrap_or(cluster_name)
     } else {
         cluster_name
     };
 
-    // Create base cluster based on provider type
     let base_cluster = match provider {
         ChosenClusterProvider::Kind => {
-            let cluster = if using_existing_cluster {
+            if using_existing_cluster {
                 println!("Using existing kind cluster '{}'", cluster_name);
-                KindCluster::load(cluster_name, cluster_kubeconfig.clone())
-                    .await
-                    .context("Failed to load existing kind cluster")?
+                HostClusterType::Kind(
+                    KindCluster::load(cluster_name, cluster_kubeconfig.clone()).await?,
+                )
             } else {
                 println!("Creating new kind cluster '{}'", cluster_name);
-                KindCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
-                    .await
-                    .context("Failed to create new kind cluster")?
-            };
-            HostClusterType::Kind(cluster)
+                HostClusterType::Kind(
+                    KindCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
+                        .await?,
+                )
+            }
         }
         ChosenClusterProvider::K3s => {
-            let cluster = if using_existing_cluster {
+            if using_existing_cluster {
                 println!("Using existing k3s cluster '{}'", cluster_name);
-                K3sCluster::load(cluster_name, cluster_kubeconfig.clone())
-                    .await
-                    .context("Failed to load existing k3s cluster")?
+                HostClusterType::K3s(
+                    K3sCluster::load(cluster_name, cluster_kubeconfig.clone()).await?,
+                )
             } else {
                 println!("Creating new k3s cluster '{}'", cluster_name);
-                K3sCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
-                    .await
-                    .context("Failed to create new k3s cluster")?
-            };
-            HostClusterType::K3s(cluster)
+                HostClusterType::K3s(
+                    K3sCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
+                        .await?,
+                )
+            }
         }
         ChosenClusterProvider::None => {
-            let cluster = if using_existing_cluster {
+            if using_existing_cluster {
                 println!("Using existing pre-existing cluster '{}'", cluster_name);
-                PreExistingCluster::load(cluster_name, cluster_kubeconfig.clone())
-                    .await
-                    .context("Failed to load existing pre-existing cluster")?
+                HostClusterType::PreExisting(
+                    PreExistingCluster::load(cluster_name, cluster_kubeconfig.clone()).await?,
+                )
             } else {
                 println!("Creating new pre-existing cluster '{}'", cluster_name);
-                PreExistingCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
-                    .await
-                    .context("Failed to create new pre-existing cluster")?
-            };
-            HostClusterType::PreExisting(cluster)
+                HostClusterType::PreExisting(
+                    PreExistingCluster::create(
+                        cluster_name,
+                        cluster_kubeconfig.clone(),
+                        port_mappings,
+                    )
+                    .await?,
+                )
+            }
         }
     };
 
-    let tenant1_kubeconfig_name = format!("tenant1-{}", cluster_name);
-    let tenant2_kubeconfig_name = format!("tenant2-{}", cluster_name);
-    let tenant1_kubeconfig = output_dir.join(format!("{}.kubeconfig", tenant1_kubeconfig_name));
-    let tenant2_kubeconfig = output_dir.join(format!("{}.kubeconfig", tenant2_kubeconfig_name));
+    let t1_cfg = output_dir.join(format!("tenant1-{}.kubeconfig", cluster_name));
+    let t2_cfg = output_dir.join(format!("tenant2-{}.kubeconfig", cluster_name));
 
-    let tenant1_cluster =
-        get_or_create_tenant_cluster(&base_cluster, "tenant1", tenant1_kubeconfig.clone(), env)
-            .await?;
-    let tenant2_cluster =
-        get_or_create_tenant_cluster(&base_cluster, "tenant2", tenant2_kubeconfig.clone(), env)
-            .await?;
+    let t1_cluster =
+        get_or_create_tenant_cluster(&base_cluster, "tenant1", t1_cfg.clone(), env).await?;
+    let t2_cluster =
+        get_or_create_tenant_cluster(&base_cluster, "tenant2", t2_cfg.clone(), env).await?;
 
-    tenant1_cluster.ensure_cluster_is_ready().await?;
-    tenant2_cluster.ensure_cluster_is_ready().await?;
+    t1_cluster.ensure_cluster_is_ready().await?;
+    t2_cluster.ensure_cluster_is_ready().await?;
 
     println!("Created test clusters:");
-    println!("Tenant 1 kubeconfig: {}", tenant1_kubeconfig.display());
-    println!("Tenant 2 kubeconfig: {}", tenant2_kubeconfig.display());
+    println!("Tenant 1 kubeconfig: {}", t1_cfg.display());
+    println!("Tenant 2 kubeconfig: {}", t2_cfg.display());
 
     Ok(())
 }
 
+fn resolve_tenant_config(
+    short: &Option<Vec<String>>,
+    default_ns: &str,
+    default_mapping: &(u16, u16),
+) -> anyhow::Result<(String, (u16, u16))> {
+    let tenant_ns = short
+        .as_ref()
+        .and_then(|v| v.first())
+        .cloned()
+        .unwrap_or_else(|| default_ns.to_string());
+    let tenant_mapping = if let Some(v) = short {
+        if v.len() > 1 {
+            parse_mapping(&v[1])?
+        } else {
+            *default_mapping
+        }
+    } else {
+        *default_mapping
+    };
+    Ok((tenant_ns, tenant_mapping))
+}
+
 pub async fn list_pods(client: Client) -> anyhow::Result<()> {
     let pods: Api<Pod> = Api::all(client);
-    let pod = pods.list(&ListParams::default()).await?;
-    println!("List of pods:");
-    // print namespace and name of each pod
-    for p in pod.items {
+    for p in pods.list(&ListParams::default()).await?.items {
         println!(
             "\t{}: {}",
             p.metadata.namespace.as_deref().unwrap_or("default"),
             p.metadata.name.as_deref().unwrap_or("unnamed")
         );
     }
-
     Ok(())
 }
 
@@ -1257,17 +1210,12 @@ fn parse_mapping(s: &str) -> anyhow::Result<(u16, u16)> {
     if parts.len() != 2 {
         return Err(anyhow!("Invalid format, expected 'containerPort:hostPort'"));
     }
-    let container = parts[0].parse().context("Invalid container port")?;
-    let host = parts[1].parse().context("Invalid host port")?;
-    Ok((container, host))
+    Ok((parts[0].parse()?, parts[1].parse()?))
 }
 
 fn setup_logging(verbose: bool) -> anyhow::Result<()> {
-    let filter_level = if verbose { Level::INFO } else { Level::ERROR };
-
     tracing_subscriber::fmt()
-        .with_max_level(filter_level)
+        .with_max_level(if verbose { Level::INFO } else { Level::ERROR })
         .init();
-
     Ok(())
 }
