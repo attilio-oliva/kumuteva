@@ -203,8 +203,33 @@ impl FairnessControlPlaneAssessor {
                         label: Some(format!("update-deploy-{}", name)),
                     });
                 }
+                // 5. List ConfigMaps
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res = cm_api
+                    .list(&ListParams::default().labels(&format!("app={}", name)))
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("list-cm-{}", name)),
+                });
 
-                // 5. Delete ConfigMap
+                // 6. List Deployments
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res = deploy_api
+                    .list(&ListParams::default().labels(&format!("app={}", name)))
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("list-deploy-{}", name)),
+                });
+
+                // 7. Delete ConfigMap
                 if res_cm_create.is_ok() {
                     let ts = start_time.elapsed().as_secs_f64();
                     let op_start = Instant::now();
@@ -217,7 +242,7 @@ impl FairnessControlPlaneAssessor {
                     });
                 }
 
-                // 6. Delete Deployment
+                // 8. Delete Deployment
                 if res_deploy_create.is_ok() {
                     let ts = start_time.elapsed().as_secs_f64();
                     let op_start = Instant::now();
