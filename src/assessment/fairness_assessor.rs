@@ -556,21 +556,22 @@ impl FairnessRunner {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
 
-        // Export baseline
+        info!("Exporting metrics to {}/", self.output_dir);
+
         let baseline_path = format!(
             "{}/{}_baseline_{}.csv",
             self.output_dir, subsystem, timestamp
         );
-        info!("Exporting baseline metrics to {}", baseline_path);
-        write_csv(&baseline_path, &result.baseline).await?;
-
-        // Export unbalanced
         let unbalanced_path = format!(
             "{}/{}_unbalanced_{}.csv",
             self.output_dir, subsystem, timestamp
         );
-        info!("Exporting unbalanced metrics to {}", unbalanced_path);
-        write_csv(&unbalanced_path, &result.unbalanced).await?;
+
+        // Run both writes concurrently
+        let write_baseline = write_csv(&baseline_path, &result.baseline);
+        let write_unbalanced = write_csv(&unbalanced_path, &result.unbalanced);
+
+        tokio::try_join!(write_baseline, write_unbalanced)?;
 
         println!("  📁 Exported to {}/", self.output_dir);
         println!("      - {}", baseline_path);
@@ -580,44 +581,57 @@ impl FairnessRunner {
 }
 
 async fn write_csv(path: &str, phase: &PhaseResult) -> Result<()> {
+    use std::fmt::Write;
     use tokio::fs::File;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncWriteExt, BufWriter}; // Needed for write! macro on String
 
-    let mut file = File::create(path).await?;
-    file.write_all(b"tenant,timestamp_secs,latency_ms,is_error,label\n")
+    let file = File::create(path).await?;
+    // Use a large buffer (e.g., 64KB) to minimize syscalls
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+
+    writer
+        .write_all(b"tenant,timestamp_secs,latency_ms,is_error,label\n")
         .await?;
 
+    // Reusable buffer to avoid allocating a new String for every row
+    let mut line_buf = String::with_capacity(256);
+
+    // Helper closure to write points (reduces code duplication)
+    // Note: We use a macro-like approach or simple loop to avoid borrow checker complexity in async
     for point in &phase.tenant1.raw {
-        file.write_all(
-            format!(
-                "tenant1,{:.3},{:.3},{},{}\n",
-                point.timestamp_secs,
-                point.latency_ms,
-                point.is_error,
-                point.label.as_deref().unwrap_or("")
-            )
-            .as_bytes(),
+        line_buf.clear();
+        // Write formatting into memory buffer first
+        writeln!(
+            &mut line_buf,
+            "tenant1,{:.3},{:.3},{},{}",
+            point.timestamp_secs,
+            point.latency_ms,
+            point.is_error,
+            point.label.as_deref().unwrap_or("")
         )
-        .await?;
+        .unwrap();
+
+        // Write memory buffer to BufWriter (fast)
+        writer.write_all(line_buf.as_bytes()).await?;
     }
 
     for point in &phase.tenant2.raw {
-        file.write_all(
-            format!(
-                "tenant2,{:.3},{:.3},{},{}\n",
-                point.timestamp_secs,
-                point.latency_ms,
-                point.is_error,
-                point.label.as_deref().unwrap_or("")
-            )
-            .as_bytes(),
+        line_buf.clear();
+        writeln!(
+            &mut line_buf,
+            "tenant2,{:.3},{:.3},{},{}",
+            point.timestamp_secs,
+            point.latency_ms,
+            point.is_error,
+            point.label.as_deref().unwrap_or("")
         )
-        .await?;
+        .unwrap();
+        writer.write_all(line_buf.as_bytes()).await?;
     }
 
+    writer.flush().await?;
     Ok(())
 }
-
 // =============================================================================
 // BUILDER
 // =============================================================================

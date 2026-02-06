@@ -1015,7 +1015,7 @@ impl KubernetesClient {
 
         let lp = WatchParams::default()
             .fields(&format!("metadata.name={}", pod_name))
-            .timeout(60); // Reduced timeout, we'll poll if watch expires
+            .timeout(120);
 
         let mut stream = api.watch(&lp, &resource_version).await?.boxed();
 
