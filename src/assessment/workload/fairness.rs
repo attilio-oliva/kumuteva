@@ -177,46 +177,64 @@ fn sysbench_pod(
     duration_secs: u64,
     rate: Option<f64>,
 ) -> Pod {
-    // Rate limiting in shell: track elapsed time and sleep if ahead of schedule
-    // This mimics how RateLimiter works in Rust code
-    let rate_limit_setup = rate
-        .map(|r| {
-            format!(
-                "rate={}; interval=$(awk \"BEGIN {{printf \\\"%.6f\\\", 1.0/{}}}\"); ",
-                r, r
-            )
-        })
-        .unwrap_or_default();
+    let rate_val = rate
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "None".to_string());
 
-    let rate_limit_check = if rate.is_some() {
-        // Calculate expected start time for this iteration and sleep if ahead
-        "expected=$(awk \"BEGIN {printf \\\"%.6f\\\", $i * $interval}\"); \
-         elapsed=$(awk \"BEGIN {printf \\\"%.6f\\\", $(date +%s.%N) - $start_time}\"); \
-         ahead=$(awk \"BEGIN {printf \\\"%.6f\\\", $expected - $elapsed}\"); \
-         if [ $(awk \"BEGIN {print ($ahead > 0.001) ? 1 : 0}\") -eq 1 ]; then sleep $ahead; fi; "
-    } else {
-        ""
-    };
+    // Python script to run sysbench with minimal overhead
+    // This avoids the massive overhead of forking 'date', 'awk', 'grep' in a shell loop
+    let python_script = format!(
+        r#"
+import subprocess
+import time
+import sys
 
-    // Run sysbench in a loop with proper rate limiting
-    let command = format!(
-        "apk add --no-cache sysbench >/dev/null 2>&1 && \
-         start_time=$(date +%s.%N); \
-         end_time=$(($(date +%s) + {duration})); \
-         {rate_setup}\
-         results=''; \
-         i=0; \
-         while [ $(date +%s) -lt $end_time ]; do \
-           {rate_check}\
-           result=$(sysbench cpu --threads={threads} --cpu-max-prime={max_prime} --time=0 --events=1 run 2>&1 | grep 'total time:' | awk '{{print $3}}' | tr -d 's'); \
-           ts=$(awk \"BEGIN {{printf \\\"%.3f\\\", $(date +%s.%N) - $start_time}}\"); \
-           results=\"$results$ts:$result,\"; \
-           i=$((i + 1)); \
-         done; \
-         echo \"RESULTS:$results\"",
+THREADS = {threads}
+MAX_PRIME = {max_prime}
+DURATION = {duration}
+RATE = {rate}
+
+print(f"Starting benchmark: threads={{THREADS}}, prime={{MAX_PRIME}}, duration={{DURATION}}s, rate={{RATE}}", file=sys.stderr)
+
+start_time = time.perf_counter()
+end_time = time.time() + DURATION
+i = 0
+results = []
+
+cmd = ["sysbench", "cpu", f"--threads={{THREADS}}", f"--cpu-max-prime={{MAX_PRIME}}", "--time=0", "--events=1", "run"]
+
+while time.time() < end_time:
+    iter_start = time.perf_counter()
+    
+    # Rate limiting
+    if RATE is not None:
+        expected_now = start_time + (i * (1.0/RATE))
+        drift = expected_now - iter_start
+        if drift > 0.001:
+            time.sleep(drift)
+    
+    try:
+        # Run sysbench and capture output
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
+        
+        # Parse latency (looking for "total time: 0.0004s")
+        for line in out.splitlines():
+            if "total time:" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    latency_s = parts[2].replace("s", "")
+                    ts = time.perf_counter() - start_time
+                    results.append(f"{{ts:.3f}}:{{latency_s}}")
+                    break
+    except Exception as e:
+        print(f"Error: {{e}}", file=sys.stderr)
+        
+    i += 1
+
+print("RESULTS:" + ",".join(results))
+"#,
         duration = duration_secs,
-        rate_setup = rate_limit_setup,
-        rate_check = rate_limit_check,
+        rate = rate_val,
         threads = config.threads,
         max_prime = config.max_prime
     );
@@ -229,8 +247,8 @@ fn sysbench_pod(
             "restartPolicy": "Never",
             "containers": [{
                 "name": "sysbench",
-                "image": "alpine:latest",
-                "command": ["sh", "-c", command],
+                "image": "python:3.11-alpine",
+                "command": ["sh", "-c", format!("apk add --no-cache sysbench >/dev/null 2>&1 && python3 -c '{}'", python_script)],
                 "resources": {
                     "requests": { "memory": "64Mi", "cpu": "100m" },
                     "limits": { "memory": "256Mi", "cpu": "1000m" }
@@ -376,7 +394,9 @@ async fn cleanup_pods(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
         let name = format!("workload-fairness-{}", i);
         let _ = tokio::time::timeout(
             Duration::from_secs(POD_DELETION_TIMEOUT_SECS),
-            tenant.cluster.wait_for_pod_deletion(&name, &tenant.namespace),
+            tenant
+                .cluster
+                .wait_for_pod_deletion(&name, &tenant.namespace),
         )
         .await;
     }
