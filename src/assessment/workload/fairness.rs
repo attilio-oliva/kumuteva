@@ -251,7 +251,7 @@ print("RESULTS:" + ",".join(results))
                 "command": ["sh", "-c", format!("apk add --no-cache sysbench >/dev/null 2>&1 && python3 -c '{}'", python_script)],
                 "resources": {
                     "requests": { "memory": "64Mi", "cpu": "100m" },
-                    "limits": { "memory": "256Mi", "cpu": "1000m" }
+                    "limits": { "memory": "512Mi", "cpu": "1000m" }
                 }
             }]
         }
@@ -302,20 +302,16 @@ async fn wait_for_completion(tenant: &TenantClusterConfig, pods: u32) -> Result<
         let name = format!("workload-fairness-{}", i);
 
         // Helper to check if pod is completed
-        let is_completed = |pod: &Pod| -> bool {
-            pod.status
-                .as_ref()
-                .and_then(|s| s.phase.as_ref())
-                .map(|p| p == "Succeeded" || p == "Failed")
-                .unwrap_or(false)
-        };
-
-        // First check if pod is already completed
-        if let Ok(pod) = api.get(&name).await {
-            if is_completed(&pod) {
-                continue;
+        let is_pod_completed = async |pod_name: &str| -> bool {
+            if let Ok(pod) = api.get(pod_name).await {
+                if let Some(status) = pod.status {
+                    if let Some(phase) = status.phase {
+                        return phase == "Succeeded" || phase == "Failed";
+                    }
+                }
             }
-        }
+            false
+        };
 
         // Pod not done yet, watch for completion
         let lp = WatchParams::default()
@@ -324,21 +320,9 @@ async fn wait_for_completion(tenant: &TenantClusterConfig, pods: u32) -> Result<
 
         let mut stream = api.watch(&lp, "0").await?.boxed();
 
-        while let Some(event) = stream.try_next().await? {
-            match event {
-                kube::api::WatchEvent::Modified(pod) => {
-                    if is_completed(&pod) {
-                        break;
-                    }
-                }
-                _ => {
-                    // On any other event (Bookmark, Added, etc.), check pod status directly
-                    if let Ok(pod) = api.get(&name).await {
-                        if is_completed(&pod) {
-                            break;
-                        }
-                    }
-                }
+        while let Some(_event) = stream.try_next().await? {
+            if is_pod_completed(&name).await {
+                break;
             }
         }
     }

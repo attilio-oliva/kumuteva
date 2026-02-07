@@ -207,7 +207,7 @@ fn fio_pod(
          --runtime={} --time_based=1 \
          --filename=/data/fio-test-file \
          --write_lat_log=/data/latency \
-         --log_avg_msec=0{} 2>&1 && \
+         --log_avg_msec=0 {} 2>&1 && \
          echo 'LATLOG_START' && \
          cat /data/latency_clat.*.log 2>/dev/null || cat /data/latency_clat.log 2>/dev/null || echo 'NO_LAT_LOG' && \
          echo 'LATLOG_END'",
