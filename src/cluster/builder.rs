@@ -417,7 +417,10 @@ impl KubernetesClusterBuilder {
             .await?;
 
         // Modify the kubeconfig to use the correct port and skip TLS verification
-        self.adjust_capsule_proxy_kubeconfig(host_port)?;
+        // Only if using kind provider
+        if matches!(self.host_cluster, HostClusterType::Kind(_)) {
+            self.adjust_capsule_proxy_kubeconfig(host_port)?;
+        }
 
         // Now create the namespace using the adjusted kubeconfig
         let tenant_cluster = KubernetesClient::load_with_retry(&self.kubeconfig_path, 10).await?;
