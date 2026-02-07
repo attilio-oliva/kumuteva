@@ -87,6 +87,7 @@ impl KubernetesClient {
         let options = KubeConfigOptions::default();
         let config = Config::from_custom_kubeconfig(kubeconfig, &options).await?;
         let client = Client::try_from(config)?;
+        let base_retry_interval = 5;
 
         let mut last_error = None;
         for attempt in 1..=max_retries {
@@ -99,14 +100,17 @@ impl KubernetesClient {
                 }
                 Err(e) => {
                     last_error = Some(e);
+                    let retry_interval = base_retry_interval * attempt;
                     if attempt < max_retries {
                         println!(
-                            "Discovery failed on attempt {}/{}, retrying in 5 seconds: {}",
+                            "Discovery failed on attempt {}/{}, retrying in {} seconds: {}",
                             attempt,
                             max_retries,
+                            retry_interval,
                             last_error.as_ref().unwrap()
                         );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(retry_interval.into()))
+                            .await;
                     }
                 }
             }
