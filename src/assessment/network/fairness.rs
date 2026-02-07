@@ -18,6 +18,10 @@ use crate::assessment::fairness_assessor::{
 };
 use crate::assessment::TenantClusterConfig;
 
+use futures::{StreamExt, TryStreamExt};
+use kube::api::WatchParams;
+use kube::Api;
+
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
@@ -628,11 +632,6 @@ async fn create_tcp_ping_clients(
 }
 
 async fn wait_for_completion(tenant: &TenantClusterConfig, pairs: u32) -> Result<()> {
-    use futures::{StreamExt, TryStreamExt};
-    use k8s_openapi::api::core::v1::Pod;
-    use kube::api::WatchParams;
-    use kube::Api;
-
     let api: Api<Pod> = Api::namespaced(tenant.cluster.client().clone(), &tenant.namespace);
 
     for i in 0..pairs {

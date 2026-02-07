@@ -971,7 +971,12 @@ impl KubernetesClient {
         Err(Error::msg("Pod watch timed out"))
     }
 
-    pub async fn wait_for_pod_to_be_ready(&self, pod_name: &str, namespace: &str) -> Result<()> {
+    pub async fn wait_for_pod_readiness_timeout(
+        &self,
+        pod_name: &str,
+        namespace: &str,
+        timeout_seconds: u32,
+    ) -> Result<()> {
         // use the Job API to wait for the pod to be ready
         let api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
@@ -983,7 +988,7 @@ impl KubernetesClient {
 
         let wc = watcher::Config {
             field_selector: Some(format!("metadata.name={}", pod_name)),
-            timeout: Some(290),
+            timeout: Some(timeout_seconds),
             ..Default::default()
         };
 
@@ -1002,7 +1007,17 @@ impl KubernetesClient {
         Err(Error::msg("Pod did not become ready in time"))
     }
 
-    pub async fn wait_for_pod_deletion(&self, pod_name: &str, namespace: &str) -> Result<()> {
+    pub async fn wait_for_pod_to_be_ready(&self, pod_name: &str, namespace: &str) -> Result<()> {
+        self.wait_for_pod_readiness_timeout(pod_name, namespace, 290)
+            .await
+    }
+
+    pub async fn wait_for_pod_deletion_timeout(
+        &self,
+        pod_name: &str,
+        namespace: &str,
+        timeout_seconds: u32,
+    ) -> Result<()> {
         let api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
         // Check if pod exists and get its resource version for proper watching
@@ -1019,7 +1034,7 @@ impl KubernetesClient {
 
         let lp = WatchParams::default()
             .fields(&format!("metadata.name={}", pod_name))
-            .timeout(120);
+            .timeout(timeout_seconds);
 
         let mut stream = api.watch(&lp, &resource_version).await?.boxed();
 
@@ -1043,6 +1058,11 @@ impl KubernetesClient {
         }
 
         Err(Error::msg("Pod was not deleted in time"))
+    }
+
+    pub async fn wait_for_pod_deletion(&self, pod_name: &str, namespace: &str) -> Result<()> {
+        self.wait_for_pod_deletion_timeout(pod_name, namespace, 120)
+            .await
     }
 
     pub async fn publish_crd<C>(&self) -> Result<()>

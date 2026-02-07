@@ -849,7 +849,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("═══════════════════════════════════════════════════════════");
 
                 let cp_assessor = FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
-                    workers: config.cp_requesters,
+                    max_workers: config.cp_requesters,
                 });
                 let runner = create_runner(config.cp_rate);
                 results.push((

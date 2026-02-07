@@ -7,10 +7,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::ConfigMap;
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, WatchParams};
 use kube::Api;
+use tracing::info;
 
 use crate::assessment::fairness_assessor::{
     FairnessAssessor, FairnessConfig, MetricPoint, PhaseResult, RateLimiter, TenantMetrics,
@@ -24,13 +26,14 @@ use crate::assessment::TenantClusterConfig;
 /// Control plane assessor configuration
 #[derive(Debug, Clone)]
 pub struct FairnessControlPlaneConfig {
-    /// Number of concurrent workers per tenant
-    pub workers: usize,
+    /// Maximum number of concurrent workers per tenant
+    /// This is used to control the level of concurrency and achieve the desired request rates for each tenant
+    pub max_workers: usize,
 }
 
 impl Default for FairnessControlPlaneConfig {
     fn default() -> Self {
-        Self { workers: 1 }
+        Self { max_workers: 1 }
     }
 }
 
@@ -73,13 +76,9 @@ impl FairnessControlPlaneAssessor {
         rate_limiter: &RateLimiter,
         worker_id: usize,
     ) -> Result<Vec<MetricPoint>> {
-        let client = tenant.cluster.client().clone();
-        let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &tenant.namespace);
-        let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), &tenant.namespace);
-
         let start_time = Instant::now();
         let deadline = start_time + duration;
-        let mut handles = Vec::new();
+        let mut points = Vec::new();
         let mut counter = 0u64;
 
         while Instant::now() < deadline {
@@ -87,185 +86,190 @@ impl FairnessControlPlaneAssessor {
             rate_limiter.wait().await;
 
             let name = format!("fairness-test-{}-{}", worker_id, counter);
-            let cm_api = cm_api.clone();
-            let deploy_api = deploy_api.clone();
             let namespace = tenant.namespace.clone();
 
-            // Spawn the operation to allow concurrency (pipelining)
-            // This ensures we can meet the target rate even if latency > interval
-            let handle = tokio::spawn(async move {
-                let mut points = Vec::new();
-                let labels = std::collections::BTreeMap::from([
-                    ("kumuteva.io/test".to_string(), "control-plane".to_string()),
-                    ("app".to_string(), name.clone()),
-                ]);
+            let labels = std::collections::BTreeMap::from([
+                ("kumuteva.io/test".to_string(), "control-plane".to_string()),
+                ("app".to_string(), name.clone()),
+            ]);
 
-                // 1. Create ConfigMap
-                let cm = ConfigMap {
-                    metadata: kube::api::ObjectMeta {
-                        name: Some(name.clone()),
-                        namespace: Some(namespace.clone()),
-                        labels: Some(labels.clone()),
-                        ..Default::default()
-                    },
-                    data: Some([("key".to_string(), "value".to_string())].into()),
+            // 1. Create ConfigMap
+            let cm = ConfigMap {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(name.clone()),
+                    namespace: Some(namespace.clone()),
+                    labels: Some(labels.clone()),
                     ..Default::default()
-                };
+                },
+                data: Some([("key".to_string(), "value".to_string())].into()),
+                ..Default::default()
+            };
 
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res_cm_create = cm_api.create(&PostParams::default(), &cm).await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res_cm_create.is_err(),
-                    label: Some(format!("create-cm-{}", name)),
-                });
+            let ts = start_time.elapsed().as_secs_f64();
+            let op_start = Instant::now();
+            let res_cm_create = tenant
+                .cluster
+                .create_namespaced_resource(&cm, &tenant.namespace)
+                .await;
 
-                // 2. Create Deployment
-                let deployment = Deployment {
-                    metadata: kube::api::ObjectMeta {
-                        name: Some(name.clone()),
-                        namespace: Some(namespace.clone()),
-                        labels: Some(labels.clone()),
-                        ..Default::default()
-                    },
-                    spec: Some(k8s_openapi::api::apps::v1::DeploymentSpec {
-                        replicas: Some(1),
-                        selector: k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector {
-                            match_labels: Some(std::collections::BTreeMap::from([(
-                                "app".to_string(),
-                                name.clone(),
-                            )])),
-                            ..Default::default()
-                        },
-                        template: k8s_openapi::api::core::v1::PodTemplateSpec {
-                            metadata: Some(kube::api::ObjectMeta {
-                                labels: Some(std::collections::BTreeMap::from([(
-                                    "app".to_string(),
-                                    name.clone(),
-                                )])),
-                                ..Default::default()
-                            }),
-                            spec: Some(k8s_openapi::api::core::v1::PodSpec {
-                                containers: vec![k8s_openapi::api::core::v1::Container {
-                                    name: "nginx".to_string(),
-                                    image: Some("nginx:alpine".to_string()),
-                                    ..Default::default()
-                                }],
-                                ..Default::default()
-                            }),
-                        },
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                };
-
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res_deploy_create =
-                    deploy_api.create(&PostParams::default(), &deployment).await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res_deploy_create.is_err(),
-                    label: Some(format!("create-deploy-{}", name)),
-                });
-
-                // 3. Update ConfigMap
-                if res_cm_create.is_ok() {
-                    let patch = serde_json::json!({ "data": { "key": "updated-value" } });
-                    let ts = start_time.elapsed().as_secs_f64();
-                    let op_start = Instant::now();
-                    let res = cm_api
-                        .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
-                        .await;
-                    points.push(MetricPoint {
-                        timestamp_secs: ts,
-                        latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                        is_error: res.is_err(),
-                        label: Some(format!("update-cm-{}", name)),
-                    });
-                }
-
-                // 4. Update Deployment (scale up)
-                if res_deploy_create.is_ok() {
-                    let patch = serde_json::json!({ "spec": { "replicas": 2 } });
-                    let ts = start_time.elapsed().as_secs_f64();
-                    let op_start = Instant::now();
-                    let res = deploy_api
-                        .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
-                        .await;
-                    points.push(MetricPoint {
-                        timestamp_secs: ts,
-                        latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                        is_error: res.is_err(),
-                        label: Some(format!("update-deploy-{}", name)),
-                    });
-                }
-                // 5. List ConfigMaps
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res = cm_api
-                    .list(&ListParams::default().labels(&format!("app={}", name)))
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("list-cm-{}", name)),
-                });
-
-                // 6. List Deployments
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res = deploy_api
-                    .list(&ListParams::default().labels(&format!("app={}", name)))
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("list-deploy-{}", name)),
-                });
-
-                // 7. Delete ConfigMap
-                if res_cm_create.is_ok() {
-                    let ts = start_time.elapsed().as_secs_f64();
-                    let op_start = Instant::now();
-                    let res = cm_api.delete(&name, &DeleteParams::default()).await;
-                    points.push(MetricPoint {
-                        timestamp_secs: ts,
-                        latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                        is_error: res.is_err(),
-                        label: Some(format!("delete-cm-{}", name)),
-                    });
-                }
-
-                // 8. Delete Deployment
-                if res_deploy_create.is_ok() {
-                    let ts = start_time.elapsed().as_secs_f64();
-                    let op_start = Instant::now();
-                    let res = deploy_api.delete(&name, &DeleteParams::default()).await;
-                    points.push(MetricPoint {
-                        timestamp_secs: ts,
-                        latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                        is_error: res.is_err(),
-                        label: Some(format!("delete-deploy-{}", name)),
-                    });
-                }
-                points
+            points.push(MetricPoint {
+                timestamp_secs: ts,
+                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                is_error: res_cm_create.is_err(),
+                label: Some(format!("create-cm-{}", name)),
             });
 
-            handles.push(handle);
-            counter += 1;
-        }
+            // 2. Create nginx Pod
+            let deployment = Pod {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(name.clone()),
+                    namespace: Some(namespace.clone()),
+                    labels: Some(labels.clone()),
+                    ..Default::default()
+                },
+                spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                    containers: vec![k8s_openapi::api::core::v1::Container {
+                        name: "nginx".to_string(),
+                        image: Some("nginx:latest".to_string()),
+                        image_pull_policy: Some("IfNotPresent".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
 
-        let mut points = Vec::with_capacity(handles.len() * 6);
-        for handle in handles {
-            if let Ok(task_points) = handle.await {
-                points.extend(task_points);
+            let ts = start_time.elapsed().as_secs_f64();
+            let op_start = Instant::now();
+            let res_pod_create = tenant
+                .cluster
+                .create_namespaced_resource(&deployment, &tenant.namespace)
+                .await;
+            points.push(MetricPoint {
+                timestamp_secs: ts,
+                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                is_error: res_pod_create.is_err(),
+                label: Some(format!("create-deploy-{}", name)),
+            });
+
+            // 3. Update ConfigMap
+            if res_cm_create.is_ok() {
+                let patch = serde_json::json!({ "data": { "key": "updated-value" } });
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res: Result<ConfigMap> = tenant
+                    .cluster
+                    .patch_namespaced_resource(&name, &tenant.namespace, &Patch::Merge(&patch))
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("update-cm-{}", name)),
+                });
             }
+
+            //  Wait for pods to be ready (watch for deployment to be ready)
+            if res_pod_create.is_ok() {
+                let _ = tenant
+                    .cluster
+                    .wait_for_pod_readiness_timeout(
+                        &name,
+                        &tenant.namespace,
+                        (deadline - Instant::now()).as_secs() as u32,
+                    )
+                    .await;
+            }
+
+            // 4. Update Pod (add label)
+            if res_pod_create.is_ok() {
+                let patch = serde_json::json!({ "metadata": { "labels": { "updated": "true" } } });
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res: Result<Pod> = tenant
+                    .cluster
+                    .patch_namespaced_resource(&name, &tenant.namespace, &Patch::Merge(&patch))
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("update-deploy-{}", name)),
+                });
+            }
+            // 5. List ConfigMaps
+            let ts = start_time.elapsed().as_secs_f64();
+            let op_start = Instant::now();
+            let res = tenant
+                .cluster
+                .list_namespaced_resources::<ConfigMap>(&tenant.namespace)
+                .await;
+            points.push(MetricPoint {
+                timestamp_secs: ts,
+                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                is_error: res.is_err(),
+                label: Some(format!("list-cm-{}", name)),
+            });
+
+            // 6. List Pods
+            let ts = start_time.elapsed().as_secs_f64();
+            let op_start = Instant::now();
+            let res = tenant
+                .cluster
+                .list_namespaced_resources::<Pod>(&tenant.namespace)
+                .await;
+            points.push(MetricPoint {
+                timestamp_secs: ts,
+                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                is_error: res.is_err(),
+                label: Some(format!("list-deploy-{}", name)),
+            });
+
+            // 7. Delete ConfigMap
+            if res_cm_create.is_ok() {
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res = tenant
+                    .cluster
+                    .delete_resource_in_namespace::<ConfigMap>(&name, &tenant.namespace)
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("delete-cm-{}", name)),
+                });
+            }
+
+            // 8. Delete Deployment
+            if res_pod_create.is_ok() {
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res = tenant
+                    .cluster
+                    .delete_resource_in_namespace::<Pod>(&name, &tenant.namespace)
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("delete-deploy-{}", name)),
+                });
+            }
+
+            // Wait for pod to be deleted
+            if res_pod_create.is_ok() {
+                let _ = tenant
+                    .cluster
+                    .wait_for_pod_deletion_timeout(
+                        &name,
+                        &tenant.namespace,
+                        (deadline - Instant::now()).as_secs() as u32,
+                    )
+                    .await;
+            }
+
+            counter += 1;
         }
 
         Ok(points)
@@ -291,11 +295,39 @@ impl FairnessControlPlaneAssessor {
         let _ = self.cleanup_resources(&t1).await;
         let _ = self.cleanup_resources(&t2).await;
 
+        // manipulate the number of workers to reach the desired request rate per tenant
+        let target_t1_workers: usize = if t1_limiter.rate().is_infinite() {
+            1
+        } else {
+            let ops_per_scenario = 6.0; // Each scenario performs 6 operations
+            let desired_rate = t1_limiter.rate() / ops_per_scenario;
+            let workers = (desired_rate / t1_workers as f64).ceil() as usize;
+            workers.min(self.config.max_workers)
+        };
+
+        let target_t2_workers: usize = if t2_limiter.rate().is_infinite() {
+            1
+        } else {
+            let ops_per_scenario = 6.0; // Each scenario performs 6 operations
+            let desired_rate = t2_limiter.rate() / ops_per_scenario;
+            let workers = (desired_rate / t2_workers as f64).ceil() as usize;
+            workers.min(t2_workers)
+        };
+        info!(
+            "Target workers - tenant1: {}, tenant2: {}",
+            target_t1_workers, target_t2_workers
+        );
+
         let t1_handle = tokio::spawn(async move {
             let mut all_points = Vec::new();
             let mut handles = Vec::new();
 
             // Spawn worker tasks for tenant1
+            info!(
+                "Starting tenant1 with {} workers at rate {:.2} ops/sec",
+                t1_workers,
+                t1_limiter.rate()
+            );
             for i in 0..t1_workers {
                 let tenant = t1.clone();
                 // Adjust rate because each scenario performs 6 operations
@@ -303,7 +335,9 @@ impl FairnessControlPlaneAssessor {
                 let adjusted_rate = if t1_limiter.rate().is_infinite() {
                     0.0
                 } else {
-                    t1_limiter.rate() / ops_per_scenario
+                    let rate = t1_limiter.rate() / ops_per_scenario;
+
+                    rate / t1_workers as f64
                 };
 
                 let limiter = RateLimiter::new(t1_limiter.strategy, adjusted_rate);
@@ -311,7 +345,7 @@ impl FairnessControlPlaneAssessor {
 
                 handles.push(tokio::spawn(async move {
                     let assessor = FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
-                        workers: 1,
+                        max_workers: 1,
                     });
                     assessor.run_tenant(&tenant, dur, &limiter, i).await
                 }));
@@ -331,6 +365,11 @@ impl FairnessControlPlaneAssessor {
             let mut handles = Vec::new();
 
             // Spawn worker tasks for tenant2
+            info!(
+                "Starting tenant2 with {} workers at rate {:.2} ops/sec",
+                t2_workers,
+                t2_limiter.rate()
+            );
             for i in 0..t2_workers {
                 let tenant = t2.clone();
                 // Adjust rate because each scenario performs 6 operations
@@ -338,7 +377,9 @@ impl FairnessControlPlaneAssessor {
                 let adjusted_rate = if t2_limiter.rate().is_infinite() {
                     0.0
                 } else {
-                    t2_limiter.rate() / ops_per_scenario
+                    let rate = t2_limiter.rate() / ops_per_scenario;
+
+                    rate / t2_workers as f64
                 };
 
                 let limiter = RateLimiter::new(t2_limiter.strategy, adjusted_rate);
@@ -346,7 +387,7 @@ impl FairnessControlPlaneAssessor {
 
                 handles.push(tokio::spawn(async move {
                     let assessor = FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
-                        workers: 1,
+                        max_workers: 1,
                     });
                     assessor.run_tenant(&tenant, dur, &limiter, i).await
                 }));
@@ -396,8 +437,8 @@ impl FairnessAssessor for FairnessControlPlaneAssessor {
             config.baseline_duration,
             config.tenant1_limiter(),
             config.tenant2_limiter(),
-            self.config.workers,
-            self.config.workers,
+            self.config.max_workers,
+            self.config.max_workers,
         )
         .await
     }
@@ -409,14 +450,14 @@ impl FairnessAssessor for FairnessControlPlaneAssessor {
         config: &FairnessConfig,
     ) -> Result<PhaseResult> {
         let malicious_workers =
-            (self.config.workers as f64 * config.malicious_pod_multiplier) as usize;
+            (self.config.max_workers as f64 * config.malicious_pod_multiplier) as usize;
         self.run_phase(
             tenant1,
             tenant2,
             config.test_duration,
             config.tenant1_limiter(),
             config.tenant2_malicious_limiter(),
-            self.config.workers,
+            self.config.max_workers,
             malicious_workers.max(1),
         )
         .await
