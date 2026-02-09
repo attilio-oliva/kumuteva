@@ -26,7 +26,7 @@ storage:
   scenario: random 
 
 workload:
-  rate: 25.0
+  rate: 100.0
   pods: 1
   threads: 1
   maxPrime: 500000

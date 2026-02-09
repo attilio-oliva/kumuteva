@@ -120,30 +120,40 @@ impl FairnessControlPlaneAssessor {
             });
 
             // 2. Create nginx Pod
-            let deployment = Pod {
-                metadata: kube::api::ObjectMeta {
-                    name: Some(name.clone()),
-                    namespace: Some(namespace.clone()),
-                    labels: Some(labels.clone()),
-                    ..Default::default()
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name.clone(),
+                    "namespace": namespace.clone(),
+                    "labels": labels.clone(),
                 },
-                spec: Some(k8s_openapi::api::core::v1::PodSpec {
-                    containers: vec![k8s_openapi::api::core::v1::Container {
-                        name: "nginx".to_string(),
-                        image: Some("nginx:latest".to_string()),
-                        image_pull_policy: Some("IfNotPresent".to_string()),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "nginx",
+                            "image": "nginx:latest",
+                            "imagePullPolicy": "IfNotPresent",
+                            "resources": {
+                                "requests": {
+                                    "cpu": "50m",
+                                    "memory": "128Mi"
+                                },
+                                "limits": {
+                                    "cpu": "100m",
+                                    "memory": "256Mi"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }))?;
 
             let ts = start_time.elapsed().as_secs_f64();
             let op_start = Instant::now();
             let res_pod_create = tenant
                 .cluster
-                .create_namespaced_resource(&deployment, &tenant.namespace)
+                .create_namespaced_resource(&pod, &tenant.namespace)
                 .await;
             points.push(MetricPoint {
                 timestamp_secs: ts,
