@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, WatchParams};
+use kube::api::{DeleteParams, ListParams, Patch};
 use kube::Api;
+
 use tracing::info;
 
 use crate::assessment::fairness_assessor::{
@@ -68,8 +68,8 @@ impl FairnessControlPlaneAssessor {
         Ok(())
     }
 
-    /// Run workload for a single tenant
-    async fn run_tenant(
+    /// Run workload for a single tenant - performs CRUD operations on ConfigMaps
+    async fn run_stress_test_on_configmap(
         &self,
         tenant: &TenantClusterConfig,
         duration: Duration,
@@ -119,7 +119,84 @@ impl FairnessControlPlaneAssessor {
                 label: Some(format!("create-cm-{}", name)),
             });
 
-            // 2. Create nginx Pod
+            // 1. Update ConfigMap
+            if res_cm_create.is_ok() {
+                let patch = serde_json::json!({ "data": { "key": "updated-value" } });
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res: Result<ConfigMap> = tenant
+                    .cluster
+                    .patch_namespaced_resource(&name, &tenant.namespace, &Patch::Merge(&patch))
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("update-cm-{}", name)),
+                });
+            }
+
+            //2. List ConfigMaps
+            let ts = start_time.elapsed().as_secs_f64();
+            let op_start = Instant::now();
+            let res = tenant
+                .cluster
+                .list_namespaced_resources::<ConfigMap>(&tenant.namespace)
+                .await;
+            points.push(MetricPoint {
+                timestamp_secs: ts,
+                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                is_error: res.is_err(),
+                label: Some(format!("list-cm-{}", name)),
+            });
+
+            // 3. Delete ConfigMap
+            if res_cm_create.is_ok() {
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res = tenant
+                    .cluster
+                    .delete_resource_in_namespace::<ConfigMap>(&name, &tenant.namespace)
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("delete-cm-{}", name)),
+                });
+            }
+
+            counter += 1;
+        }
+
+        Ok(points)
+    }
+
+    async fn run_stress_test_on_pod(
+        &self,
+        tenant: &TenantClusterConfig,
+        duration: Duration,
+        rate_limiter: &RateLimiter,
+        worker_id: usize,
+    ) -> Result<Vec<MetricPoint>> {
+        let start_time = Instant::now();
+        let deadline = start_time + duration;
+        let mut points = Vec::new();
+        let mut counter = 0u64;
+
+        while Instant::now() < deadline {
+            // Wait for rate limiter
+            rate_limiter.wait().await;
+
+            let name: String = format!("fairness-pod-{}-{}", worker_id, counter);
+            let namespace = tenant.namespace.clone();
+
+            let labels = std::collections::BTreeMap::from([
+                ("kumuteva.io/test".to_string(), "control-plane".to_string()),
+                ("app".to_string(), name.clone()),
+            ]);
+
+            // 1. Create Pod
             let pod: Pod = serde_json::from_value(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
@@ -131,17 +208,17 @@ impl FairnessControlPlaneAssessor {
                 "spec": {
                     "containers": [
                         {
-                            "name": "nginx",
-                            "image": "nginx:latest",
+                            "name": "pause",
+                            "image": "k8s.gcr.io/pause:3.5",
                             "imagePullPolicy": "IfNotPresent",
                             "resources": {
                                 "requests": {
-                                    "cpu": "50m",
-                                    "memory": "128Mi"
+                                    "cpu": "10m",
+                                    "memory": "10Mi"
                                 },
                                 "limits": {
-                                    "cpu": "100m",
-                                    "memory": "256Mi"
+                                    "cpu": "20m",
+                                    "memory": "20Mi"
                                 }
                             }
                         }
@@ -159,27 +236,10 @@ impl FairnessControlPlaneAssessor {
                 timestamp_secs: ts,
                 latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
                 is_error: res_pod_create.is_err(),
-                label: Some(format!("create-deploy-{}", name)),
+                label: Some(format!("create-pod-{}", name)),
             });
 
-            // 3. Update ConfigMap
-            if res_cm_create.is_ok() {
-                let patch = serde_json::json!({ "data": { "key": "updated-value" } });
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res: Result<ConfigMap> = tenant
-                    .cluster
-                    .patch_namespaced_resource(&name, &tenant.namespace, &Patch::Merge(&patch))
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("update-cm-{}", name)),
-                });
-            }
-
-            //  Wait for pods to be ready (watch for deployment to be ready)
+            //  Wait for pods to be ready (watch for pod to be ready)
             if res_pod_create.is_ok() {
                 let _ = tenant
                     .cluster
@@ -191,7 +251,7 @@ impl FairnessControlPlaneAssessor {
                     .await;
             }
 
-            // 4. Update Pod (add label)
+            // 2. Update Pod (add label)
             if res_pod_create.is_ok() {
                 let patch = serde_json::json!({ "metadata": { "labels": { "updated": "true" } } });
                 let ts = start_time.elapsed().as_secs_f64();
@@ -204,24 +264,11 @@ impl FairnessControlPlaneAssessor {
                     timestamp_secs: ts,
                     latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
                     is_error: res.is_err(),
-                    label: Some(format!("update-deploy-{}", name)),
+                    label: Some(format!("update-pod-{}", name)),
                 });
             }
-            // 5. List ConfigMaps
-            let ts = start_time.elapsed().as_secs_f64();
-            let op_start = Instant::now();
-            let res = tenant
-                .cluster
-                .list_namespaced_resources::<ConfigMap>(&tenant.namespace)
-                .await;
-            points.push(MetricPoint {
-                timestamp_secs: ts,
-                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                is_error: res.is_err(),
-                label: Some(format!("list-cm-{}", name)),
-            });
 
-            // 6. List Pods
+            // 3. List Pods
             let ts = start_time.elapsed().as_secs_f64();
             let op_start = Instant::now();
             let res = tenant
@@ -232,26 +279,10 @@ impl FairnessControlPlaneAssessor {
                 timestamp_secs: ts,
                 latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
                 is_error: res.is_err(),
-                label: Some(format!("list-deploy-{}", name)),
+                label: Some(format!("list-pod-{}", name)),
             });
 
-            // 7. Delete ConfigMap
-            if res_cm_create.is_ok() {
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res = tenant
-                    .cluster
-                    .delete_resource_in_namespace::<ConfigMap>(&name, &tenant.namespace)
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("delete-cm-{}", name)),
-                });
-            }
-
-            // 8. Delete Deployment
+            // 4. Delete Pod
             if res_pod_create.is_ok() {
                 let ts = start_time.elapsed().as_secs_f64();
                 let op_start = Instant::now();
@@ -263,7 +294,7 @@ impl FairnessControlPlaneAssessor {
                     timestamp_secs: ts,
                     latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
                     is_error: res.is_err(),
-                    label: Some(format!("delete-deploy-{}", name)),
+                    label: Some(format!("delete-pod-{}", name)),
                 });
             }
 
@@ -278,7 +309,6 @@ impl FairnessControlPlaneAssessor {
                     )
                     .await;
             }
-
             counter += 1;
         }
 
@@ -305,27 +335,36 @@ impl FairnessControlPlaneAssessor {
         let _ = self.cleanup_resources(&t1).await;
         let _ = self.cleanup_resources(&t2).await;
 
-        // manipulate the number of workers to reach the desired request rate per tenant
-        let target_t1_workers: usize = if t1_limiter.rate().is_infinite() {
-            1
-        } else {
-            let ops_per_scenario = 6.0; // Each scenario performs 6 operations
-            let desired_rate = t1_limiter.rate() / ops_per_scenario;
-            let workers = (desired_rate / t1_workers as f64).ceil() as usize;
-            workers.min(self.config.max_workers)
+        let estimate_target_workers = |limiter: &RateLimiter, max_workers: usize| {
+            if limiter.rate().is_infinite() {
+                1
+            } else {
+                let ops_per_scenario = 3.0; // Each scenario performs 3 operations
+                let desired_rate = limiter.rate() / ops_per_scenario;
+                (desired_rate.ceil() as usize).min(max_workers)
+            }
         };
 
-        let target_t2_workers: usize = if t2_limiter.rate().is_infinite() {
-            1
-        } else {
-            let ops_per_scenario = 6.0; // Each scenario performs 6 operations
-            let desired_rate = t2_limiter.rate() / ops_per_scenario;
-            let workers = (desired_rate / t2_workers as f64).ceil() as usize;
-            workers.min(t2_workers)
+        let distribute_workers = |total_workers: usize| {
+            let pod_workers = total_workers / 2; // Allocate 1/2 of workers to Pod operations
+            let cm_workers = total_workers - pod_workers;
+            (pod_workers, cm_workers)
         };
+
+        let target_t1_workers = estimate_target_workers(&t1_limiter, t1_workers);
+        let target_t2_workers = estimate_target_workers(&t2_limiter, t2_workers);
+
         info!(
             "Target workers - tenant1: {}, tenant2: {}",
             target_t1_workers, target_t2_workers
+        );
+
+        let (t1_pod_workers, t1_cm_workers) = distribute_workers(target_t1_workers);
+        let (t2_pod_workers, t2_cm_workers) = distribute_workers(target_t2_workers);
+
+        info!(
+            "Worker distribution - tenant1: {} pod workers, {} cm workers; tenant2: {} pod workers, {} cm workers",
+            t1_pod_workers, t1_cm_workers, t2_pod_workers, t2_cm_workers
         );
 
         let t1_handle = tokio::spawn(async move {
@@ -340,8 +379,8 @@ impl FairnessControlPlaneAssessor {
             );
             for i in 0..t1_workers {
                 let tenant = t1.clone();
-                // Adjust rate because each scenario performs 6 operations
-                let ops_per_scenario = 6.0;
+                // Adjust rate because each scenario performs 3 operations
+                let ops_per_scenario = 3.0;
                 let adjusted_rate = if t1_limiter.rate().is_infinite() {
                     0.0
                 } else {
@@ -353,12 +392,27 @@ impl FairnessControlPlaneAssessor {
                 let limiter = RateLimiter::new(t1_limiter.strategy, adjusted_rate);
                 let dur = duration;
 
-                handles.push(tokio::spawn(async move {
-                    let assessor = FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
-                        max_workers: 1,
-                    });
-                    assessor.run_tenant(&tenant, dur, &limiter, i).await
-                }));
+                if i < t1_pod_workers {
+                    handles.push(tokio::spawn(async move {
+                        let assessor =
+                            FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
+                                max_workers: 1,
+                            });
+                        assessor
+                            .run_stress_test_on_pod(&tenant, dur, &limiter, i)
+                            .await
+                    }));
+                } else {
+                    handles.push(tokio::spawn(async move {
+                        let assessor =
+                            FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
+                                max_workers: 1,
+                            });
+                        assessor
+                            .run_stress_test_on_configmap(&tenant, dur, &limiter, i)
+                            .await
+                    }));
+                }
             }
 
             for handle in handles {
@@ -382,8 +436,8 @@ impl FairnessControlPlaneAssessor {
             );
             for i in 0..t2_workers {
                 let tenant = t2.clone();
-                // Adjust rate because each scenario performs 6 operations
-                let ops_per_scenario = 6.0;
+                // Adjust rate because each scenario performs 3 operations
+                let ops_per_scenario = 3.0;
                 let adjusted_rate = if t2_limiter.rate().is_infinite() {
                     0.0
                 } else {
@@ -395,12 +449,27 @@ impl FairnessControlPlaneAssessor {
                 let limiter = RateLimiter::new(t2_limiter.strategy, adjusted_rate);
                 let dur = duration;
 
-                handles.push(tokio::spawn(async move {
-                    let assessor = FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
-                        max_workers: 1,
-                    });
-                    assessor.run_tenant(&tenant, dur, &limiter, i).await
-                }));
+                if i < t2_pod_workers {
+                    handles.push(tokio::spawn(async move {
+                        let assessor =
+                            FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
+                                max_workers: 1,
+                            });
+                        assessor
+                            .run_stress_test_on_pod(&tenant, dur, &limiter, i)
+                            .await
+                    }));
+                } else {
+                    handles.push(tokio::spawn(async move {
+                        let assessor =
+                            FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
+                                max_workers: 1,
+                            });
+                        assessor
+                            .run_stress_test_on_configmap(&tenant, dur, &limiter, i)
+                            .await
+                    }));
+                }
             }
 
             for handle in handles {
