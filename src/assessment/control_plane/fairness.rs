@@ -119,7 +119,23 @@ impl FairnessControlPlaneAssessor {
                 label: Some(format!("create-cm-{}", name)),
             });
 
-            // 1. Update ConfigMap
+            // 2. Get ConfigMap
+            if res_cm_create.is_ok() {
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res = tenant
+                    .cluster
+                    .get_resource_in_namespace::<ConfigMap>(&name, &tenant.namespace)
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("get-cm-{}", name)),
+                });
+            }
+
+            // 3. Update ConfigMap
             if res_cm_create.is_ok() {
                 let patch = serde_json::json!({ "data": { "key": "updated-value" } });
                 let ts = start_time.elapsed().as_secs_f64();
@@ -136,7 +152,23 @@ impl FairnessControlPlaneAssessor {
                 });
             }
 
-            //2. List ConfigMaps
+            // 4. Get ConfigMap again to verify update
+            if res_cm_create.is_ok() {
+                let ts = start_time.elapsed().as_secs_f64();
+                let op_start = Instant::now();
+                let res = tenant
+                    .cluster
+                    .get_resource_in_namespace::<ConfigMap>(&name, &tenant.namespace)
+                    .await;
+                points.push(MetricPoint {
+                    timestamp_secs: ts,
+                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
+                    is_error: res.is_err(),
+                    label: Some(format!("get-updated-cm-{}", name)),
+                });
+            }
+
+            //5. List ConfigMaps
             let ts = start_time.elapsed().as_secs_f64();
             let op_start = Instant::now();
             let res = tenant
@@ -150,7 +182,7 @@ impl FairnessControlPlaneAssessor {
                 label: Some(format!("list-cm-{}", name)),
             });
 
-            // 3. Delete ConfigMap
+            // 6. Delete ConfigMap
             if res_cm_create.is_ok() {
                 let ts = start_time.elapsed().as_secs_f64();
                 let op_start = Instant::now();
@@ -239,16 +271,21 @@ impl FairnessControlPlaneAssessor {
                 label: Some(format!("create-pod-{}", name)),
             });
 
-            //  Wait for pods to be ready (watch for pod to be ready)
+            // Wait for pods to be ready (watch for pod to be ready)
             if res_pod_create.is_ok() {
-                let _ = tenant
-                    .cluster
-                    .wait_for_pod_readiness_timeout(
-                        &name,
-                        &tenant.namespace,
-                        (deadline - Instant::now()).as_secs() as u32,
-                    )
-                    .await;
+                let remaining_time = deadline.saturating_duration_since(Instant::now());
+
+                // Only wait if we still have time left in the test
+                if !remaining_time.is_zero() {
+                    let _ = tenant
+                        .cluster
+                        .wait_for_pod_readiness_timeout(
+                            &name,
+                            &tenant.namespace,
+                            remaining_time.as_secs() as u32,
+                        )
+                        .await;
+                }
             }
 
             // 2. Update Pod (add label)
@@ -300,12 +337,13 @@ impl FairnessControlPlaneAssessor {
 
             // Wait for pod to be deleted
             if res_pod_create.is_ok() {
+                let remaining_time = deadline.saturating_duration_since(Instant::now());
                 let _ = tenant
                     .cluster
                     .wait_for_pod_deletion_timeout(
                         &name,
                         &tenant.namespace,
-                        (deadline - Instant::now()).as_secs() as u32,
+                        remaining_time.as_secs() as u32,
                     )
                     .await;
             }
