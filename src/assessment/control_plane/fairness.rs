@@ -272,21 +272,21 @@ impl FairnessControlPlaneAssessor {
             });
 
             // Wait for pods to be ready (watch for pod to be ready)
-            if res_pod_create.is_ok() {
-                let remaining_time = deadline.saturating_duration_since(Instant::now());
+            // if res_pod_create.is_ok() {
+            //     let remaining_time = deadline.saturating_duration_since(Instant::now());
 
-                // Only wait if we still have time left in the test
-                if !remaining_time.is_zero() {
-                    let _ = tenant
-                        .cluster
-                        .wait_for_pod_readiness_timeout(
-                            &name,
-                            &tenant.namespace,
-                            remaining_time.as_secs() as u32,
-                        )
-                        .await;
-                }
-            }
+            //     // Only wait if we still have time left in the test
+            //     if !remaining_time.is_zero() {
+            //         let _ = tenant
+            //             .cluster
+            //             .wait_for_pod_readiness_timeout(
+            //                 &name,
+            //                 &tenant.namespace,
+            //                 remaining_time.as_secs() as u32,
+            //             )
+            //             .await;
+            //     }
+            // }
 
             // 2. Update Pod (add label)
             if res_pod_create.is_ok() {
@@ -336,17 +336,17 @@ impl FairnessControlPlaneAssessor {
             }
 
             // Wait for pod to be deleted
-            if res_pod_create.is_ok() {
-                let remaining_time = deadline.saturating_duration_since(Instant::now());
-                let _ = tenant
-                    .cluster
-                    .wait_for_pod_deletion_timeout(
-                        &name,
-                        &tenant.namespace,
-                        remaining_time.as_secs() as u32,
-                    )
-                    .await;
-            }
+            // if res_pod_create.is_ok() {
+            //     let remaining_time = deadline.saturating_duration_since(Instant::now());
+            //     let _ = tenant
+            //         .cluster
+            //         .wait_for_pod_deletion_timeout(
+            //             &name,
+            //             &tenant.namespace,
+            //             remaining_time.as_secs() as u32,
+            //         )
+            //         .await;
+            // }
             counter += 1;
         }
 
