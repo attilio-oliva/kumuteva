@@ -7,6 +7,10 @@ class ExperimentData:
     Container for experiment data with methods to compute common metrics for plotting.
     """
     def __init__(self, df, metadata=None):
+        # remove data that has is_error as True
+        #df = df[df['is_error'] == False].copy()
+        # Do not consider data points with duration_ms <= 0 as they may indicate failed or invalid measurements
+        df = df[df['duration_ms'] > 0].copy()
         self.raw_df = df
         self.metadata = metadata or {}
         self.t1_df = self._preprocess(df[df['role'] == 'tenant1'].copy())

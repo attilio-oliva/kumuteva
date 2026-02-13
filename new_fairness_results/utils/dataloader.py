@@ -18,8 +18,10 @@ DATA_CONFIGS = {
     },
 }
 
-def load_experiment_data(src_dir="./"):
-    """Load data and preprocess as experiment data from the specified source directory, organizing it by solution and system."""
+def load_experiment_data(src_dir="./", systems_to_load=None):
+    """Load data and preprocess as experiment data from the specified source directory, organizing it by solution and system.
+       By default load all systems (control-plane, network, ...). You may pass the exact list here.
+    """
     experiments = {}
     
     latest_stress_files = _get_latest_file_paths_generic(src_dir, DATA_CONFIGS['stresstest'])
@@ -27,6 +29,9 @@ def load_experiment_data(src_dir="./"):
     
     #zip the stress test and baseline files based on solution and system
     for (solution, system, timestamp), stress_file in latest_stress_files.items():
+        if systems_to_load and system not in systems_to_load:
+            continue
+
         baseline_file = latest_baseline_files.get((solution, system, timestamp))
         if baseline_file:
             baseline_experiment = preprocessing.TestResultDeserializer().load_experiment(baseline_file)
