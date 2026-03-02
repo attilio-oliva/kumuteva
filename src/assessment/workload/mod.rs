@@ -13,7 +13,7 @@ use crate::assessment::{
     SubsystemReport,
 };
 
-// Re-export for backward compatibility
+#[allow(dead_code)]
 pub type WorkloadIsolationReport = SubsystemReport<WorkloadResource>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -126,7 +126,8 @@ impl MultitenancyAssessor for WorkloadAssessor {
     }
 }
 
-/// Public API - maintains backward compatibility
+/// Simple Public API
+#[allow(dead_code)]
 pub async fn check_workload_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,

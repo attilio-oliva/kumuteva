@@ -59,10 +59,6 @@ impl Default for TenantsPortMapping {
 }
 
 impl TenantsPortMapping {
-    pub fn new(tenant1: PortMapping, tenant2: PortMapping) -> Self {
-        Self { tenant1, tenant2 }
-    }
-
     pub fn from_tuple(tenant1: (u16, u16), tenant2: (u16, u16)) -> Self {
         Self {
             tenant1: PortMapping {
@@ -131,6 +127,7 @@ impl<T: ClusterProvider> HostCluster<T> {
         })
     }
 
+    #[allow(dead_code)]
     pub async fn delete(&self) -> anyhow::Result<()> {
         T::delete_cluster(&self.name)
             .await
@@ -147,6 +144,7 @@ pub fn terminal_stderr_to_error(output: process::Output) -> Error {
 }
 
 impl HostClusterType {
+    #[allow(dead_code)]
     pub fn name(&self) -> &str {
         match self {
             HostClusterType::Kind(c) => &c.name,

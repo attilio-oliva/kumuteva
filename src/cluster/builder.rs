@@ -34,6 +34,7 @@ pub enum ControlPlaneIsolation {
     Kamaji(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum DataPlaneIsolation {
     Network(NetworkIsolationStrategy),
@@ -41,28 +42,33 @@ pub enum DataPlaneIsolation {
     Workload(WorkloadIsolation),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum NetworkIsolationStrategy {
     NetworkPolicy(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum StorageIsolationStrategy {
     SeparateStorageClass,
     ReclaimPolicySetToDelete,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum WorkloadIsolation {
     VM(VirtualMachineSandboxing),
     UserspaceKernel(UserspaceKernelSandboxing),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum VirtualMachineSandboxing {
     KataContainers,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum UserspaceKernelSandboxing {
     GVisor,
@@ -724,9 +730,6 @@ impl KubernetesClusterBuilder {
     }
 
     async fn deploy_kubevirt_cluster(&self, namespace: &str) -> anyhow::Result<()> {
-        let tenant1_service = self.host_cluster.port_mappings().tenant1.clone();
-        let tenant2_service = self.host_cluster.port_mappings().tenant2.clone();
-
         // sleep for a while to ensure the host cluster is ready
         sleep(Duration::from_secs(10)).await;
 

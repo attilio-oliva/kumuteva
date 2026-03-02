@@ -34,6 +34,7 @@ const NODE_PROBE_POD_NAME: &str = "node-network-probe";
 // RESOURCE AND OPERATION DEFINITIONS
 // =============================================================================
 
+#[allow(dead_code)]
 pub type NetworkIsolationReport = SubsystemReport<NetworkResource>;
 
 #[allow(dead_code)]
@@ -175,6 +176,7 @@ impl MultitenancyAssessor for NetworkAssessor {
 }
 
 /// Public API - entry point for network isolation assessment
+#[allow(dead_code)]
 pub async fn check_network_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,

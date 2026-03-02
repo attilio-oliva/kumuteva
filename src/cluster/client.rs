@@ -10,8 +10,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::{ClusterResourceScope, Metadata, NamespaceResourceScope, Resource};
 use kube::api::{
-    ApiResource, AttachParams, AttachedProcess, DynamicObject, ListParams, LogParams, Object,
-    ObjectList, ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams,
+    ApiResource, AttachParams, AttachedProcess, DynamicObject, ListParams, LogParams, ObjectList,
+    ObjectMeta, Patch, PatchParams, WatchEvent, WatchParams,
 };
 use kube::config::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -1414,7 +1414,26 @@ mod tests {
 
     use crate::cluster::KindCluster;
     use crate::cluster::KubernetesClient;
-    use crate::cluster::NGINX_POD;
+
+    use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
+    use kube::api::ObjectMeta;
+    use std::sync::LazyLock;
+
+    pub static NGINX_POD: LazyLock<Pod> = LazyLock::new(|| Pod {
+        metadata: ObjectMeta {
+            name: Some(String::from("nginx-pod")),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: String::from("nginx-container"),
+                image: Some(String::from("nginx")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
 
     const CLUSTER_NAME_PREFIX: &str = "test-k8s";
 

@@ -22,15 +22,17 @@ use tokio::time::sleep;
 
 use crate::assessment::control_plane::utils::create_minimal_object;
 use crate::assessment::{
-    AssessableResource, AutonomyRatio, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
+    AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
     OperationAssessment, SubsystemReport,
 };
 
 use crate::assessment::TenantClusterConfig;
 
+#[allow(dead_code)]
 pub type ControlPlaneIsolationReport = SubsystemReport<ControlPlaneResource>;
 
 /// Assessment of a single resource with all its operations
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ResourceAssessment<R: AssessableResource> {
     pub resource: R,
@@ -50,19 +52,6 @@ pub enum ControlPlaneAutonomyCategory {
     Infrastructure,
     /// Cluster-wide resources (ClusterRole, StorageClass, PersistentVolume, etc.)
     Cluster,
-}
-
-/// Autonomy level categories for control plane resources
-#[derive(Debug, Clone, Default)]
-pub struct ControlPlaneAutonomyLevels {
-    /// Workload resources (Pods, Deployments, etc.) - inside namespace
-    pub workload: AutonomyRatio,
-    /// Scope resources (Namespace itself, ResourceQuota, LimitRange)
-    pub scope: AutonomyRatio,
-    /// Infrastructure resources (Node, DaemonSet)
-    pub infrastructure: AutonomyRatio,
-    /// Cluster-wide resources (ClusterRole, StorageClass, etc.)
-    pub cluster: AutonomyRatio,
 }
 
 /// Control plane resources map to Kubernetes object kinds
@@ -188,6 +177,7 @@ impl ControlPlaneResource {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_namespaced(&self) -> bool {
         self.to_kubernetes_object().is_namespaced()
     }
@@ -397,11 +387,6 @@ fn is_valid_get_result(obj: &DynamicObject, expected_name: &str) -> bool {
         Some(name) => name == expected_name,
         None => false,
     }
-}
-
-/// Validate that a GET result contains any valid object (for existing resources)
-fn is_valid_object(obj: &DynamicObject) -> bool {
-    obj.metadata.name.is_some()
 }
 
 /// Delete a test resource and clean up any associated resources (like PVCs for StatefulSets)
@@ -858,7 +843,7 @@ pub async fn manual_test_cross_tenant_operation(
         if k8s_obj.kind() == "StatefulSet" {
             if let Some(ns) = namespace {
                 let pvc_name = format!("{}-{}-0", test_name, test_name);
-                let pvc_api = tenant1
+                let _delete_operation = tenant1
                     .cluster
                     .delete_resource_in_namespace::<PersistentVolumeClaim>(&pvc_name, ns)
                     .await;
@@ -907,6 +892,7 @@ fn print_operation_result<T: std::fmt::Debug, E: std::fmt::Display>(
 }
 
 /// Quick test for a specific resource - tests all operations
+#[allow(dead_code)]
 pub async fn manual_test_resource(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
@@ -919,6 +905,7 @@ pub async fn manual_test_resource(
 }
 
 /// Manual test for autonomy (single tenant) - checks if tenant can perform operation
+#[allow(dead_code)]
 pub async fn manual_test_autonomy(
     tenant: &TenantClusterConfig,
     resource: &ControlPlaneResource,

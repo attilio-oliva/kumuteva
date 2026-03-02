@@ -12,12 +12,6 @@ pub use network::*;
 pub use storage::*;
 pub use workload::*;
 
-// Re-export new clean fairness API
-pub use fairness_assessor::{
-    FairnessAssessor, FairnessConfig, FairnessLevel, FairnessResult, FairnessRunner,
-    FairnessRunnerBuilder, MetricPoint, PhaseResult, RateLimitStrategy, RateLimiter, TenantMetrics,
-};
-
 use tabled::settings::object::Rows;
 use tabled::settings::{Alignment, Modify, Style};
 use tabled::{Table, Tabled};
@@ -62,16 +56,6 @@ impl AssessmentConfig {
         }
     }
 
-    /// Create a new config with no systems enabled
-    pub fn none() -> Self {
-        Self {
-            control_plane: false,
-            storage: false,
-            network: false,
-            workload: false,
-        }
-    }
-
     /// Create config from CLI flags.
     /// If no flags are set, all systems are enabled (default behavior).
     /// If any flag is set, only those systems are enabled (exclusive mode).
@@ -90,11 +74,6 @@ impl AssessmentConfig {
             // Default mode: run all assessments
             Self::all()
         }
-    }
-
-    /// Check if any system is enabled
-    pub fn has_any(&self) -> bool {
-        self.control_plane || self.storage || self.network || self.workload
     }
 
     /// Get a list of enabled system names
@@ -854,10 +833,6 @@ fn format_ratio_with_icon(ratio: &AutonomyRatio) -> String {
         "❌"
     };
     format!("{} {}", icon, ratio)
-}
-
-fn format_isolation(level: &IsolationLevel) -> String {
-    format_isolation_with_bound(level, None)
 }
 
 /// Formats an isolation level, optionally showing the upper bound when Unknown.

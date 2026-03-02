@@ -21,7 +21,7 @@ impl ClusterProvider for K3sProvider {
         kubeconfig_path: &Path,
         tenants_port_mapping: TenantsPortMapping,
     ) -> anyhow::Result<()> {
-        let (tenant1_mapping, tenant2_mapping) =
+        let (_tenant1_mapping, _tenant2_mapping) =
             (&tenants_port_mapping.tenant1, &tenants_port_mapping.tenant2);
 
         // Create k3s data directory
@@ -50,7 +50,7 @@ impl ClusterProvider for K3sProvider {
         // Note: Direct port mapping in k3s requires external load balancer setup
         // This is a simplified approach - you may need additional configuration
 
-        let child = cmd.spawn().context("Failed to start k3s server")?;
+        let _child = cmd.spawn().context("Failed to start k3s server")?;
 
         // Wait for k3s to be ready
         thread::sleep(Duration::from_secs(10));
@@ -92,7 +92,7 @@ impl ClusterProvider for K3sProvider {
 
     async fn delete_cluster(name: &str) -> anyhow::Result<()> {
         // Kill k3s processes for this cluster
-        let output = Command::new("pkill")
+        let _output = Command::new("pkill")
             .arg("-f")
             .arg(format!("k3s.*{}", name))
             .output()

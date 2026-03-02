@@ -129,6 +129,7 @@ impl MultitenancyAssessor for StorageAssessor {
 }
 
 /// Public API - entry point for storage isolation assessment
+#[allow(dead_code)]
 pub async fn check_storage_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
