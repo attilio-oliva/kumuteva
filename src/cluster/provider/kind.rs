@@ -3,7 +3,64 @@ use std::{fs::File, io::Write, path::Path, process::Command, str};
 use anyhow::Context;
 use serde_json::json;
 
+/// Per-container log capacity for the benchmark cluster.
+///
+/// Sized for the storage assessment, which is by far the most verbose: 10k IOPS
+/// for 60 s is ~600k fio lines, ~20 MB, and the intruder runs ten such pods.
+/// 512 MB leaves room for longer phases or higher rates without revisiting this.
+const CONTAINER_LOG_MAX_SIZE: &str = "512Mi";
+
+/// Kept at the kubelet default; the size is what matters here.
+const CONTAINER_LOG_MAX_FILES: u32 = 5;
+
 use crate::cluster::{terminal_stderr_to_error, ClusterProvider, HostCluster, TenantsPortMapping};
+
+/// Build the kind cluster definition.
+///
+/// Separated from `create` so the generated document can be asserted on without
+/// standing up a cluster.
+fn cluster_config(name: &str, tenants_port_mapping: &TenantsPortMapping) -> serde_json::Value {
+    let (tenant1_mapping, tenant2_mapping) =
+        (&tenants_port_mapping.tenant1, &tenants_port_mapping.tenant2);
+
+    json!({
+        "kind": "Cluster",
+        "apiVersion": "kind.x-k8s.io/v1alpha4",
+        "name": name,
+        "nodes": [{
+            "role": "control-plane",
+            "image": "kindest/node:v1.33.4@sha256:25a6018e48dfcaee478f4a59af81157a437f15e6e140bf103f85a2e7cd0cbbf2",
+            // Benchmark pods report their measurements over stdout, which is
+            // the only channel every multi-tenancy solution leaves open —
+            // `exec` is blocked by the more restrictive ones, and those are
+            // exactly the ones worth measuring.
+            //
+            // That makes container log capacity part of the measurement
+            // apparatus. fio writes one line per I/O, so a pod at 10k IOPS
+            // for 60 s emits roughly 600k lines, about 20 MB, against the
+            // 10 Mi kubelet retains by default. Rotation then discards the
+            // start of the stream and the pod's entire sample is lost — not
+            // truncated, lost, because the parser can no longer find where
+            // the log begins.
+            "kubeadmConfigPatches": [
+                format!(
+                    "kind: KubeletConfiguration\ncontainerLogMaxSize: \"{}\"\ncontainerLogMaxFiles: {}\n",
+                    CONTAINER_LOG_MAX_SIZE, CONTAINER_LOG_MAX_FILES
+                )
+            ],
+            "extraPortMappings": [
+                {
+                    "containerPort": tenant1_mapping.container_port,
+                    "hostPort": tenant1_mapping.host_port
+                },
+                {
+                    "containerPort": tenant2_mapping.container_port,
+                    "hostPort": tenant2_mapping.host_port
+                }
+            ]
+        }]
+    })
+}
 
 pub type KindCluster = HostCluster<KindProvider>;
 
@@ -16,28 +73,7 @@ impl ClusterProvider for KindProvider {
         kubeconfig_path: &Path,
         tenants_port_mapping: TenantsPortMapping,
     ) -> anyhow::Result<()> {
-        let (tenant1_mapping, tenant2_mapping) =
-            (&tenants_port_mapping.tenant1, &tenants_port_mapping.tenant2);
-
-        let config_json = json!({
-            "kind": "Cluster",
-            "apiVersion": "kind.x-k8s.io/v1alpha4",
-            "name": name,
-            "nodes": [{
-                "role": "control-plane",
-                "image": "kindest/node:v1.33.4@sha256:25a6018e48dfcaee478f4a59af81157a437f15e6e140bf103f85a2e7cd0cbbf2",
-                "extraPortMappings": [
-                    {
-                        "containerPort": tenant1_mapping.container_port,
-                        "hostPort": tenant1_mapping.host_port
-                    },
-                    {
-                        "containerPort": tenant2_mapping.container_port,
-                        "hostPort": tenant2_mapping.host_port
-                    }
-                ]
-            }]
-        });
+        let config_json = cluster_config(name, &tenants_port_mapping);
 
         let yaml_config =
             serde_yaml::to_string(&config_json).context("Failed to convert JSON config to YAML")?;
@@ -130,6 +166,9 @@ mod tests {
     const CLUSTER_NAME: &str = "test-cluster";
     const TEMP_KUBECONFIG_PATH: &str = "/tmp/kubeconfig";
 
+    // Provisions a real kind cluster via Docker, so it cannot run on a clean
+    // checkout or in CI. Run explicitly with `cargo test -- --ignored`.
+    #[ignore]
     #[tokio::test]
     async fn test_create_and_delete_kind_cluster() {
         let dummy_port_mapping = TenantsPortMapping {
@@ -172,5 +211,89 @@ mod tests {
             "Failed to delete Kind cluster: {:?}",
             deletion.err()
         );
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use crate::cluster::PortMapping;
+
+    fn mappings() -> TenantsPortMapping {
+        TenantsPortMapping {
+            tenant1: PortMapping {
+                host_port: 30010,
+                container_port: 30001,
+            },
+            tenant2: PortMapping {
+                host_port: 30020,
+                container_port: 30002,
+            },
+        }
+    }
+
+    /// Container log capacity is part of the measurement apparatus, not a
+    /// convenience: benchmark pods report their samples over stdout because it
+    /// is the only channel every multi-tenancy solution leaves open. At the
+    /// kubelet default of 10 Mi the storage assessment loses whole pods, so the
+    /// cluster the tool builds must raise it.
+    #[test]
+    fn cluster_config_raises_the_container_log_limit() {
+        let config = cluster_config("bench", &mappings());
+        let node = &config["nodes"][0];
+
+        let patches = node["kubeadmConfigPatches"]
+            .as_array()
+            .expect("kubeadmConfigPatches must be a list of documents");
+        assert_eq!(patches.len(), 1);
+
+        let patch = patches[0].as_str().expect("a patch is a YAML string");
+        assert!(patch.contains("kind: KubeletConfiguration"), "{patch}");
+        assert!(patch.contains("containerLogMaxSize: \"512Mi\""), "{patch}");
+        assert!(patch.contains("containerLogMaxFiles: 5"), "{patch}");
+
+        // 20 MB per pod is what the default could not hold; the new limit must
+        // clear it with room to spare.
+        assert!(
+            CONTAINER_LOG_MAX_SIZE.ends_with("Mi"),
+            "the kubelet expects a quantity suffix"
+        );
+        let megabytes: u32 = CONTAINER_LOG_MAX_SIZE
+            .trim_end_matches("Mi")
+            .parse()
+            .unwrap();
+        assert!(
+            megabytes >= 64,
+            "{megabytes}Mi is too small for a storage run"
+        );
+    }
+
+    /// kind renders the config as YAML, so the patch has to survive that trip
+    /// intact — a multi-line string is where this would break.
+    #[test]
+    fn config_serialises_to_yaml_kind_can_read() {
+        let config = cluster_config("bench", &mappings());
+        let yaml = serde_yaml::to_string(&config).expect("config must serialise");
+
+        assert!(yaml.contains("kind: Cluster"));
+        assert!(yaml.contains("kubeadmConfigPatches"));
+        assert!(yaml.contains("containerLogMaxSize"));
+
+        // Round-trip it: whatever kind parses must still carry the patch.
+        let parsed: serde_json::Value = serde_yaml::from_str(&yaml).expect("must re-parse");
+        let patch = parsed["nodes"][0]["kubeadmConfigPatches"][0]
+            .as_str()
+            .expect("patch survives the YAML round trip");
+        assert!(patch.contains("containerLogMaxSize"), "{patch}");
+    }
+
+    #[test]
+    fn port_mappings_are_preserved() {
+        let config = cluster_config("bench", &mappings());
+        let ports = &config["nodes"][0]["extraPortMappings"];
+        assert_eq!(ports[0]["hostPort"], 30010);
+        assert_eq!(ports[0]["containerPort"], 30001);
+        assert_eq!(ports[1]["hostPort"], 30020);
+        assert_eq!(ports[1]["containerPort"], 30002);
     }
 }

@@ -2,3 +2,14 @@
 /target/
 
 venv
+
+# Raw experiment data — too large for git (~8 GB).
+# Published as a release asset instead; see new_fairness_results/README.md.
+new_fairness_results/raw/
+new_fairness_results/raw_*/
+new_fairness_results/kumuteva_raw_results/
+new_fairness_results/kumuteva_raw_results.zip
+**/__pycache__/
+
+# Output of validate_analysis.py — regenerated on demand.
+new_fairness_results/_validation_figures/

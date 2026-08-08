@@ -1516,6 +1516,9 @@ mod tests {
         kind_cluster.delete().await
     }
 
+    // Provisions a real kind cluster via Docker, so it cannot run on a clean
+    // checkout or in CI. Run explicitly with `cargo test -- --ignored`.
+    #[ignore]
     #[tokio::test]
     async fn setup_vcluster() {
         let temp_cluster_name = format!("{}-vcluster", CLUSTER_NAME_PREFIX);

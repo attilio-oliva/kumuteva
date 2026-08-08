@@ -52,9 +52,9 @@ spec:
             spec:
               domain:
                 cpu:
-                  cores: 2
+                  cores: ${CONTROL_PLANE_VM_CORES}
                 memory:
-                  guest: "4Gi"
+                  guest: "${CONTROL_PLANE_VM_MEMORY}"
                 devices:
                   networkInterfaceMultiqueue: true
                   disks:
@@ -89,9 +89,15 @@ spec:
     initConfiguration:
       nodeRegistration:
         criSocket: "${CRI_PATH}"
+        kubeletExtraArgs:
+          container-log-max-size: "${CONTAINER_LOG_MAX_SIZE}"
+          container-log-max-files: "${CONTAINER_LOG_MAX_FILES}"
     joinConfiguration:
       nodeRegistration:
         criSocket: "${CRI_PATH}"
+        kubeletExtraArgs:
+          container-log-max-size: "${CONTAINER_LOG_MAX_SIZE}"
+          container-log-max-files: "${CONTAINER_LOG_MAX_FILES}"
   version: "${KUBERNETES_VERSION}"
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
@@ -113,9 +119,9 @@ spec:
             spec:
               domain:
                 cpu:
-                  cores: 2
+                  cores: ${WORKER_VM_CORES}
                 memory:
-                  guest: "4Gi"
+                  guest: "${WORKER_VM_MEMORY}"
                 devices:
                   networkInterfaceMultiqueue: true
                   disks:
@@ -138,7 +144,17 @@ spec:
     spec:
       joinConfiguration:
         nodeRegistration:
-          kubeletExtraArgs: {}
+          # The storage assessor ships fio's per-I/O latency log through the pod's
+          # stdout, which is the only retrieval path that works across every
+          # solution. At 10k IOPS for 60s that is ~600k lines, well past the
+          # kubelet's 10Mi default, and rotation silently drops the beginning of
+          # the run. The host kind cluster gets this same setting through its
+          # kubeadm patch, but these tenant nodes are VMs provisioned by CAPI and
+          # have their own kubelet, which is why two of five KubeVirt storage runs
+          # aborted with "no fio samples" while the other solutions were fine.
+          kubeletExtraArgs:
+            container-log-max-size: "${CONTAINER_LOG_MAX_SIZE}"
+            container-log-max-files: "${CONTAINER_LOG_MAX_FILES}"
 ---
 apiVersion: cluster.x-k8s.io/v1beta1
 kind: MachineDeployment

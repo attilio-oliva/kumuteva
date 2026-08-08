@@ -1,0 +1,115 @@
+# Campaign configuration: every subsystem at a 10x intruder escalation.
+#
+#   kumuteva fairness t1.kubeconfig t2.kubeconfig \
+#     --config experiments/campaign.yaml \
+#     --solution-label "$SOLUTION" --export-csv --output-dir "$OUT" \
+#     --st-volume pvc
+#
+# One escalation factor for all four subsystems, so their degradation factors
+# are directly comparable. The published campaign did not have this property: it
+# stressed the control plane 30x (rate) and 100x (workers) while the data plane
+# saw 10x, a 300-fold difference that is why Table I shows control-plane deltas
+# of 9-43 against data-plane deltas of 0.5-3.3. Those rows were never measuring
+# the same experiment.
+#
+# Targets, and what the run should report:
+#
+#   subsystem      owner            intruder          unit
+#   control plane    150              1,500            req/s
+#   storage       10,000            100,000            IOPS
+#   network       15,625            156,250            pkt/s  (125 Mbps -> 1.25 Gbps one-way)
+#   workload           5                 50            req/s
+#
+# For storage, network and workload `rate` is *per pod or pair*, so the total
+# scales with the pod count. For the control plane `rate` is the tenant total
+# and the worker count only supplies the concurrency needed to deliver it.
+
+apiVersion: v1
+
+global:
+  baselineDurationSeconds: 30
+  testDurationSeconds: 60
+
+  # Never `unlimited`: that makes the rate limiter a no-op and every rate below
+  # is silently ignored, which is how the first campaign ended up unable to
+  # reconcile its offered load with its configuration.
+  rateStrategy: fixed-delay
+
+  rate: 10.0            # per-subsystem rates below override this
+
+  # The probe is Burstable, not Guaranteed.
+  #
+  # Guaranteed means requests == limits by definition — Kubernetes offers no
+  # "Guaranteed with smaller requests" — so a Guaranteed probe reserves a whole
+  # core on every node it lands on. A KubeVirt tenant is a pair of 2-core VMs,
+  # and that reservation is what made its workload and storage runs unschedulable
+  # while the other four solutions, sitting on the 16-core host node, were fine.
+  #
+  # Burstable splits the two: the request is what the scheduler charges against
+  # node capacity (100m), the limit is the cfs quota that would throttle the
+  # probe (1000m, unchanged). On an uncontended node the behaviour is identical
+  # to Guaranteed, since nothing throttles below the limit.
+  #
+  # Set here rather than per-solution on purpose. The probe is the measuring
+  # instrument, so it has to be the same instrument everywhere or the five
+  # columns of Table I are not comparable. The cost lands only on KubeVirt: under
+  # cgroup v2 the CPU weight derives from the request, so on a saturated tenant
+  # node a 100m-request probe gets a tenth of the share of a 1000m one, and its
+  # degradation factor may include some of its own starvation. The alternative
+  # there is no measurement at all.
+  probeQos: burstable
+
+  # BestEffort, so the intruder is never capped. Capping it would cap the
+  # interference and understate what an unconstrained neighbour can do.
+  intruderQos: besteffort
+
+  # Escalation is 1 x 10 = 10x everywhere.
+  #
+  # Prefer podMultiplier over loadMultiplier. podMultiplier scales the worker or
+  # pod count *and* the offered rate together, so per-worker demand stays flat.
+  # loadMultiplier raises the rate alone, concentrating it on the same workers —
+  # and a worker blocked on a request cannot exceed 1/latency, roughly 400 req/s
+  # at 2.5 ms and far less under contention.
+  loadMultiplier: 1.0
+  podMultiplier: 10.0
+
+controlPlane:
+  enabled: true
+  rate: 150.0
+  # Owner: 5 workers at 30 req/s = 150. Intruder: 5 x 10 = 50 workers, still
+  # 30 req/s each, totalling 1500. That per-worker figure is roughly 5% of what
+  # a single blocking worker can sustain, so the schedule is never the limit.
+  requesters: 5
+
+storage:
+  enabled: true
+  # 10,000 IOPS per pod. fio's --rate_iops is now split across read and write,
+  # so a 50/50 randrw job offers 10k in total rather than 10k per direction —
+  # the bug that delivered 18.3k against a configured 10k.
+  rate: 10000.0
+  pods: 1
+  blockSizeKb: 4
+  fileSizeMb: 100
+  iodepth: 16
+  scenario: random
+
+network:
+  enabled: true
+  # 125 Mbps one-way at a 1000-byte payload: 125e6 / 8 / 1000 = 15,625 pkt/s.
+  # The probe is an echo, so the link carries twice this. The paper quotes the
+  # one-way figure and should say so.
+  rate: 15625.0
+  packetSizeBytes: 1000
+  streams: 5
+  podPairs: 1
+
+workload:
+  enabled: true
+  rate: 5.0
+  pods: 5
+  threads: 1
+  maxPrime: 500000
+
+export:
+  csv: true
+  outputDir: fairness_results

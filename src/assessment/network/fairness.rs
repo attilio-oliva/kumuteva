@@ -134,9 +134,17 @@ impl FairnessNetworkAssessor {
 
         info!("Cleanup completed.");
 
+        // One logical operation is a TCP echo: the payload crosses the wire twice.
+        // Reporting this makes the paper's bandwidth figures measured rather than
+        // restated from the configured packet rate. Note that a "125 Mbps" style
+        // figure quoting one-way payload is half the traffic actually carried.
+        let bytes_per_operation = self.config.packet_size as f64 * 2.0;
+
         Ok(PhaseResult {
-            tenant1: TenantMetrics::from_raw(t1_points),
-            tenant2: TenantMetrics::from_raw(t2_points),
+            tenant1: TenantMetrics::from_raw(t1_points)
+                .with_bytes_per_operation(bytes_per_operation),
+            tenant2: TenantMetrics::from_raw(t2_points)
+                .with_bytes_per_operation(bytes_per_operation),
         })
     }
 }
@@ -149,6 +157,16 @@ impl FairnessAssessor for FairnessNetworkAssessor {
 
     fn metric(&self) -> &'static str {
         "TCP round-trip latency"
+    }
+
+    fn configuration(&self) -> Option<serde_json::Value> {
+        // Bandwidth is derived from these, so a Mbps figure is uninterpretable
+        // without them.
+        Some(serde_json::json!({
+            "pod_pairs": self.config.pod_pairs,
+            "streams": self.config.streams,
+            "packet_size_bytes": self.config.packet_size,
+        }))
     }
 
     async fn run_baseline(
@@ -688,6 +706,9 @@ async fn collect_results(tenant: &TenantClusterConfig, pairs: u32) -> Result<Vec
                     if let (Ok(ts), Ok(rtt)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
                         let is_error = parts.get(2).map(|e| *e == "1").unwrap_or(false);
                         points.push(MetricPoint {
+                            // Pacing happens inside the pod, so there is no dispatch schedule to
+                            // measure against: the recorded latency is already the service time.
+                            scheduled_latency_ms: None,
                             timestamp_secs: ts,
                             latency_ms: rtt,
                             is_error,

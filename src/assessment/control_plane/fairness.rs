@@ -15,7 +15,8 @@ use kube::Api;
 use tracing::info;
 
 use crate::assessment::fairness_assessor::{
-    FairnessAssessor, FairnessConfig, MetricPoint, PhaseResult, RateLimiter, TenantMetrics,
+    FairnessAssessor, FairnessConfig, MetricPoint, OperationSchedule, PhaseResult, RateLimiter,
+    TenantMetrics,
 };
 use crate::assessment::TenantClusterConfig;
 
@@ -35,6 +36,65 @@ impl Default for FairnessControlPlaneConfig {
     fn default() -> Self {
         Self { max_workers: 1 }
     }
+}
+
+// =============================================================================
+// OPERATION GATING
+// =============================================================================
+
+/// Issue a single API request on schedule and record its response and service time.
+///
+/// The schedule advances once per *request*, not once per CRUD scenario. This is
+/// what makes the configured rate equal the achieved request rate: a scenario
+/// issuing six requests and one issuing four both emit at the same ops/sec.
+///
+/// Two latencies are recorded, and only the first is reported.
+///
+/// `latency_ms` runs from actual dispatch to completion: the time the API server
+/// spent on the request, and the number the degradation factor is computed from.
+///
+/// `scheduled_latency_ms` runs from the operation's *scheduled slot*, so it also
+/// charges the request for any wait between when it was due and when a worker
+/// was free to send it. That wait is modelled, not observed — these workers are
+/// sequential loops, so a request not yet sent is not queued anywhere real — and
+/// under sustained overload it grows with the phase duration rather than
+/// converging. It therefore serves as a validity check: divided by `latency_ms`
+/// it gives the coordinated-omission factor, and a value near 1.0 is what says
+/// the probe kept up and its latency describes the platform rather than its own
+/// backlog.
+///
+/// Every operation in a scenario is issued unconditionally, even when an earlier
+/// step failed. A load generator's contract is to offer a defined request rate;
+/// a GET against a name whose CREATE failed is still a real API request and is
+/// recorded with `is_error: true`. Skipping dependent steps would make the
+/// offered load a function of the failure rate, which is precisely the coupling
+/// that made the previous implementation's load unmeasurable.
+macro_rules! timed_operation {
+    ($points:expr, $schedule:expr, $label:expr, $call:expr) => {{
+        let schedule_start = $schedule.start();
+        let intended = $schedule.next_slot().await;
+        let timestamp_secs = intended
+            .saturating_duration_since(schedule_start)
+            .as_secs_f64();
+        let dispatched = Instant::now();
+        let result = $call.await;
+        let completed = Instant::now();
+
+        let scheduled_ms = completed.saturating_duration_since(intended).as_secs_f64() * 1000.0;
+        let service_ms = completed
+            .saturating_duration_since(dispatched)
+            .as_secs_f64()
+            * 1000.0;
+
+        $points.push(MetricPoint {
+            timestamp_secs,
+            latency_ms: service_ms,
+            scheduled_latency_ms: Some(scheduled_ms),
+            is_error: result.is_err(),
+            label: Some($label),
+        });
+        result
+    }};
 }
 
 // =============================================================================
@@ -73,18 +133,16 @@ impl FairnessControlPlaneAssessor {
         &self,
         tenant: &TenantClusterConfig,
         duration: Duration,
-        rate_limiter: &RateLimiter,
+        schedule: &mut OperationSchedule,
         worker_id: usize,
     ) -> Result<Vec<MetricPoint>> {
-        let start_time = Instant::now();
-        let deadline = start_time + duration;
+        // Deadline is anchored to the schedule origin so every worker in a phase
+        // covers the same window, regardless of when its task happened to start.
+        let deadline = schedule.start() + duration;
         let mut points = Vec::new();
         let mut counter = 0u64;
 
         while Instant::now() < deadline {
-            // Wait for rate limiter
-            rate_limiter.wait().await;
-
             let name = format!("fairness-test-{}-{}", worker_id, counter);
             let namespace = tenant.namespace.clone();
 
@@ -105,98 +163,67 @@ impl FairnessControlPlaneAssessor {
                 ..Default::default()
             };
 
-            let ts = start_time.elapsed().as_secs_f64();
-            let op_start = Instant::now();
-            let res_cm_create = tenant
-                .cluster
-                .create_namespaced_resource(&cm, &tenant.namespace)
-                .await;
-
-            points.push(MetricPoint {
-                timestamp_secs: ts,
-                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                is_error: res_cm_create.is_err(),
-                label: Some(format!("create-cm-{}", name)),
-            });
+            let _ = timed_operation!(
+                points,
+                schedule,
+                format!("create-cm-{}", name),
+                tenant
+                    .cluster
+                    .create_namespaced_resource(&cm, &tenant.namespace)
+            );
 
             // 2. Get ConfigMap
-            if res_cm_create.is_ok() {
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res = tenant
+            let _ = timed_operation!(
+                points,
+                schedule,
+                format!("get-cm-{}", name),
+                tenant
                     .cluster
                     .get_resource_in_namespace::<ConfigMap>(&name, &tenant.namespace)
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("get-cm-{}", name)),
-                });
-            }
+            );
 
             // 3. Update ConfigMap
-            if res_cm_create.is_ok() {
-                let patch = serde_json::json!({ "data": { "key": "updated-value" } });
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res: Result<ConfigMap> = tenant
-                    .cluster
-                    .patch_namespaced_resource(&name, &tenant.namespace, &Patch::Merge(&patch))
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("update-cm-{}", name)),
-                });
-            }
+            let patch = serde_json::json!({ "data": { "key": "updated-value" } });
+            let _: Result<ConfigMap> = timed_operation!(
+                points,
+                schedule,
+                format!("update-cm-{}", name),
+                tenant.cluster.patch_namespaced_resource(
+                    &name,
+                    &tenant.namespace,
+                    &Patch::Merge(&patch)
+                )
+            );
 
             // 4. Get ConfigMap again to verify update
-            if res_cm_create.is_ok() {
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res = tenant
+            let _ = timed_operation!(
+                points,
+                schedule,
+                format!("get-updated-cm-{}", name),
+                tenant
                     .cluster
                     .get_resource_in_namespace::<ConfigMap>(&name, &tenant.namespace)
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("get-updated-cm-{}", name)),
-                });
-            }
+            );
 
-            //5. List ConfigMaps
-            let ts = start_time.elapsed().as_secs_f64();
-            let op_start = Instant::now();
-            let res = tenant
-                .cluster
-                .list_namespaced_resources::<ConfigMap>(&tenant.namespace)
-                .await;
-            points.push(MetricPoint {
-                timestamp_secs: ts,
-                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                is_error: res.is_err(),
-                label: Some(format!("list-cm-{}", name)),
-            });
+            // 5. List ConfigMaps
+            let _ = timed_operation!(
+                points,
+                schedule,
+                format!("list-cm-{}", name),
+                tenant
+                    .cluster
+                    .list_namespaced_resources::<ConfigMap>(&tenant.namespace)
+            );
 
             // 6. Delete ConfigMap
-            if res_cm_create.is_ok() {
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res = tenant
+            let _ = timed_operation!(
+                points,
+                schedule,
+                format!("delete-cm-{}", name),
+                tenant
                     .cluster
                     .delete_resource_in_namespace::<ConfigMap>(&name, &tenant.namespace)
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("delete-cm-{}", name)),
-                });
-            }
+            );
 
             counter += 1;
         }
@@ -208,18 +235,16 @@ impl FairnessControlPlaneAssessor {
         &self,
         tenant: &TenantClusterConfig,
         duration: Duration,
-        rate_limiter: &RateLimiter,
+        schedule: &mut OperationSchedule,
         worker_id: usize,
     ) -> Result<Vec<MetricPoint>> {
-        let start_time = Instant::now();
-        let deadline = start_time + duration;
+        // Deadline is anchored to the schedule origin so every worker in a phase
+        // covers the same window, regardless of when its task happened to start.
+        let deadline = schedule.start() + duration;
         let mut points = Vec::new();
         let mut counter = 0u64;
 
         while Instant::now() < deadline {
-            // Wait for rate limiter
-            rate_limiter.wait().await;
-
             let name: String = format!("fairness-pod-{}-{}", worker_id, counter);
             let namespace = tenant.namespace.clone();
 
@@ -258,95 +283,52 @@ impl FairnessControlPlaneAssessor {
                 }
             }))?;
 
-            let ts = start_time.elapsed().as_secs_f64();
-            let op_start = Instant::now();
-            let res_pod_create = tenant
-                .cluster
-                .create_namespaced_resource(&pod, &tenant.namespace)
-                .await;
-            points.push(MetricPoint {
-                timestamp_secs: ts,
-                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                is_error: res_pod_create.is_err(),
-                label: Some(format!("create-pod-{}", name)),
-            });
+            let _ = timed_operation!(
+                points,
+                schedule,
+                format!("create-pod-{}", name),
+                tenant
+                    .cluster
+                    .create_namespaced_resource(&pod, &tenant.namespace)
+            );
 
-            // Wait for pods to be ready (watch for pod to be ready)
-            // if res_pod_create.is_ok() {
-            //     let remaining_time = deadline.saturating_duration_since(Instant::now());
-
-            //     // Only wait if we still have time left in the test
-            //     if !remaining_time.is_zero() {
-            //         let _ = tenant
-            //             .cluster
-            //             .wait_for_pod_readiness_timeout(
-            //                 &name,
-            //                 &tenant.namespace,
-            //                 remaining_time.as_secs() as u32,
-            //             )
-            //             .await;
-            //     }
-            // }
+            // NOTE: pod readiness is deliberately NOT awaited. This metric measures
+            // API admission latency only, not scheduling or container start. The
+            // paper's methodology section must say so explicitly.
 
             // 2. Update Pod (add label)
-            if res_pod_create.is_ok() {
-                let patch = serde_json::json!({ "metadata": { "labels": { "updated": "true" } } });
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res: Result<Pod> = tenant
-                    .cluster
-                    .patch_namespaced_resource(&name, &tenant.namespace, &Patch::Merge(&patch))
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("update-pod-{}", name)),
-                });
-            }
+            let patch = serde_json::json!({ "metadata": { "labels": { "updated": "true" } } });
+            let _: Result<Pod> = timed_operation!(
+                points,
+                schedule,
+                format!("update-pod-{}", name),
+                tenant.cluster.patch_namespaced_resource(
+                    &name,
+                    &tenant.namespace,
+                    &Patch::Merge(&patch)
+                )
+            );
 
             // 3. List Pods
-            let ts = start_time.elapsed().as_secs_f64();
-            let op_start = Instant::now();
-            let res = tenant
-                .cluster
-                .list_namespaced_resources::<Pod>(&tenant.namespace)
-                .await;
-            points.push(MetricPoint {
-                timestamp_secs: ts,
-                latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                is_error: res.is_err(),
-                label: Some(format!("list-pod-{}", name)),
-            });
+            let _ = timed_operation!(
+                points,
+                schedule,
+                format!("list-pod-{}", name),
+                tenant
+                    .cluster
+                    .list_namespaced_resources::<Pod>(&tenant.namespace)
+            );
 
             // 4. Delete Pod
-            if res_pod_create.is_ok() {
-                let ts = start_time.elapsed().as_secs_f64();
-                let op_start = Instant::now();
-                let res = tenant
+            let _ = timed_operation!(
+                points,
+                schedule,
+                format!("delete-pod-{}", name),
+                tenant
                     .cluster
                     .delete_resource_in_namespace::<Pod>(&name, &tenant.namespace)
-                    .await;
-                points.push(MetricPoint {
-                    timestamp_secs: ts,
-                    latency_ms: op_start.elapsed().as_secs_f64() * 1000.0,
-                    is_error: res.is_err(),
-                    label: Some(format!("delete-pod-{}", name)),
-                });
-            }
+            );
 
-            // Wait for pod to be deleted
-            // if res_pod_create.is_ok() {
-            //     let remaining_time = deadline.saturating_duration_since(Instant::now());
-            //     let _ = tenant
-            //         .cluster
-            //         .wait_for_pod_deletion_timeout(
-            //             &name,
-            //             &tenant.namespace,
-            //             remaining_time.as_secs() as u32,
-            //         )
-            //         .await;
-            // }
             counter += 1;
         }
 
@@ -373,37 +355,33 @@ impl FairnessControlPlaneAssessor {
         let _ = self.cleanup_resources(&t1).await;
         let _ = self.cleanup_resources(&t2).await;
 
-        let estimate_target_workers = |limiter: &RateLimiter, max_workers: usize| {
-            if limiter.rate().is_infinite() {
-                1
-            } else {
-                let ops_per_scenario = 3.0; // Each scenario performs 3 operations
-                let desired_rate = limiter.rate() / ops_per_scenario;
-                (desired_rate.ceil() as usize).min(max_workers)
-            }
-        };
-
+        // Split each tenant's workers between the Pod and ConfigMap scenarios.
+        //
+        // The split no longer affects the offered request rate: `timed_operation!` gates
+        // every individual API call, so a ConfigMap worker (6 requests/iteration)
+        // and a Pod worker (4 requests/iteration) both emit at the same ops/sec.
+        // Previously the rate was divided by a hardcoded `ops_per_scenario = 3.0`
+        // while the scenarios issued 6 and 4 requests respectively, which inflated
+        // the achieved rate to (2*4 + 3*6) / (5*3) = 1.733x configured at 5 workers.
         let distribute_workers = |total_workers: usize| {
             let pod_workers = total_workers / 2; // Allocate 1/2 of workers to Pod operations
             let cm_workers = total_workers - pod_workers;
             (pod_workers, cm_workers)
         };
 
-        let target_t1_workers = estimate_target_workers(&t1_limiter, t1_workers);
-        let target_t2_workers = estimate_target_workers(&t2_limiter, t2_workers);
-
-        info!(
-            "Target workers - tenant1: {}, tenant2: {}",
-            target_t1_workers, target_t2_workers
-        );
-
-        let (t1_pod_workers, t1_cm_workers) = distribute_workers(target_t1_workers);
-        let (t2_pod_workers, t2_cm_workers) = distribute_workers(target_t2_workers);
+        let (t1_pod_workers, t1_cm_workers) = distribute_workers(t1_workers);
+        let (t2_pod_workers, t2_cm_workers) = distribute_workers(t2_workers);
 
         info!(
             "Worker distribution - tenant1: {} pod workers, {} cm workers; tenant2: {} pod workers, {} cm workers",
             t1_pod_workers, t1_cm_workers, t2_pod_workers, t2_cm_workers
         );
+
+        // One time origin for the whole phase, fixed before any worker starts.
+        // Both tenants and every worker schedule their intended dispatch times
+        // against it, so the recorded timestamps share an axis and the response
+        // times are measured against a schedule that does not drift with load.
+        let phase_start = Instant::now();
 
         let t1_handle = tokio::spawn(async move {
             let mut all_points = Vec::new();
@@ -411,23 +389,24 @@ impl FairnessControlPlaneAssessor {
 
             // Spawn worker tasks for tenant1
             info!(
-                "Starting tenant1 with {} workers at rate {:.2} ops/sec",
+                "Starting tenant1: {} workers, {:.2} ops/sec total ({:.2} per worker)",
                 t1_workers,
-                t1_limiter.rate()
+                t1_limiter.rate(),
+                t1_limiter.rate() / t1_workers.max(1) as f64
             );
             for i in 0..t1_workers {
                 let tenant = t1.clone();
-                // Adjust rate because each scenario performs 3 operations
-                let ops_per_scenario = 3.0;
+                // Each worker gets an equal share of the tenant's request rate.
+                // Summed across workers this yields exactly the configured ops/sec.
                 let adjusted_rate = if t1_limiter.rate().is_infinite() {
                     0.0
                 } else {
-                    let rate = t1_limiter.rate() / ops_per_scenario;
-
-                    rate / t1_workers as f64
+                    t1_limiter.rate() / t1_workers as f64
                 };
 
-                let limiter = RateLimiter::new(t1_limiter.strategy, adjusted_rate);
+                // Every worker in the phase shares one time origin, so their intended
+                // dispatch times form a single coherent schedule.
+                let mut schedule = OperationSchedule::new(phase_start, adjusted_rate);
                 let dur = duration;
 
                 if i < t1_pod_workers {
@@ -437,7 +416,7 @@ impl FairnessControlPlaneAssessor {
                                 max_workers: 1,
                             });
                         assessor
-                            .run_stress_test_on_pod(&tenant, dur, &limiter, i)
+                            .run_stress_test_on_pod(&tenant, dur, &mut schedule, i)
                             .await
                     }));
                 } else {
@@ -447,7 +426,7 @@ impl FairnessControlPlaneAssessor {
                                 max_workers: 1,
                             });
                         assessor
-                            .run_stress_test_on_configmap(&tenant, dur, &limiter, i)
+                            .run_stress_test_on_configmap(&tenant, dur, &mut schedule, i)
                             .await
                     }));
                 }
@@ -468,23 +447,24 @@ impl FairnessControlPlaneAssessor {
 
             // Spawn worker tasks for tenant2
             info!(
-                "Starting tenant2 with {} workers at rate {:.2} ops/sec",
+                "Starting tenant2: {} workers, {:.2} ops/sec total ({:.2} per worker)",
                 t2_workers,
-                t2_limiter.rate()
+                t2_limiter.rate(),
+                t2_limiter.rate() / t2_workers.max(1) as f64
             );
             for i in 0..t2_workers {
                 let tenant = t2.clone();
-                // Adjust rate because each scenario performs 3 operations
-                let ops_per_scenario = 3.0;
+                // Each worker gets an equal share of the tenant's request rate.
+                // Summed across workers this yields exactly the configured ops/sec.
                 let adjusted_rate = if t2_limiter.rate().is_infinite() {
                     0.0
                 } else {
-                    let rate = t2_limiter.rate() / ops_per_scenario;
-
-                    rate / t2_workers as f64
+                    t2_limiter.rate() / t2_workers as f64
                 };
 
-                let limiter = RateLimiter::new(t2_limiter.strategy, adjusted_rate);
+                // Every worker in the phase shares one time origin, so their intended
+                // dispatch times form a single coherent schedule.
+                let mut schedule = OperationSchedule::new(phase_start, adjusted_rate);
                 let dur = duration;
 
                 if i < t2_pod_workers {
@@ -494,7 +474,7 @@ impl FairnessControlPlaneAssessor {
                                 max_workers: 1,
                             });
                         assessor
-                            .run_stress_test_on_pod(&tenant, dur, &limiter, i)
+                            .run_stress_test_on_pod(&tenant, dur, &mut schedule, i)
                             .await
                     }));
                 } else {
@@ -504,7 +484,7 @@ impl FairnessControlPlaneAssessor {
                                 max_workers: 1,
                             });
                         assessor
-                            .run_stress_test_on_configmap(&tenant, dur, &limiter, i)
+                            .run_stress_test_on_configmap(&tenant, dur, &mut schedule, i)
                             .await
                     }));
                 }
@@ -542,6 +522,15 @@ impl FairnessAssessor for FairnessControlPlaneAssessor {
         "API request latency"
     }
 
+    fn configuration(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "max_workers": self.config.max_workers,
+            // Pod readiness is deliberately not awaited: this measures API
+            // admission latency, not scheduling or container start.
+            "measures": "api admission latency only",
+        }))
+    }
+
     async fn run_baseline(
         &self,
         tenant1: Arc<TenantClusterConfig>,
@@ -567,15 +556,30 @@ impl FairnessAssessor for FairnessControlPlaneAssessor {
         config: &FairnessConfig,
     ) -> Result<PhaseResult> {
         let malicious_workers =
-            (self.config.max_workers as f64 * config.malicious_pod_multiplier) as usize;
+            ((self.config.max_workers as f64 * config.malicious_pod_multiplier) as usize).max(1);
+
+        // The intruder's *total* offered rate is escalated by both multipliers,
+        // matching the "Nx effective load" the runner prints, which is their
+        // product.
+        //
+        // Adding workers alone cannot do it: `run_phase` splits a tenant's rate
+        // evenly across its workers, so the count cancels out and ten workers
+        // sharing 20 ops/s still offer 20 ops/s. That left `podMultiplier` a
+        // no-op for the control plane — with the default `loadMultiplier` of 1.0
+        // the intruder ran at exactly the owner's rate and no contention was
+        // induced at all. Scaling the total here keeps the per-worker rate equal
+        // to the baseline's, so each extra worker genuinely adds load.
+        let malicious_rate = config.malicious_rate() * config.malicious_pod_multiplier;
+        let malicious_limiter = RateLimiter::new(config.strategy, malicious_rate);
+
         self.run_phase(
             tenant1,
             tenant2,
             config.test_duration,
             config.tenant1_limiter(),
-            config.tenant2_malicious_limiter(),
+            malicious_limiter,
             self.config.max_workers,
-            malicious_workers.max(1),
+            malicious_workers,
         )
         .await
     }

@@ -41,12 +41,44 @@ wait_for_deployment_ready() {
     echo "Deployment $deployment_name is ready!"
 }
 
-# Check if CAPI is already installed
+# Wait for a Service to have at least one ready backing address.
+#
+# A Deployment reporting rolled-out is not the same as its webhook answering:
+# the Service can exist with no endpoints while the pod finishes starting or
+# while cert-manager injects the serving certificate. Applying cluster manifests
+# in that window fails with "connection refused" from the API server's webhook
+# call, and CAPI then never creates the machines.
+wait_for_endpoints() {
+    local service_name="$1" namespace="$2"
+    local max_attempts=60 attempt=0
+
+    echo "Waiting for service $service_name in namespace $namespace to have endpoints..."
+    while [ $attempt -lt $max_attempts ]; do
+        if [ -n "$(kubectl get endpoints "$service_name" -n "$namespace" \
+                --kubeconfig "$KUBECONFIG_PATH" \
+                -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)" ]; then
+            echo "Service $service_name has endpoints!"
+            return 0
+        fi
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+
+    echo "Error: service $service_name has no endpoints after $max_attempts attempts"
+    return 1
+}
+
+# An existing capi-system means the install ran before — but not that it
+# finished, and not that anything is ready now. Skip the install, never the
+# readiness checks: exiting here outright is what let the cluster manifests be
+# applied against a CAPK webhook that was not yet serving.
+CAPI_ALREADY_INSTALLED=false
 if kubectl get ns capi-system --kubeconfig "$KUBECONFIG_PATH" &>/dev/null; then
-    echo "CAPI is already installed. Exiting."
-    exit 0
+    echo "CAPI is already installed; verifying it is ready."
+    CAPI_ALREADY_INSTALLED=true
 fi
 
+if [ "$CAPI_ALREADY_INSTALLED" = false ]; then
 echo "Setting up Helm repositories..."
 helm repo add capi-operator https://kubernetes-sigs.github.io/cluster-api-operator
 helm repo add jetstack https://charts.jetstack.io --force-update
@@ -71,6 +103,8 @@ helm install capi-operator capi-operator/cluster-api-operator \
     --timeout 300s \
     --kubeconfig "$KUBECONFIG_PATH"
 
+fi
+
 echo "Waiting for all CAPI controllers to be deployed and ready..."
 
 # Wait for deployments to exist first, then check if they're ready
@@ -85,6 +119,10 @@ wait_for_deployment_ready "capi-kubeadm-control-plane-controller-manager" "capi-
 
 wait_for_deployment_to_exist "capk-controller-manager" "kubevirt-infrastructure-system"
 wait_for_deployment_ready "capk-controller-manager" "kubevirt-infrastructure-system"
+
+# The validating webhook for KubevirtMachineTemplate is served by this pod. The
+# cluster manifests cannot be applied until it answers.
+wait_for_endpoints "capk-webhook-service" "kubevirt-infrastructure-system"
 
 echo "All CAPI controllers are ready!"
 echo "CAPI installation completed successfully!"

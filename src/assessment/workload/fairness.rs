@@ -13,13 +13,40 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 
 use crate::assessment::fairness_assessor::{
-    FairnessAssessor, FairnessConfig, MetricPoint, PhaseResult, RateLimitStrategy, TenantMetrics,
+    FairnessAssessor, FairnessConfig, MetricPoint, PhaseResult, PodResources, QosClass,
+    RateLimitStrategy, TenantMetrics,
 };
 use crate::assessment::TenantClusterConfig;
 
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
+
+/// What the intruder runs during the unbalanced phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FairnessWorkloadNoise {
+    /// The same sysbench prime workload as the probe, only more of it.
+    ///
+    /// Purely CPU-bound: it never touches the cache hierarchy, the memory bus or
+    /// the I/O path, so it exercises cgroup CPU shares and very little else.
+    #[default]
+    Prime,
+    /// stress-ng across several resource dimensions at once.
+    ///
+    /// Real noisy-neighbour interference cascades between resources — cache
+    /// thrashing and memory-bus saturation degrade a victim that is nominally
+    /// getting its CPU share. This is the mode that tests those paths.
+    Mixed,
+}
+
+impl std::fmt::Display for FairnessWorkloadNoise {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FairnessWorkloadNoise::Prime => write!(f, "prime (CPU only)"),
+            FairnessWorkloadNoise::Mixed => write!(f, "mixed (CPU, cache, memory, I/O)"),
+        }
+    }
+}
 
 /// Workload assessor configuration
 #[derive(Debug, Clone)]
@@ -30,6 +57,16 @@ pub struct FairnessWorkloadConfig {
     pub threads: u32,
     /// Max prime number for sysbench (higher = longer tasks)
     pub max_prime: u32,
+    /// Interference workload the intruder runs in the unbalanced phase
+    pub intruder_noise: FairnessWorkloadNoise,
+    /// QoS for the measuring probe. Guaranteed by default: an unstable probe
+    /// cannot distinguish contention from its own throttling.
+    pub probe_qos: QosClass,
+    /// QoS for the intruder's interference pods. BestEffort by default, since a
+    /// capped intruder cannot generate the contention the test is meant to induce.
+    pub intruder_qos: QosClass,
+    /// RuntimeClass for benchmark pods (e.g. a gVisor or Kata sandbox)
+    pub runtime_class_name: Option<String>,
 }
 
 impl Default for FairnessWorkloadConfig {
@@ -38,7 +75,39 @@ impl Default for FairnessWorkloadConfig {
             pods: 1,
             threads: 1,
             max_prime: 500000,
+            intruder_noise: FairnessWorkloadNoise::default(),
+            probe_qos: QosClass::Guaranteed,
+            intruder_qos: QosClass::BestEffort,
+            runtime_class_name: None,
         }
+    }
+}
+
+/// CPU/memory allocation for a probe pod when its QoS class needs one.
+const PROBE_CPU_LIMIT_MILLIS: u32 = 1000;
+const PROBE_MEMORY_LIMIT_MI: u32 = 256;
+
+/// See the fio constants in `storage::fairness`: the request is what decides
+/// whether a pod can be placed on a small KubeVirt tenant node, the limit is
+/// what decides whether it gets throttled once it is there.
+const PROBE_CPU_REQUEST_MILLIS: u32 = 100;
+const PROBE_MEMORY_REQUEST_MI: u32 = 64;
+
+/// Resources for a workload pod under `qos`.
+///
+/// Guaranteed pins requests to the limits, so the request constants only take
+/// effect for Burstable — which is the point of setting them low.
+fn workload_resources(qos: QosClass) -> PodResources {
+    match qos {
+        QosClass::Guaranteed => {
+            PodResources::uniform(PROBE_CPU_LIMIT_MILLIS, PROBE_MEMORY_LIMIT_MI)
+        }
+        _ => PodResources::burstable(
+            PROBE_CPU_REQUEST_MILLIS,
+            PROBE_CPU_LIMIT_MILLIS,
+            PROBE_MEMORY_REQUEST_MI,
+            PROBE_MEMORY_LIMIT_MI,
+        ),
     }
 }
 
@@ -56,6 +125,7 @@ impl FairnessWorkloadAssessor {
         Self { config }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_phase(
         &self,
         tenant1: Arc<TenantClusterConfig>,
@@ -65,6 +135,9 @@ impl FairnessWorkloadAssessor {
         t2_pods: u32,
         t1_rate: Option<f64>,
         t2_rate: Option<f64>,
+        // Interference pods the intruder runs alongside its probe. Zero in the
+        // baseline phase, which must stay symmetric.
+        t2_interference_pods: u32,
     ) -> Result<PhaseResult> {
         let duration_secs = duration.as_secs();
 
@@ -78,6 +151,13 @@ impl FairnessWorkloadAssessor {
             create_sysbench_pods(&t2_clone, t2_pods, &config2, duration_secs, t2_rate)
         )?;
 
+        // Interference starts after the probes are running, so the probes measure
+        // a system that is already under load rather than one ramping into it.
+        if t2_interference_pods > 0 {
+            create_interference_pods(&tenant2, t2_interference_pods, &self.config, duration_secs)
+                .await?;
+        }
+
         // Wait for completion in parallel across tenants
         let t1_clone = tenant1.clone();
         let t2_clone = tenant2.clone();
@@ -86,13 +166,16 @@ impl FairnessWorkloadAssessor {
             wait_for_completion(&t2_clone, t2_pods)
         )?;
 
-        // Collect results
+        // Collect results. Interference pods emit no metrics by design.
         let t1_points = collect_results(&tenant1, t1_pods).await?;
         let t2_points = collect_results(&tenant2, t2_pods).await?;
 
         // Cleanup
         cleanup_pods(&tenant1, t1_pods).await?;
         cleanup_pods(&tenant2, t2_pods).await?;
+        if t2_interference_pods > 0 {
+            cleanup_interference_pods(&tenant2, t2_interference_pods).await?;
+        }
 
         Ok(PhaseResult {
             tenant1: TenantMetrics::from_raw(t1_points),
@@ -111,6 +194,21 @@ impl FairnessAssessor for FairnessWorkloadAssessor {
         "CPU task latency"
     }
 
+    fn configuration(&self) -> Option<serde_json::Value> {
+        // `max_prime` sets how long one event takes, and so the ceiling on the
+        // achievable rate; `intruder_noise` decides whether the interference is
+        // CPU-only or multi-resource. Both change what the number means.
+        Some(serde_json::json!({
+            "pods": self.config.pods,
+            "threads": self.config.threads,
+            "max_prime": self.config.max_prime,
+            "intruder_noise": self.config.intruder_noise.to_string(),
+            "probe_qos": self.config.probe_qos.to_string(),
+            "intruder_qos": self.config.intruder_qos.to_string(),
+            "runtime_class_name": self.config.runtime_class_name,
+        }))
+    }
+
     async fn run_baseline(
         &self,
         tenant1: Arc<TenantClusterConfig>,
@@ -123,6 +221,8 @@ impl FairnessAssessor for FairnessWorkloadAssessor {
             Some(config.tenant1_rate)
         };
 
+        // Symmetric by construction: both tenants run the same probe at the same
+        // rate, and neither generates interference.
         self.run_phase(
             tenant1,
             tenant2,
@@ -131,6 +231,7 @@ impl FairnessAssessor for FairnessWorkloadAssessor {
             self.config.pods,
             rate,
             rate,
+            0,
         )
         .await
     }
@@ -152,16 +253,27 @@ impl FairnessAssessor for FairnessWorkloadAssessor {
             Some(config.malicious_rate())
         };
 
-        let malicious_pods = (self.config.pods as f64 * config.malicious_pod_multiplier) as u32;
+        let malicious_pods =
+            ((self.config.pods as f64 * config.malicious_pod_multiplier) as u32).max(1);
+
+        // In Mixed mode the intruder's scaled-up capacity goes into stress-ng
+        // interference, and it keeps a single probe pod so that its own observed
+        // latency remains a comparable series. In Prime mode the intruder simply
+        // runs more of the probe workload, as before.
+        let (t2_probe_pods, t2_interference_pods) = match self.config.intruder_noise {
+            FairnessWorkloadNoise::Prime => (malicious_pods, 0),
+            FairnessWorkloadNoise::Mixed => (1, malicious_pods),
+        };
 
         self.run_phase(
             tenant1,
             tenant2,
             config.test_duration,
             self.config.pods,
-            malicious_pods.max(1),
+            t2_probe_pods,
             t1_rate,
             t2_rate,
+            t2_interference_pods,
         )
         .await
     }
@@ -239,7 +351,7 @@ print("RESULTS:" + ",".join(results))
         max_prime = config.max_prime
     );
 
-    serde_json::from_value(serde_json::json!({
+    let mut pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": { "name": format!("workload-fairness-{}", index) },
@@ -249,14 +361,119 @@ print("RESULTS:" + ",".join(results))
                 "name": "sysbench",
                 "image": "python:3.11-alpine",
                 "command": ["sh", "-c", format!("apk add --no-cache sysbench >/dev/null 2>&1 && python3 -c '{}'", python_script)],
-                "resources": {
-                    "requests": { "memory": "64Mi", "cpu": "100m" },
-                    "limits": { "memory": "512Mi", "cpu": "1000m" }
-                }
             }]
         }
-    }))
-    .unwrap()
+    });
+
+    // The probe is Guaranteed by default: it is the measuring instrument, and a
+    // throttled instrument cannot tell contention apart from its own cfs quota.
+    config.probe_qos.apply_to_pod(
+        &mut pod,
+        &workload_resources(config.probe_qos),
+        config.runtime_class_name.as_deref(),
+    );
+
+    serde_json::from_value(pod).unwrap()
+}
+
+/// A multi-resource interference pod for the intruder.
+///
+/// Deliberately *not* the probe workload. Prime computation saturates one core
+/// and nothing else; a realistic noisy neighbour also thrashes the shared cache,
+/// saturates the memory bus and issues I/O, which is what degrades a victim that
+/// is nominally receiving its CPU share.
+///
+/// Emits no metrics: this pod exists to create contention, not to measure it.
+fn interference_pod(index: u32, config: &FairnessWorkloadConfig, duration_secs: u64) -> Pod {
+    // --cpu:      saturate scheduler run queues
+    // --cache:    thrash shared L2/L3, which cgroup CPU shares do not partition
+    // --vm:       saturate the memory bus with allocation and dirtying
+    // --matrix:   floating point plus strided memory access
+    // --io:       dirty page writeback pressure
+    let workers = config.threads.max(1);
+    let command = format!(
+        "apk add --no-cache stress-ng >/dev/null 2>&1 && \
+         stress-ng --cpu {workers} --cache {workers} --vm {workers} --vm-bytes 128M \
+         --matrix {workers} --io {workers} --timeout {duration_secs}s --metrics-brief"
+    );
+
+    let mut pod = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": format!("workload-interference-{}", index) },
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": "stress-ng",
+                "image": "alpine:latest",
+                "command": ["sh", "-c", command],
+            }]
+        }
+    });
+
+    // BestEffort by default. Capping the intruder would cap the interference and
+    // understate what an unconstrained neighbour can actually do to a co-tenant.
+    config.intruder_qos.apply_to_pod(
+        &mut pod,
+        &workload_resources(config.intruder_qos),
+        config.runtime_class_name.as_deref(),
+    );
+
+    serde_json::from_value(pod).unwrap()
+}
+
+/// Launch the intruder's interference pods.
+///
+/// These are fire-and-forget: readiness is awaited so that the load is actually
+/// running before the phase proceeds, but no results are collected from them.
+async fn create_interference_pods(
+    tenant: &TenantClusterConfig,
+    pods: u32,
+    config: &FairnessWorkloadConfig,
+    duration_secs: u64,
+) -> Result<()> {
+    let mut pod_names = Vec::new();
+    for i in 0..pods {
+        let pod = interference_pod(i, config, duration_secs);
+        let name = pod.metadata.name.clone().unwrap();
+        tenant
+            .cluster
+            .create_pod_in_namespace(&pod, &tenant.namespace)
+            .await?;
+        pod_names.push(name);
+    }
+
+    for name in pod_names {
+        tenant
+            .cluster
+            .wait_for_pod_to_be_ready(&name, &tenant.namespace)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn cleanup_interference_pods(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
+    for i in 0..pods {
+        let name = format!("workload-interference-{}", i);
+        let _ = tenant
+            .cluster
+            .delete_pod_in_namespace(&name, &tenant.namespace)
+            .await;
+    }
+
+    for i in 0..pods {
+        let name = format!("workload-interference-{}", i);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(POD_DELETION_TIMEOUT_SECS),
+            tenant
+                .cluster
+                .wait_for_pod_deletion(&name, &tenant.namespace),
+        )
+        .await;
+    }
+
+    Ok(())
 }
 
 /// Create all sysbench pods for a tenant in parallel
@@ -347,6 +564,9 @@ async fn collect_results(tenant: &TenantClusterConfig, pods: u32) -> Result<Vec<
                 if parts.len() == 2 {
                     if let (Ok(ts), Ok(secs)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
                         points.push(MetricPoint {
+                            // Pacing happens inside the pod, so there is no dispatch schedule to
+                            // measure against: the recorded latency is already the service time.
+                            scheduled_latency_ms: None,
                             timestamp_secs: ts,
                             latency_ms: secs * 1000.0, // seconds to ms
                             is_error: false,
@@ -386,4 +606,87 @@ async fn cleanup_pods(tenant: &TenantClusterConfig, pods: u32) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn container_of(pod: &Pod) -> &k8s_openapi::api::core::v1::Container {
+        &pod.spec.as_ref().unwrap().containers[0]
+    }
+
+    /// The probe is the measuring instrument. If it is throttled by its own cfs
+    /// quota it cannot distinguish neighbour contention from self-inflicted
+    /// starvation, so it defaults to Guaranteed.
+    #[test]
+    fn probe_pod_is_guaranteed_by_default() {
+        let config = FairnessWorkloadConfig::default();
+        assert_eq!(config.probe_qos, QosClass::Guaranteed);
+
+        let pod = sysbench_pod(0, &config, 30, Some(5.0));
+        let resources = container_of(&pod).resources.as_ref().unwrap();
+        let requests = resources.requests.as_ref().unwrap();
+        let limits = resources.limits.as_ref().unwrap();
+        assert_eq!(requests["cpu"].0, "1000m");
+        assert_eq!(limits["cpu"].0, "1000m");
+        assert_eq!(requests["memory"].0, limits["memory"].0);
+    }
+
+    /// Capping the intruder caps the interference, which would understate what an
+    /// unconstrained neighbour can do to a co-tenant.
+    #[test]
+    fn interference_pod_is_best_effort_by_default() {
+        let config = FairnessWorkloadConfig::default();
+        assert_eq!(config.intruder_qos, QosClass::BestEffort);
+
+        let pod = interference_pod(0, &config, 60);
+        assert!(
+            container_of(&pod).resources.is_none(),
+            "a BestEffort pod must carry no resources block at all"
+        );
+        assert_eq!(
+            pod.metadata.name.as_deref(),
+            Some("workload-interference-0"),
+            "interference pods need a distinct name so cleanup does not race the probes"
+        );
+    }
+
+    #[test]
+    fn interference_pod_exercises_more_than_cpu() {
+        let config = FairnessWorkloadConfig {
+            threads: 2,
+            ..Default::default()
+        };
+        let pod = interference_pod(1, &config, 45);
+        let command = container_of(&pod).command.as_ref().unwrap().join(" ");
+
+        // A reviewer's objection was that prime computation is purely CPU-bound
+        // and never touches the shared resources where interference actually
+        // cascades. Each of these covers one of those paths.
+        for dimension in ["--cpu 2", "--cache 2", "--vm 2", "--matrix 2", "--io 2"] {
+            assert!(
+                command.contains(dimension),
+                "interference command missing {dimension}: {command}"
+            );
+        }
+        assert!(command.contains("--timeout 45s"));
+    }
+
+    #[test]
+    fn runtime_class_propagates_to_both_pod_kinds() {
+        let config = FairnessWorkloadConfig {
+            runtime_class_name: Some("kata".into()),
+            ..Default::default()
+        };
+        for pod in [
+            sysbench_pod(0, &config, 10, None),
+            interference_pod(0, &config, 10),
+        ] {
+            assert_eq!(
+                pod.spec.as_ref().unwrap().runtime_class_name.as_deref(),
+                Some("kata")
+            );
+        }
+    }
 }

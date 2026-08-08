@@ -1,4 +1,5 @@
 import glob
+import json
 import pandas as pd
 import os
 import re
@@ -49,6 +50,103 @@ def load_experiment_data(src_dir="./", systems_to_load=None):
     return experiments
     
     
+
+def load_manifest(csv_path):
+    """Load the run manifest sitting beside a result CSV, if there is one.
+
+    Runs produced before manifests existed have none; callers must treat the
+    result as optional rather than assuming it is present.
+    """
+    directory = os.path.dirname(csv_path)
+    filename = os.path.basename(csv_path)
+    match = re.match(r"(?P<system>.+)_(?:baseline|unbalanced)_(?P<timestamp>\d+)\.csv", filename)
+    if not match:
+        return None
+
+    manifest_path = os.path.join(
+        directory,
+        f"{match.group('system')}_manifest_{match.group('timestamp')}.json",
+    )
+    if not os.path.exists(manifest_path):
+        return None
+
+    try:
+        with open(manifest_path) as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Could not read manifest {manifest_path}: {error}")
+        return None
+
+
+def load_all_experiment_runs(src_dir="./", systems_to_load=None):
+    """Load *every* run, not just the most recent one per (solution, system).
+
+    `load_experiment_data` keeps only the newest timestamp, which is right for
+    rendering a single figure but discards exactly the repetitions needed to put
+    confidence intervals on a degradation factor. This returns
+
+        runs[solution][system] -> [ {baseline, stress_test, timestamp, manifest}, ... ]
+
+    ordered by timestamp, so repeated runs can be aggregated with
+    `utils.stats.aggregate_runs`.
+    """
+    stress_files = _get_all_file_paths_generic(src_dir, DATA_CONFIGS["stresstest"])
+    baseline_files = _get_all_file_paths_generic(src_dir, DATA_CONFIGS["baseline"])
+
+    runs = {}
+    for (solution, system, timestamp), stress_file in sorted(stress_files.items()):
+        if systems_to_load and system not in systems_to_load:
+            continue
+
+        baseline_file = baseline_files.get((solution, system, timestamp))
+        if not baseline_file:
+            print(f"No matching baseline file for {stress_file}")
+            continue
+
+        baseline_experiment = preprocessing.TestResultDeserializer().load_experiment(baseline_file)
+        if baseline_experiment is None:
+            continue
+        baseline_metadata = baseline_experiment.as_baseline_metadata()
+        stress_experiment = preprocessing.TestResultDeserializer().load_experiment(
+            stress_file, baseline_metadata
+        )
+
+        runs.setdefault(solution, {}).setdefault(system, []).append(
+            {
+                "baseline": baseline_experiment,
+                "stress_test": stress_experiment,
+                "baseline_metadata": baseline_metadata,
+                "timestamp": timestamp,
+                "manifest": load_manifest(stress_file),
+            }
+        )
+
+    return runs
+
+
+def _get_all_file_paths_generic(src_dir, config):
+    """Like `_get_latest_file_paths_generic`, but keeps every timestamp."""
+    file_paths = {}
+    for data_pattern in config["data_patterns"]:
+        glob_pattern = data_pattern.replace("<system>", "*").replace("<timestamp>", "*")
+        search_path = os.path.join(src_dir, "*", glob_pattern)
+
+        regex_pattern = (
+            re.escape(data_pattern)
+            .replace(re.escape("<system>"), r"(?P<system>.+)")
+            .replace(re.escape("<timestamp>"), r"(?P<timestamp>\d+)")
+        )
+
+        for filepath in glob.glob(search_path):
+            filename = os.path.basename(filepath)
+            solution = os.path.basename(os.path.dirname(filepath))
+            match = re.match(regex_pattern, filename)
+            if match:
+                key = (solution, match.group("system"), int(match.group("timestamp")))
+                file_paths[key] = filepath
+
+    return file_paths
+
 
 def get_latest_stresstest_file_paths(src_dir="./"):
     """Get the file paths of the most recent stresstest data files"""

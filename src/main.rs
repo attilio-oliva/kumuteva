@@ -18,14 +18,16 @@ use tracing::Level;
 
 use crate::assessment::{
     // New clean assessors
-    fairness_assessor::{FairnessRunnerBuilder, RateLimitStrategy as FairnessRateLimitStrategy},
+    fairness_assessor::{
+        FairnessRunnerBuilder, QosClass, RateLimitStrategy as FairnessRateLimitStrategy,
+    },
     // Legacy types for isolation assessment
     AssessmentConfig,
 };
 use crate::assessment::{
     FairnessControlPlaneAssessor, FairnessControlPlaneConfig, FairnessNetworkAssessor,
     FairnessNetworkConfig, FairnessStorageAssessor, FairnessStorageConfig, FairnessStorageScenario,
-    FairnessWorkloadAssessor, FairnessWorkloadConfig,
+    FairnessStorageVolume, FairnessWorkloadAssessor, FairnessWorkloadConfig, FairnessWorkloadNoise,
 };
 
 use crate::cluster::{HostClusterType, K3sCluster, PreExistingCluster};
@@ -35,7 +37,7 @@ use crate::cluster::{HostClusterType, K3sCluster, PreExistingCluster};
 // ═══════════════════════════════════════════════════════════════════════════
 
 mod defaults {
-    use super::{RateLimitStrategy, StorageScenario};
+    use super::{RateLimitStrategy, StorageScenario, StorageVolumeMode};
 
     // We define STR variants for clap help text (concat! macro requires literals/str constants)
     // and typed variants for actual logic.
@@ -43,7 +45,12 @@ mod defaults {
     pub const BASELINE_DURATION: u64 = 30;
     pub const TEST_DURATION: u64 = 60;
 
-    pub const RATE_STRATEGY: RateLimitStrategy = RateLimitStrategy::Unlimited;
+    // FixedDelay, not Unlimited: under Unlimited the rate limiter is a no-op, so
+    // RATE below (and every per-subsystem rate) is silently ignored and the offered
+    // load becomes whatever the workers can push. That combination produced load
+    // figures that could not be reconciled with the configuration afterwards.
+    // Pass `--rate-strategy unlimited` explicitly to run without pacing.
+    pub const RATE_STRATEGY: RateLimitStrategy = RateLimitStrategy::FixedDelay;
 
     pub const RATE: f64 = 10.0;
     pub const LOAD_MULT: f64 = 1.0;
@@ -63,7 +70,9 @@ mod defaults {
     pub const ST_PODS: u32 = 1;
     pub const ST_BLOCK_SIZE: u32 = 4;
     pub const ST_FILE_SIZE: u32 = 100;
+    pub const ST_IODEPTH: u32 = 4;
     pub const ST_SCENARIO: StorageScenario = StorageScenario::Random;
+    pub const ST_VOLUME: StorageVolumeMode = StorageVolumeMode::EmptyDir;
 
     pub const OUTPUT_DIR: &str = "fairness_results";
 }
@@ -118,6 +127,92 @@ enum ChosenClusterProvider {
 pub enum StorageScenario {
     Random,
     Sequential,
+}
+
+/// Which storage path the fairness benchmark exercises.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Default)]
+pub enum StorageVolumeMode {
+    /// Node-local ephemeral storage — a floor for node I/O contention, but it
+    /// bypasses the PV/PVC abstraction the storage subsystem is defined over.
+    #[default]
+    EmptyDir,
+    /// A dynamically provisioned PVC: the real tenant storage path, through CSI.
+    Pvc,
+}
+
+impl From<StorageVolumeMode> for FairnessStorageVolume {
+    fn from(mode: StorageVolumeMode) -> Self {
+        match mode {
+            StorageVolumeMode::EmptyDir => FairnessStorageVolume::EmptyDir,
+            StorageVolumeMode::Pvc => FairnessStorageVolume::Pvc,
+        }
+    }
+}
+
+/// Interference the intruder generates during the unbalanced phase.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Default)]
+pub enum WorkloadNoiseMode {
+    /// More of the same CPU-bound prime workload the probe runs.
+    #[default]
+    Prime,
+    /// Multi-resource stress-ng: CPU, cache, memory bus and I/O together.
+    Mixed,
+}
+
+impl From<WorkloadNoiseMode> for FairnessWorkloadNoise {
+    fn from(mode: WorkloadNoiseMode) -> Self {
+        match mode {
+            WorkloadNoiseMode::Prime => FairnessWorkloadNoise::Prime,
+            WorkloadNoiseMode::Mixed => FairnessWorkloadNoise::Mixed,
+        }
+    }
+}
+
+fn parse_workload_noise_from_str(s: &str) -> Option<WorkloadNoiseMode> {
+    match s.to_lowercase().as_str() {
+        "prime" | "cpu" => Some(WorkloadNoiseMode::Prime),
+        "mixed" | "stress-ng" | "stressng" | "multi" => Some(WorkloadNoiseMode::Mixed),
+        _ => None,
+    }
+}
+
+/// Kubernetes QoS class requested for benchmark pods.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Default)]
+pub enum PodQosClass {
+    /// requests == limits; stable, never throttled below its request.
+    #[default]
+    Guaranteed,
+    /// requests < limits; may burst and may be throttled.
+    Burstable,
+    /// No resource constraints at all.
+    BestEffort,
+}
+
+impl From<PodQosClass> for QosClass {
+    fn from(class: PodQosClass) -> Self {
+        match class {
+            PodQosClass::Guaranteed => QosClass::Guaranteed,
+            PodQosClass::Burstable => QosClass::Burstable,
+            PodQosClass::BestEffort => QosClass::BestEffort,
+        }
+    }
+}
+
+fn parse_qos_class_from_str(s: &str) -> Option<PodQosClass> {
+    match s.to_lowercase().replace(['-', '_'], "").as_str() {
+        "guaranteed" => Some(PodQosClass::Guaranteed),
+        "burstable" => Some(PodQosClass::Burstable),
+        "besteffort" => Some(PodQosClass::BestEffort),
+        _ => None,
+    }
+}
+
+fn parse_storage_volume_from_str(s: &str) -> Option<StorageVolumeMode> {
+    match s.to_lowercase().as_str() {
+        "emptydir" | "empty-dir" | "ephemeral" => Some(StorageVolumeMode::EmptyDir),
+        "pvc" | "persistentvolumeclaim" | "csi" => Some(StorageVolumeMode::Pvc),
+        _ => None,
+    }
 }
 
 impl From<StorageScenario> for FairnessStorageScenario {
@@ -197,14 +292,22 @@ pub struct FairnessConfig {
     pub st_block_size: u32,
     pub st_file_size: u32,
     pub st_scenario: StorageScenario,
+    pub st_iodepth: u32,
+    pub st_volume: StorageVolumeMode,
+    pub st_storage_class: Option<String>,
 
     pub wl_rate: f64,
     pub wl_pods: u32,
     pub wl_threads: u32,
     pub wl_max_prime: u32,
+    pub wl_noise: WorkloadNoiseMode,
+    pub probe_qos: PodQosClass,
+    pub intruder_qos: PodQosClass,
+    pub runtime_class: Option<String>,
 
     pub export_csv: bool,
     pub output_dir: String,
+    pub solution_label: Option<String>,
 }
 
 /// Layer 1: YAML Configuration
@@ -228,6 +331,9 @@ struct FairnessYamlLayer {
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct GlobalConfigYaml {
+    probe_qos: Option<String>,
+    intruder_qos: Option<String>,
+    runtime_class_name: Option<String>,
     baseline_duration_seconds: Option<u64>,
     test_duration_seconds: Option<u64>,
     rate_strategy: Option<String>,
@@ -261,6 +367,9 @@ struct StorageConfigYaml {
     block_size_kb: Option<u32>,
     file_size_mb: Option<u32>,
     scenario: Option<String>,
+    iodepth: Option<u32>,
+    volume: Option<String>,
+    storage_class_name: Option<String>,
 }
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -270,6 +379,7 @@ struct WorkloadConfigYaml {
     pods: Option<u32>,
     threads: Option<u32>,
     max_prime: Option<u32>,
+    noise: Option<String>,
 }
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -317,7 +427,7 @@ pub struct FairnessCliLayer {
     #[clap(long)]
     pub test_duration: Option<u64>,
 
-    /// Rate strategy [default: unlimited]
+    /// Rate strategy [default: fixed-delay]
     #[clap(long, value_enum)]
     pub rate_strategy: Option<RateLimitStrategy>,
 
@@ -362,6 +472,23 @@ pub struct FairnessCliLayer {
     #[clap(long)]
     pub wl_max_prime: Option<u32>,
 
+    /// Interference the intruder generates in the unbalanced phase: the same
+    /// prime workload, or a multi-resource stress-ng mix [default: prime]
+    #[clap(long, value_enum)]
+    pub wl_noise: Option<WorkloadNoiseMode>,
+
+    /// QoS class for measuring probe pods across all subsystems [default: guaranteed]
+    #[clap(long, value_enum)]
+    pub probe_qos: Option<PodQosClass>,
+
+    /// QoS class for intruder interference pods [default: best-effort]
+    #[clap(long, value_enum)]
+    pub intruder_qos: Option<PodQosClass>,
+
+    /// RuntimeClass for all benchmark pods, e.g. a gVisor or Kata sandbox
+    #[clap(long)]
+    pub runtime_class: Option<String>,
+
     /// Number of network pod pairs (client/server) [default: 1]
     #[clap(long)]
     pub net_pod_pairs: Option<u32>,
@@ -385,6 +512,24 @@ pub struct FairnessCliLayer {
     #[clap(long, value_enum)]
     pub st_scenario: Option<StorageScenario>,
 
+    /// Outstanding I/Os per fio job in the random scenario [default: 4].
+    ///
+    /// A ceiling, not a load knob: occupancy is rate x latency, so this only
+    /// binds at saturation — where too small a value throttles the intruder and
+    /// makes a short-falling achieved rate ambiguous between a saturated device
+    /// and an exhausted queue.
+    #[clap(long)]
+    pub st_iodepth: Option<u32>,
+
+    /// Storage path exercised by the benchmark: node-local ephemeral, or a PVC
+    /// through the CSI driver [default: emptydir]
+    #[clap(long, value_enum)]
+    pub st_volume: Option<StorageVolumeMode>,
+
+    /// StorageClass to use in PVC mode [default: cluster default]
+    #[clap(long)]
+    pub st_storage_class: Option<String>,
+
     // Export
     /// Export results to CSV file(s) [default: false]
     #[clap(long)]
@@ -393,6 +538,11 @@ pub struct FairnessCliLayer {
     /// Output directory for CSV export [default: fairness_results]
     #[clap(short = 'o', long)]
     pub output_dir: Option<String>,
+
+    /// Multi-tenancy solution under test, recorded in the run manifest
+    /// (e.g. capsule, capsule-proxy, kubezoo, vcluster, kubevirt)
+    #[clap(long)]
+    pub solution_label: Option<String>,
 
     /// Enable verbose output [default: false]
     #[clap(long, default_value = "false")]
@@ -500,6 +650,57 @@ impl FairnessConfigBuilder {
             })
             .unwrap_or(defaults::ST_SCENARIO);
 
+        let st_volume = cli
+            .st_volume
+            .or_else(|| {
+                yaml.storage
+                    .volume
+                    .as_deref()
+                    .and_then(parse_storage_volume_from_str)
+            })
+            .unwrap_or(defaults::ST_VOLUME);
+
+        let st_storage_class = cli
+            .st_storage_class
+            .clone()
+            .or_else(|| yaml.storage.storage_class_name.clone());
+
+        // Workload
+        let wl_noise = cli
+            .wl_noise
+            .or_else(|| {
+                yaml.workload
+                    .noise
+                    .as_deref()
+                    .and_then(parse_workload_noise_from_str)
+            })
+            .unwrap_or_default();
+
+        let probe_qos = cli
+            .probe_qos
+            .or_else(|| {
+                yaml.global
+                    .probe_qos
+                    .as_deref()
+                    .and_then(parse_qos_class_from_str)
+            })
+            .unwrap_or(PodQosClass::Guaranteed);
+
+        let intruder_qos = cli
+            .intruder_qos
+            .or_else(|| {
+                yaml.global
+                    .intruder_qos
+                    .as_deref()
+                    .and_then(parse_qos_class_from_str)
+            })
+            .unwrap_or(PodQosClass::BestEffort);
+
+        let runtime_class = cli
+            .runtime_class
+            .clone()
+            .or_else(|| yaml.global.runtime_class_name.clone());
+
         FairnessConfig {
             baseline_duration: Duration::from_secs(baseline_duration),
             test_duration: Duration::from_secs(test_duration),
@@ -550,6 +751,12 @@ impl FairnessConfigBuilder {
                 .or(yaml.storage.file_size_mb)
                 .unwrap_or(defaults::ST_FILE_SIZE),
             st_scenario,
+            st_iodepth: cli
+                .st_iodepth
+                .or(yaml.storage.iodepth)
+                .unwrap_or(defaults::ST_IODEPTH),
+            st_volume,
+            st_storage_class,
 
             wl_rate: cli.wl_rate.or(yaml.workload.rate).unwrap_or(rate_limit),
             wl_pods: cli
@@ -564,12 +771,17 @@ impl FairnessConfigBuilder {
                 .wl_max_prime
                 .or(yaml.workload.max_prime)
                 .unwrap_or(defaults::WL_PRIME),
+            wl_noise,
+            probe_qos,
+            intruder_qos,
+            runtime_class,
 
             export_csv: cli.export_csv || yaml.export.csv.unwrap_or(false),
             output_dir: cli
                 .output_dir
                 .or(yaml.export.output_dir)
                 .unwrap_or_else(|| defaults::OUTPUT_DIR.to_string()),
+            solution_label: cli.solution_label,
         }
     }
 }
@@ -585,6 +797,10 @@ pub struct Cli {
     command: Commands,
 }
 
+// The Fairness variant carries the whole CLI layer and is much larger than the
+// others. This enum is constructed exactly once, at argument-parsing time, so
+// the size difference costs nothing and boxing it would only obscure the parser.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Setup test environment with two tenants given a cluster environment type
@@ -713,7 +929,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             setup_logging(verbose)?;
             println!("Setting up test environment...");
-            let cluster_name = format!("{}-{}", cluster_name, kind.as_str());
+            // `--cluster-name` is used exactly as given. It previously had the
+            // solution appended, so `--cluster-name bench` silently became
+            // `bench-capsule`, and every later command that needs the real name
+            // — `kind delete cluster`, `docker update --cpuset-cpus`, reading
+            // back the kubeconfig — had to know about the rewrite to find it.
+            let solution = kind.as_str().to_string();
             setup_test_environment(
                 existing_cluster_kubeconfig,
                 output_dir,
@@ -725,6 +946,11 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             println!("Test environment setup complete");
+            println!("  cluster:  {cluster_name}");
+            println!("  solution: {solution}");
+            println!(
+                "  pass `--solution-label {solution}` to `fairness` so the run manifest records it"
+            );
         }
         Commands::Verify {
             verbose,
@@ -821,6 +1047,7 @@ async fn main() -> anyhow::Result<()> {
             println!();
 
             let mut results = Vec::new();
+            let mut failed_subsystems: Vec<&str> = Vec::new();
 
             // Helper to build a runner for a specific subsystem
             let create_runner = |rate: f64| {
@@ -835,7 +1062,9 @@ async fn main() -> anyhow::Result<()> {
                 if config.export_csv {
                     builder = builder.export_csv(&config.output_dir);
                 }
-                builder.build()
+                builder
+                    .build()
+                    .with_solution_label(config.solution_label.clone())
             };
 
             // Control Plane
@@ -852,12 +1081,21 @@ async fn main() -> anyhow::Result<()> {
                     max_workers: config.cp_requesters,
                 });
                 let runner = create_runner(config.cp_rate);
-                results.push((
-                    "Control Plane",
-                    runner
-                        .run(&cp_assessor, tenant1_config.clone(), tenant2_config.clone())
-                        .await?,
-                ));
+                match runner
+                    .run(&cp_assessor, tenant1_config.clone(), tenant2_config.clone())
+                    .await
+                {
+                    Ok(result) => results.push(("Control Plane", result)),
+                    Err(error) => {
+                        // One subsystem failing must not cancel the others. A
+                        // leftover PVC in storage previously aborted the whole
+                        // invocation, so the workload assessment never ran and
+                        // four repetitions produced no data for either.
+                        eprintln!("\n  ✗ Control Plane assessment failed: {error:#}");
+                        eprintln!("    continuing with the remaining subsystems");
+                        failed_subsystems.push("Control Plane");
+                    }
+                }
             }
 
             // Network
@@ -879,16 +1117,25 @@ async fn main() -> anyhow::Result<()> {
                     packet_size: config.net_packet_size,
                 });
                 let runner = create_runner(config.net_rate);
-                results.push((
-                    "Network",
-                    runner
-                        .run(
-                            &net_assessor,
-                            tenant1_config.clone(),
-                            tenant2_config.clone(),
-                        )
-                        .await?,
-                ));
+                match runner
+                    .run(
+                        &net_assessor,
+                        tenant1_config.clone(),
+                        tenant2_config.clone(),
+                    )
+                    .await
+                {
+                    Ok(result) => results.push(("Network", result)),
+                    Err(error) => {
+                        // One subsystem failing must not cancel the others. A
+                        // leftover PVC in storage previously aborted the whole
+                        // invocation, so the workload assessment never ran and
+                        // four repetitions produced no data for either.
+                        eprintln!("\n  ✗ Network assessment failed: {error:#}");
+                        eprintln!("    continuing with the remaining subsystems");
+                        failed_subsystems.push("Network");
+                    }
+                }
             }
 
             // Storage
@@ -896,8 +1143,23 @@ async fn main() -> anyhow::Result<()> {
                 println!("\n═══════════════════════════════════════════════════════════");
                 println!("Storage Fairness Assessment");
                 println!(
-                    "  Pods: {}, Block: {}KB, File: {}MB, Scenario: {:?}",
-                    config.st_pods, config.st_block_size, config.st_file_size, config.st_scenario
+                    "  Pods: {}, Block: {}KB, File: {}MB, Scenario: {:?}, iodepth: {}",
+                    config.st_pods,
+                    config.st_block_size,
+                    config.st_file_size,
+                    config.st_scenario,
+                    config.st_iodepth
+                );
+                // Which path is under test decides what the number means, so it
+                // belongs in the log as well as the manifest.
+                println!(
+                    "  Volume: {:?}{}",
+                    config.st_volume,
+                    config
+                        .st_storage_class
+                        .as_deref()
+                        .map(|c| format!(" (storageClass {c})"))
+                        .unwrap_or_default()
                 );
                 if config.st_rate != config.rate_limit {
                     println!("  Rate limit: {} req/s (custom)", config.st_rate);
@@ -909,14 +1171,28 @@ async fn main() -> anyhow::Result<()> {
                     block_size_kb: config.st_block_size,
                     file_size_mb: config.st_file_size,
                     scenario: config.st_scenario.into(),
+                    iodepth: config.st_iodepth,
+                    volume: config.st_volume.into(),
+                    storage_class_name: config.st_storage_class.clone(),
+                    qos_class: config.probe_qos.into(),
+                    runtime_class_name: config.runtime_class.clone(),
                 });
                 let runner = create_runner(config.st_rate);
-                results.push((
-                    "Storage",
-                    runner
-                        .run(&st_assessor, tenant1_config.clone(), tenant2_config.clone())
-                        .await?,
-                ));
+                match runner
+                    .run(&st_assessor, tenant1_config.clone(), tenant2_config.clone())
+                    .await
+                {
+                    Ok(result) => results.push(("Storage", result)),
+                    Err(error) => {
+                        // One subsystem failing must not cancel the others. A
+                        // leftover PVC in storage previously aborted the whole
+                        // invocation, so the workload assessment never ran and
+                        // four repetitions produced no data for either.
+                        eprintln!("\n  ✗ Storage assessment failed: {error:#}");
+                        eprintln!("    continuing with the remaining subsystems");
+                        failed_subsystems.push("Storage");
+                    }
+                }
             }
 
             // Workload
@@ -936,14 +1212,27 @@ async fn main() -> anyhow::Result<()> {
                     pods: config.wl_pods,
                     threads: config.wl_threads,
                     max_prime: config.wl_max_prime,
+                    intruder_noise: config.wl_noise.into(),
+                    probe_qos: config.probe_qos.into(),
+                    intruder_qos: config.intruder_qos.into(),
+                    runtime_class_name: config.runtime_class.clone(),
                 });
                 let runner = create_runner(config.wl_rate);
-                results.push((
-                    "Workload",
-                    runner
-                        .run(&wl_assessor, tenant1_config.clone(), tenant2_config.clone())
-                        .await?,
-                ));
+                match runner
+                    .run(&wl_assessor, tenant1_config.clone(), tenant2_config.clone())
+                    .await
+                {
+                    Ok(result) => results.push(("Workload", result)),
+                    Err(error) => {
+                        // One subsystem failing must not cancel the others. A
+                        // leftover PVC in storage previously aborted the whole
+                        // invocation, so the workload assessment never ran and
+                        // four repetitions produced no data for either.
+                        eprintln!("\n  ✗ Workload assessment failed: {error:#}");
+                        eprintln!("    continuing with the remaining subsystems");
+                        failed_subsystems.push("Workload");
+                    }
+                }
             }
 
             // Summary
@@ -953,6 +1242,16 @@ async fn main() -> anyhow::Result<()> {
 
             for (_, result) in &results {
                 println!("{}", result);
+            }
+
+            // State plainly which subsystems produced no data. Without this a
+            // partially failed run looks like a complete one in the summary, and
+            // the gap is only noticed later when the analysis finds no files.
+            if !failed_subsystems.is_empty() {
+                println!(
+                    "\n  ✗ no data from: {} — these subsystems failed and were skipped",
+                    failed_subsystems.join(", ")
+                );
             }
 
             if !results.is_empty() {
@@ -975,6 +1274,28 @@ async fn main() -> anyhow::Result<()> {
                         worst_res.latency_degradation,
                         worst_res.fairness_level()
                     );
+                }
+
+                // Throughput retention is reported separately from latency because a
+                // saturated system harms the victim on both axes at once, and a
+                // latency-only figure understates the harm.
+                let min_retention = results
+                    .iter()
+                    .map(|(_, r)| r.throughput_retention)
+                    .fold(f64::INFINITY, f64::min);
+                if min_retention.is_finite() {
+                    println!(
+                        "Lowest Regular-Tenant Throughput Retention: {:.1}%",
+                        min_retention * 100.0
+                    );
+                    if min_retention < 0.95 {
+                        println!(
+                            "  ⚠ at least one subsystem throttled the regular tenant below its"
+                        );
+                        println!(
+                            "    configured rate — degradation factors are lower bounds there"
+                        );
+                    }
                 }
             }
 
@@ -1218,4 +1539,114 @@ fn setup_logging(verbose: bool) -> anyhow::Result<()> {
         .with_max_level(if verbose { Level::INFO } else { Level::ERROR })
         .init();
     Ok(())
+}
+
+#[cfg(test)]
+mod campaign_config_tests {
+    use super::*;
+
+    /// The campaign config must land exactly on the rates the paper reports.
+    ///
+    /// Those figures were previously *intended* values the tool never delivered:
+    /// the control plane ran 1.55x over, storage 1.83x over, and the workload
+    /// could not physically reach its target at all. Now that the configured
+    /// rate is what gets offered, this file is what makes the paper's numbers
+    /// true — so pin it. A well-meaning edit to a rate or a multiplier silently
+    /// changes what the paper claims.
+    fn campaign() -> FairnessConfig {
+        FairnessConfigBuilder::new()
+            .with_yaml(Some(&PathBuf::from("experiments/campaign.yaml")))
+            .expect("campaign config should parse")
+            .build()
+    }
+
+    /// One escalation factor across every subsystem, so the degradation factors
+    /// can be compared between them. The published campaign stressed the control
+    /// plane 300x harder than the data plane, which is why Table I's rows are not
+    /// comparable as presented.
+    #[test]
+    fn every_subsystem_is_escalated_equally() {
+        let config = campaign();
+        let factor = config.load_multiplier * config.pod_multiplier;
+        assert_eq!(factor, 10.0);
+
+        // Unlimited would make every rate below a no-op.
+        assert!(!matches!(
+            config.rate_strategy,
+            RateLimitStrategy::Unlimited
+        ));
+    }
+
+    #[test]
+    fn control_plane_targets_150_to_1500_requests_per_second() {
+        let config = campaign();
+        assert_eq!(config.cp_rate, 150.0);
+
+        let intruder = config.cp_rate * config.load_multiplier * config.pod_multiplier;
+        assert_eq!(intruder, 1500.0);
+
+        // Concurrency must be ample: a worker blocks on each request, so its
+        // ceiling is 1/latency. At 20 req/s per worker there is a wide margin
+        // even when contention pushes latency into the tens of milliseconds.
+        let workers = config.cp_requesters as f64 * config.pod_multiplier;
+        assert_eq!(workers, 50.0);
+        assert_eq!(intruder / workers, 30.0);
+    }
+
+    #[test]
+    fn probe_is_burstable_so_it_fits_a_kubevirt_tenant() {
+        let yaml = campaign();
+
+        // Guaranteed forces requests == limits, which reserves a full core per
+        // probe pod. A KubeVirt tenant is a pair of 2-core VMs, so that shape
+        // cannot be scheduled there and the solution drops out of the campaign.
+        assert_eq!(
+            yaml.probe_qos,
+            PodQosClass::Burstable,
+            "probe must be Burstable or KubeVirt tenants cannot schedule it"
+        );
+
+        // Capping the intruder would cap the interference being measured.
+        assert_eq!(
+            yaml.intruder_qos,
+            PodQosClass::BestEffort,
+            "intruder must stay unconstrained"
+        );
+    }
+
+    #[test]
+    fn data_plane_targets_the_published_rates() {
+        let config = campaign();
+        let escalate = |per_unit: f64| per_unit * config.load_multiplier * config.pod_multiplier;
+
+        // Storage: 10 -> 100 kreq/s, rate being per pod.
+        assert_eq!(config.st_rate, 10_000.0);
+        assert_eq!(escalate(10_000.0), 100_000.0);
+
+        // Network: 125 Mbps -> 1.25 Gbps one-way at a 1000-byte payload.
+        assert_eq!(config.net_packet_size, 1000);
+        let one_way_mbps = |packets: f64| packets * config.net_packet_size as f64 * 8.0 / 1e6;
+        assert_eq!(one_way_mbps(config.net_rate), 125.0);
+        assert_eq!(one_way_mbps(escalate(config.net_rate)), 1250.0);
+
+        // Workload: 5 -> 50 req/s.
+        assert_eq!(config.wl_rate, 5.0);
+        assert_eq!(escalate(5.0), 50.0);
+
+        // A sysbench event must fit inside the target interval, or the rate is
+        // unreachable however it is configured. At the published maxPrime of
+        // 500000 an event takes ~1.9 s, capping a pod near 0.5 req/s.
+        assert!(
+            config.wl_max_prime <= 50_000,
+            "maxPrime {} cannot sustain 5 req/s per pod",
+            config.wl_max_prime
+        );
+    }
+
+    #[test]
+    fn campaign_phases_are_the_published_durations() {
+        let config = campaign();
+        assert_eq!(config.baseline_duration, Duration::from_secs(30));
+        assert_eq!(config.test_duration, Duration::from_secs(60));
+    }
 }
