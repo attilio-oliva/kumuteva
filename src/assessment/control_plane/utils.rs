@@ -245,10 +245,25 @@ pub(super) fn create_minimal_object(
         }
 
         KubernetesObject::RoleBinding => {
+            // Bind a ClusterRole that exists, rather than a Role named after
+            // this binding — which is never created, so the reference cannot be
+            // resolved.
+            //
+            // Kubernetes refuses a binding whose referenced role it cannot read,
+            // because it cannot then run the privilege-escalation check that
+            // says the creator already holds everything being granted. The
+            // result is a 403 whatever the tenant's real rights are, which this
+            // assessment recorded as "operation not authorized" and hence as
+            // zero autonomy. kubectl-mtb, creating a well-formed binding,
+            // finds the same tenant can create RoleBindings perfectly well.
+            //
+            // `view` is a default ClusterRole present on every cluster, and
+            // binding it is the ordinary self-service operation a tenant owner
+            // is expected to be able to perform.
             base_object["roleRef"] = serde_json::json!({
                 "apiGroup": "rbac.authorization.k8s.io",
-                "kind": "Role",
-                "name": object_name
+                "kind": "ClusterRole",
+                "name": "view"
             });
             base_object["subjects"] = serde_json::json!([{
                 "kind": "User",
@@ -258,10 +273,14 @@ pub(super) fn create_minimal_object(
         }
 
         KubernetesObject::ClusterRoleBinding => {
+            // Same defect as RoleBinding above: the referenced ClusterRole was
+            // named after the binding and never created, so the reference could
+            // not resolve and the API server refused it for that reason rather
+            // than on the tenant's permissions.
             base_object["roleRef"] = serde_json::json!({
                 "apiGroup": "rbac.authorization.k8s.io",
                 "kind": "ClusterRole",
-                "name": object_name
+                "name": "view"
             });
             base_object["subjects"] = serde_json::json!([{
                 "kind": "User",

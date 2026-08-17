@@ -1,0 +1,484 @@
+# kubectl-mtb benchmark -> KUMUTEVA property mapping.
+#
+# Hand-authored on purpose, and kept as data rather than code so a reviewer can
+# read and challenge it without reading Python. Every claim in the comparison
+# rests on these correspondences being defensible.
+#
+# Keyed on `directory`, not `id`. Upstream reuses `MTB-PL1-BC-HI-1` for two
+# different benchmarks (block_use_of_host_path and block_use_of_nodeport_services),
+# so keying on the ID silently loses one of them.
+#
+# Fields per entry:
+#
+#   dimension    isolation | autonomy | not_covered
+#                Which KUMUTEVA output this benchmark corresponds to. Most MTB
+#                benchmarks ask "is the tenant prevented from X", which is our
+#                isolation level. The Self-Service Operations ones ask the
+#                opposite — "can the tenant do X" — which is our autonomy flag.
+#                Comparing those against an isolation level would invert the
+#                verdict, so the dimension is declared rather than inferred.
+#
+#   confidence   exact | partial
+#                `partial` means we probe something adjacent, not the same
+#                thing. Those cases must not be counted as clean agreement or
+#                disagreement, because a mismatch may just be the mapping.
+#
+#   properties   subsystem + resources x operations, expanded as a cross-product.
+#                Strings must match `kumuteva verify --list-properties` exactly;
+#                a test asserts this, because a typo would silently match nothing
+#                and produce an empty comparison that looks like a clean run.
+#
+#   capability   One name from the shared vocabulary in utils/mtb.py. Both tools
+#                are described against the same list, so a row of the feature
+#                table reads "absent" only because no benchmark declares that
+#                capability — a computed fact rather than an assertion. Declared
+#                for every benchmark, including the not_covered ones: a
+#                benchmark KUMUTEVA does not mirror still describes a capability
+#                kubectl-mtb has, and dropping it would flatter us.
+#
+#   probe_kind   rbac | admission | runtime — what the benchmark actually does.
+#                `runtime` means it observes the running system: sends traffic,
+#                reads data, executes in the container. Nothing upstream does
+#                this, and a test asserts the count stays zero.
+#
+#                Note this deliberately disagrees with upstream's own
+#                `benchmark_type`, which labels twelve of the nineteen
+#                "Behavioral Check". Behavioural there means "create an object
+#                and see whether the API server rejects it" — an admission
+#                decision, taken before anything runs. Recording it as
+#                `admission` is what lets the Method row say "static policy
+#                inspection" without overstating.
+#
+#   rationale    Why this correspondence holds, or why nothing covers it.
+
+version: 1
+
+# The catalogue this was authored against. If fetch_mtb_catalogue.py reports a
+# different commit or count, revisit the entries before trusting the output.
+catalogue_commit: 44dad58150a1ccd3d8f22b05b4b7489984700d4d
+catalogue_benchmark_count: 19
+
+benchmarks:
+
+  # ---------------------------------------------------------------- isolation
+
+  block_access_to_cluster_resources:
+    title: Block access to cluster resources
+    dimension: isolation
+    capability: control_plane
+    probe_kind: rbac
+    confidence: exact
+    rationale: >
+      Names Node, ClusterRole and ClusterRoleBinding explicitly. KUMUTEVA
+      assesses every cluster-scoped resource it knows about against all five
+      verbs, so this benchmark is a subset of what we already probe.
+    properties:
+      subsystem: control_plane
+      resources:
+        - v1/Node
+        - v1/Namespace
+        - v1/PersistentVolume
+        - rbac.authorization.k8s.io/v1/ClusterRole
+        - rbac.authorization.k8s.io/v1/ClusterRoleBinding
+        - storage.k8s.io/v1/StorageClass
+        - networking.k8s.io/v1/IngressClass
+      operations: [CREATE, GET, LIST, UPDATE, DELETE]
+
+  block_other_tenant_resources:
+    title: Block access to other tenant resources
+    dimension: isolation
+    capability: control_plane
+    probe_kind: rbac
+    confidence: exact
+    rationale: >
+      The closest thing MTB has to KUMUTEVA's central question. It asks whether
+      a tenant can view, edit, create or delete another tenant's namespaced
+      resources, which is exactly what the cross-tenant probe does for every
+      namespaced resource. Where the two disagree, one of them is wrong about
+      the same thing — which makes this the most informative row in the table.
+    properties:
+      subsystem: control_plane
+      resources:
+        - v1/Pod
+        - v1/Service
+        - v1/ConfigMap
+        - v1/Secret
+        - v1/PersistentVolumeClaim
+        - v1/ServiceAccount
+        - v1/Endpoints
+        - v1/LimitRange
+        - v1/ResourceQuota
+        - apps/v1/Deployment
+        - apps/v1/ReplicaSet
+        - apps/v1/StatefulSet
+        - apps/v1/DaemonSet
+        - batch/v1/Job
+        - batch/v1/CronJob
+        - networking.k8s.io/v1/Ingress
+        - networking.k8s.io/v1/NetworkPolicy
+        - rbac.authorization.k8s.io/v1/Role
+        - rbac.authorization.k8s.io/v1/RoleBinding
+        - policy/v1/PodDisruptionBudget
+        - autoscaling/v2/HorizontalPodAutoscaler
+      operations: [CREATE, GET, LIST, UPDATE, DELETE]
+
+  block_ns_quota:
+    title: Block modification of resource quotas
+    dimension: isolation
+    capability: control_plane
+    probe_kind: rbac
+    confidence: exact
+    rationale: >
+      A tenant modifying its own ResourceQuota is precisely the UPDATE and
+      DELETE probe on v1/ResourceQuota. CREATE is included because creating a
+      second, looser quota achieves the same end.
+    properties:
+      subsystem: control_plane
+      resources: [v1/ResourceQuota]
+      operations: [CREATE, UPDATE, DELETE]
+
+  block_multitenant_resources:
+    title: Block modification of admin-created multi-tenancy resources
+    dimension: isolation
+    capability: control_plane
+    probe_kind: rbac
+    confidence: partial
+    rationale: >
+      Concerns admin-created RoleBindings and NetworkPolicies inside the
+      tenant's own namespace. KUMUTEVA probes those resource types, but does not
+      distinguish an admin-created instance from a tenant-created one, so it
+      cannot express the distinction this benchmark rests on. Marked partial:
+      a mismatch here may be the mapping rather than either tool.
+    properties:
+      subsystem: control_plane
+      resources:
+        - rbac.authorization.k8s.io/v1/RoleBinding
+        - networking.k8s.io/v1/NetworkPolicy
+      operations: [UPDATE, DELETE]
+
+  block_role_privilege_escalation:
+    title: Block role privilege escalation
+    dimension: isolation
+    capability: control_plane
+    probe_kind: rbac
+    confidence: partial
+    rationale: >
+      Asks whether a tenant can grant itself more than the administrator
+      allowed. KUMUTEVA probes Role and RoleBinding creation and modification
+      but does not check whether the granted permissions exceed the tenant's
+      own, which is the actual escalation condition. Adjacent, not identical.
+    properties:
+      subsystem: control_plane
+      resources:
+        - rbac.authorization.k8s.io/v1/Role
+        - rbac.authorization.k8s.io/v1/RoleBinding
+      operations: [CREATE, UPDATE]
+
+  block_use_of_host_path:
+    title: Block use of host path volumes
+    dimension: isolation
+    capability: host_resource_policy
+    probe_kind: admission
+    confidence: exact
+    rationale: >
+      Both mount a host directory from a pod spec and see whether it is refused.
+
+      This entry was wrong on the first real run, and the disagreement is what
+      exposed it. kubectl-mtb failed the benchmark on Capsule while KUMUTEVA
+      reported the operation fully blocked. Neither tool was mistaken about what
+      it measured: our cross-tenant probe already used an inline hostPath volume,
+      the same route kubectl-mtb takes, but the authorization gate in front of it
+      additionally demanded that the tenant be able to create a cluster-scoped
+      hostPath PersistentVolume, and ANDed the two. Capsule blocks the
+      PersistentVolume and permits the pod, so the gate vetoed an operation that
+      was in fact wide open, and the probe never ran.
+
+      The gate now asks only about the pod, and the PersistentVolume route has
+      become its own operation — see block_use_of_host_path's sibling below in
+      spirit, `Use HostPath through a PersistentVolume`, which no kubectl-mtb
+      benchmark covers.
+    properties:
+      subsystem: storage
+      resources: [Volume]
+      operations: ["Use HostPath in a Volume"]
+
+  block_use_of_host_pid:
+    title: Block use of host PID namespace
+    dimension: isolation
+    capability: host_resource_policy
+    probe_kind: admission
+    confidence: exact
+    rationale: >
+      Both check whether a tenant can share the host PID namespace; our probe
+      confirms it by trying to see processes outside the container.
+    properties:
+      subsystem: workload
+      resources: ["Process Namespace"]
+      operations: ["View Processes"]
+
+  block_use_of_host_ipc:
+    title: Block use of host IPC namespace
+    dimension: isolation
+    capability: host_resource_policy
+    probe_kind: admission
+    confidence: exact
+    rationale: Both check whether the host IPC namespace can be shared.
+    properties:
+      subsystem: workload
+      resources: ["IPC Namespace"]
+      operations: ["Access IPC Resources"]
+
+  block_use_of_host_networking_and_ports:
+    title: Block use of host networking and ports
+    dimension: isolation
+    capability: host_resource_policy
+    probe_kind: admission
+    confidence: partial
+    rationale: >
+      Covers two things: hostNetwork and hostPort. KUMUTEVA probes the network
+      namespace but not host port binding specifically, so a tenant blocked from
+      one and not the other would be scored differently by the two tools.
+    properties:
+      subsystem: workload
+      resources: ["Network Namespace"]
+      operations: ["Create Network Connections"]
+
+  block_use_of_nodeport_services:
+    title: Block use of NodePort services
+    dimension: isolation
+    capability: host_resource_policy
+    probe_kind: admission
+    confidence: exact
+    rationale: >
+      Direct correspondence. Note this benchmark shares the ID MTB-PL1-BC-HI-1
+      with block_use_of_host_path upstream, which is why this mapping is keyed
+      on the directory name.
+    properties:
+      subsystem: network
+      resources: ["Service Network"]
+      operations: ["Expose NodePort"]
+
+  block_privileged_containers:
+    title: Block privileged containers
+    dimension: isolation
+    capability: host_resource_policy
+    probe_kind: admission
+    confidence: partial
+    rationale: >
+      An admission-time check on securityContext.privileged. KUMUTEVA instead
+      runs a container and attempts privileged syscalls, so it measures the
+      effect rather than the policy. A cluster that admits the pod but confines
+      it at runtime would fail the benchmark and pass our probe — a disagreement
+      that is informative rather than an error in either tool.
+
+      Mapped to the whole set of privileged pod-spec probes, not just the
+      syscall one. All four of these benchmarks are PodSecurity admission
+      concerns, and sharing the host PID, IPC, network or user namespace is
+      gated by the same admission decision as privileged, allowPrivilegeEscalation
+      and added capabilities. A cluster that admits a pod with hostPID is not
+      enforcing PodSecurity, so it necessarily admits the rest.
+
+      Mapping to `Privileged Syscalls` alone was under-specified, and it showed:
+      on Capsule that single probe reported Hard while the four namespace probes
+      in the same subsystem reported None, so the benchmark inherited the one
+      optimistic verdict out of five. Worst-of aggregation now reflects what the
+      subsystem actually found.
+    properties:
+      subsystem: workload
+      # Explicit pairs, not a cross-product: each workload resource has exactly
+      # one operation, so resources x operations would invent twenty
+      # combinations of which fifteen do not exist.
+      pairs:
+        - { resource: "Privileged Syscalls", operation: "Use Privileged Syscalls" }
+        - { resource: "Process Namespace",   operation: "View Processes" }
+        - { resource: "IPC Namespace",       operation: "Access IPC Resources" }
+        - { resource: "Network Namespace",   operation: "Create Network Connections" }
+        - { resource: "User Namespace",      operation: "Access Host User Namespace" }
+
+  block_privilege_escalation:
+    title: Block privilege escalation
+    dimension: isolation
+    capability: host_resource_policy
+    probe_kind: admission
+    confidence: partial
+    rationale: >
+      Checks securityContext.allowPrivilegeEscalation at admission. Our nearest
+      probe attempts privileged syscalls at runtime; the two overlap but are not
+      the same condition.
+
+      Mapped to the whole set of privileged pod-spec probes, not just the
+      syscall one. All four of these benchmarks are PodSecurity admission
+      concerns, and sharing the host PID, IPC, network or user namespace is
+      gated by the same admission decision as privileged, allowPrivilegeEscalation
+      and added capabilities. A cluster that admits a pod with hostPID is not
+      enforcing PodSecurity, so it necessarily admits the rest.
+
+      Mapping to `Privileged Syscalls` alone was under-specified, and it showed:
+      on Capsule that single probe reported Hard while the four namespace probes
+      in the same subsystem reported None, so the benchmark inherited the one
+      optimistic verdict out of five. Worst-of aggregation now reflects what the
+      subsystem actually found.
+    properties:
+      subsystem: workload
+      # Explicit pairs, not a cross-product: each workload resource has exactly
+      # one operation, so resources x operations would invent twenty
+      # combinations of which fifteen do not exist.
+      pairs:
+        - { resource: "Privileged Syscalls", operation: "Use Privileged Syscalls" }
+        - { resource: "Process Namespace",   operation: "View Processes" }
+        - { resource: "IPC Namespace",       operation: "Access IPC Resources" }
+        - { resource: "Network Namespace",   operation: "Create Network Connections" }
+        - { resource: "User Namespace",      operation: "Access Host User Namespace" }
+
+  block_add_capabilities:
+    title: Block adding Linux capabilities
+    dimension: isolation
+    capability: host_resource_policy
+    probe_kind: admission
+    confidence: partial
+    rationale: >
+      Upstream's description field is the single word "Linux", so the intent is
+      taken from the title and the check itself: adding capabilities via
+      securityContext. KUMUTEVA has no capability-specific probe; privileged
+      syscalls are the closest behavioural proxy.
+
+      Mapped to the whole set of privileged pod-spec probes, not just the
+      syscall one. All four of these benchmarks are PodSecurity admission
+      concerns, and sharing the host PID, IPC, network or user namespace is
+      gated by the same admission decision as privileged, allowPrivilegeEscalation
+      and added capabilities. A cluster that admits a pod with hostPID is not
+      enforcing PodSecurity, so it necessarily admits the rest.
+
+      Mapping to `Privileged Syscalls` alone was under-specified, and it showed:
+      on Capsule that single probe reported Hard while the four namespace probes
+      in the same subsystem reported None, so the benchmark inherited the one
+      optimistic verdict out of five. Worst-of aggregation now reflects what the
+      subsystem actually found.
+    properties:
+      subsystem: workload
+      # Explicit pairs, not a cross-product: each workload resource has exactly
+      # one operation, so resources x operations would invent twenty
+      # combinations of which fifteen do not exist.
+      pairs:
+        - { resource: "Privileged Syscalls", operation: "Use Privileged Syscalls" }
+        - { resource: "Process Namespace",   operation: "View Processes" }
+        - { resource: "IPC Namespace",       operation: "Access IPC Resources" }
+        - { resource: "Network Namespace",   operation: "Create Network Connections" }
+        - { resource: "User Namespace",      operation: "Access Host User Namespace" }
+
+  require_run_as_non_root_user:
+    title: Require running as a non-root user
+    dimension: isolation
+    capability: host_resource_policy
+    probe_kind: admission
+    confidence: partial
+    rationale: >
+      Another benchmark whose upstream description is just "Linux". It asserts
+      runAsNonRoot at admission. KUMUTEVA does not check the effective UID; the
+      privileged-syscall probe is related but would pass for a non-root user who
+      still holds capabilities.
+
+      Mapped to the whole set of privileged pod-spec probes, not just the
+      syscall one. All four of these benchmarks are PodSecurity admission
+      concerns, and sharing the host PID, IPC, network or user namespace is
+      gated by the same admission decision as privileged, allowPrivilegeEscalation
+      and added capabilities. A cluster that admits a pod with hostPID is not
+      enforcing PodSecurity, so it necessarily admits the rest.
+
+      Mapping to `Privileged Syscalls` alone was under-specified, and it showed:
+      on Capsule that single probe reported Hard while the four namespace probes
+      in the same subsystem reported None, so the benchmark inherited the one
+      optimistic verdict out of five. Worst-of aggregation now reflects what the
+      subsystem actually found.
+    properties:
+      subsystem: workload
+      # Explicit pairs, not a cross-product: each workload resource has exactly
+      # one operation, so resources x operations would invent twenty
+      # combinations of which fifteen do not exist.
+      pairs:
+        - { resource: "Privileged Syscalls", operation: "Use Privileged Syscalls" }
+        - { resource: "Process Namespace",   operation: "View Processes" }
+        - { resource: "IPC Namespace",       operation: "Access IPC Resources" }
+        - { resource: "Network Namespace",   operation: "Create Network Connections" }
+        - { resource: "User Namespace",      operation: "Access Host User Namespace" }
+
+  # ----------------------------------------------------------------- autonomy
+  # These ask whether the tenant CAN act, not whether it is prevented. Compared
+  # against an isolation level the verdict would come out backwards.
+
+  create_network_policies:
+    title: Create network policies
+    dimension: autonomy
+    capability: autonomy
+    probe_kind: rbac
+    confidence: exact
+    rationale: >
+      A self-service check: the tenant should be able to create NetworkPolicies
+      in its own namespace. That is KUMUTEVA's autonomy flag on the same
+      resource and verb, not an isolation level.
+    properties:
+      subsystem: control_plane
+      resources: [networking.k8s.io/v1/NetworkPolicy]
+      operations: [CREATE]
+
+  create_role_bindings:
+    title: Create roles and role bindings
+    dimension: autonomy
+    capability: autonomy
+    probe_kind: rbac
+    confidence: exact
+    rationale: >
+      Self-service again — the tenant should be able to manage RBAC within its
+      own namespace.
+    properties:
+      subsystem: control_plane
+      resources:
+        - rbac.authorization.k8s.io/v1/Role
+        - rbac.authorization.k8s.io/v1/RoleBinding
+      operations: [CREATE]
+
+  # -------------------------------------------------------------- not covered
+  # Recorded explicitly. An omission and a deliberate non-mapping look identical
+  # in a results table unless the difference is written down.
+
+  configure_ns_quotas:
+    title: Configure namespace resource quotas
+    dimension: not_covered
+    capability: quota_configuration
+    probe_kind: admission
+    rationale: >
+      Asserts that a ResourceQuota exists and constrains CPU and memory. This is
+      a configuration assertion about the cluster, not a behaviour a tenant can
+      be observed attempting, and KUMUTEVA has no equivalent.
+
+      The capability is deliberately `quota_configuration` and NOT
+      `performance_isolation`, and the distinction is the whole point. MTB files
+      this under the category "Fairness", but it checks whether a quota object
+      is *configured*; KUMUTEVA measures what the tenant actually experiences
+      while a neighbour saturates the resource. A quota can be present and the
+      neighbour still triple the owner's latency — configuration is not the
+      outcome. Filing it under performance_isolation would let a config
+      assertion answer for a measurement, and the feature table would then show
+      coverage that does not exist. The two use the same word for different
+      things, and neither subsumes the other.
+
+  configure_ns_object_quota:
+    title: Configure namespace object quotas
+    dimension: not_covered
+    capability: quota_configuration
+    probe_kind: admission
+    rationale: >
+      As above, for object-count quotas. A configuration assertion with no
+      behavioural counterpart in KUMUTEVA.
+
+  require_always_pull_image:
+    title: Require imagePullPolicy Always
+    dimension: not_covered
+    capability: image_provenance
+    probe_kind: admission
+    rationale: >
+      Prevents a tenant from using another tenant's cached private image by
+      forcing a registry pull, which re-checks credentials. A real isolation
+      concern — image-layer data isolation — that KUMUTEVA does not probe at
+      all. This is a genuine coverage gap on our side and belongs in the paper
+      as one, not buried.

@@ -23,7 +23,19 @@ const AUTONOMY_TEST_SERVICE_NAME: &str = "autonomy-test-service";
 const WEBSERVER_SERVICE_NAME: &str = "webserver-service";
 const AUTONOMY_TEST_PORT: i32 = 8080;
 const AUTONOMY_TEST_NODE_PORT: i32 = 30080;
-const WEBSERVER_PORT: i32 = 80;
+/// Unprivileged, so the probe can serve without running as root.
+///
+/// A port below 1024 needs CAP_NET_BIND_SERVICE, which the `restricted` Pod
+/// Security Standard forbids. A tenant configured to that standard — which is
+/// the whole point of the `capsule-hardened` target — would refuse the probe
+/// pod outright, and the reachability question would go unmeasured for the
+/// solutions that are most interesting to measure.
+///
+/// The port number is not itself under test: the NetworkPolicies this
+/// subsystem exercises select on pods and namespaces and carry no `ports`
+/// block, so reachability on 8080 asks exactly the question reachability on 80
+/// did.
+const WEBSERVER_PORT: i32 = 8080;
 
 // Infrastructure network test constants
 const NODE_MARKER_POD_NAME: &str = "node-marker-service";
@@ -272,6 +284,48 @@ async fn test_node_network_authorization(tenant: &TenantClusterConfig) -> anyhow
 // CROSS-TENANT EFFECT TESTS
 // =============================================================================
 
+/// Puts a probe pod to a tenant's API server, separating "the cluster said no"
+/// from "the run broke".
+///
+/// `Ok(None)` means the pod was admitted. `Ok(Some(result))` means it was
+/// refused, and carries the finding to return in place of a measurement. Only a
+/// genuine fault — the server unreachable, a malformed object — comes back as
+/// `Err`.
+///
+/// The refusal is recorded as [`IsolationLevel::Hard`] because an operation the
+/// tenant cannot perform at all is the strongest isolation this methodology
+/// recognises, and `autonomy: false` because being unable to run a pod of one's
+/// own is precisely a loss of autonomy. Both halves matter: reporting only the
+/// isolation would make a tenant that can do nothing look ideal.
+async fn admit_probe_pod(
+    tenant: &TenantClusterConfig,
+    pod: &Pod,
+    what: &str,
+) -> anyhow::Result<Option<CrossTenantResult>> {
+    match tenant
+        .cluster
+        .create_pod_in_namespace(pod, &tenant.namespace)
+        .await
+    {
+        Ok(_) => Ok(None),
+        Err(error) => match crate::assessment::admission_refusal(&error) {
+            Some(message) => {
+                info!("{} refused in {}: {}", what, tenant.namespace, message);
+                Ok(Some(CrossTenantResult {
+                    isolation: IsolationLevel::Hard,
+                    autonomy: false,
+                    details: format!(
+                        "{} could not be created in {}, so the effect could not be \
+                         observed. The cluster refused it: {}",
+                        what, tenant.namespace, message
+                    ),
+                }))
+            }
+            None => Err(error),
+        },
+    }
+}
+
 async fn test_pod_network_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
@@ -279,15 +333,12 @@ async fn test_pod_network_isolation(
     // Create pods in both namespaces
     let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
 
-    tenant1
-        .cluster
-        .create_pod_in_namespace(&pod, &tenant1.namespace)
-        .await?;
-
-    tenant2
-        .cluster
-        .create_pod_in_namespace(&pod, &tenant2.namespace)
-        .await?;
+    if let Some(refused) = admit_probe_pod(tenant1, &pod, "the tenant1 network probe").await? {
+        return Ok(refused);
+    }
+    if let Some(refused) = admit_probe_pod(tenant2, &pod, "the tenant2 network probe").await? {
+        return Ok(refused);
+    }
 
     info!("Waiting for pod in tenant1 to be ready...");
     tenant1
@@ -309,6 +360,26 @@ async fn test_pod_network_isolation(
 
     info!("Tenant 2 pod IP: {}", tenant2_pod_ip);
 
+    // Positive control, as in the service test. `Ready` is the kubelet
+    // reporting that the container started, which is not the same as the
+    // server inside it having bound its port. The window is narrower here than
+    // for a Service — no endpoint controller is involved — but a refused
+    // connection would be read as isolation just the same, so the target is
+    // required to answer itself before its silence is allowed to mean
+    // anything.
+    if !service_answers(tenant2, &tenant2_pod_ip).await {
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: true,
+            details: format!(
+                "tenant2's own probe pod at {tenant2_pod_ip} never answered from \
+                 inside {}, so there was nothing established to reach and a \
+                 failure from tenant1 would prove nothing.",
+                tenant2.namespace
+            ),
+        });
+    }
+
     // Try to connect from tenant1 to tenant2's pod
     let can_reach_other_pod = tenant1
         .cluster
@@ -316,7 +387,7 @@ async fn test_pod_network_isolation(
             NETWORK_MULTITOOL_POD_NAME,
             &tenant1.namespace,
             format!(
-                "curl -sSf {}:80 --connect-timeout 10 2>&1 >/dev/null",
+                "curl -sSf {}:{WEBSERVER_PORT} --connect-timeout 10 2>&1 >/dev/null",
                 tenant2_pod_ip
             )
             .as_str(),
@@ -359,6 +430,39 @@ async fn test_pod_network_isolation(
     }
 }
 
+/// Whether a tenant's own service answers from inside its own namespace.
+///
+/// The positive control for every cross-tenant service check. A pod being
+/// `Ready` does not mean its Service has endpoints yet: readiness is reported
+/// by the kubelet, while endpoint propagation is a separate controller writing
+/// to a separate object, and the gap between them is exactly wide enough for a
+/// curl to land in. Polling until the service answers closes that gap without
+/// guessing at a fixed sleep.
+///
+/// Retries for roughly thirty seconds. A service that has not answered its own
+/// namespace by then is not slow, it is broken.
+async fn service_answers(tenant: &TenantClusterConfig, service_ip: &str) -> bool {
+    let probe =
+        format!("curl -sSf {service_ip}:{WEBSERVER_PORT} --connect-timeout 2 2>&1 >/dev/null");
+    for attempt in 1..=15 {
+        let answered = tenant
+            .cluster
+            .exec_command_in_container(NETWORK_MULTITOOL_POD_NAME, &tenant.namespace, &probe)
+            .await
+            .map(|output| output.is_empty())
+            .unwrap_or(false);
+        if answered {
+            info!(
+                "service {} answers from inside {} (attempt {})",
+                service_ip, tenant.namespace, attempt
+            );
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    false
+}
+
 async fn test_service_network_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
@@ -367,15 +471,12 @@ async fn test_service_network_isolation(
     let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
     let service = create_webserver_service(&tenant2.namespace);
 
-    tenant1
-        .cluster
-        .create_pod_in_namespace(&pod, &tenant1.namespace)
-        .await?;
-
-    tenant2
-        .cluster
-        .create_pod_in_namespace(&pod, &tenant2.namespace)
-        .await?;
+    if let Some(refused) = admit_probe_pod(tenant1, &pod, "the tenant1 service probe").await? {
+        return Ok(refused);
+    }
+    if let Some(refused) = admit_probe_pod(tenant2, &pod, "the tenant2 service backend").await? {
+        return Ok(refused);
+    }
 
     tenant2
         .cluster
@@ -386,6 +487,19 @@ async fn test_service_network_isolation(
     tenant1
         .cluster
         .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
+        .await?;
+
+    // The backend, not just the client.
+    //
+    // Its absence was a real defect rather than an oversight: the test waited
+    // for the *Service object* to exist, which says nothing about whether
+    // anything is behind it. A curl issued before the backing pod was serving
+    // got connection-refused, and the code below read that as proof of
+    // isolation. The failure therefore appeared and disappeared between runs
+    // and always in the reassuring direction.
+    tenant2
+        .cluster
+        .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
         .await?;
 
     tenant2
@@ -406,6 +520,28 @@ async fn test_service_network_isolation(
 
     info!("Service IP: {}", service_ip);
 
+    // Positive control, before the cross-tenant attempt means anything.
+    //
+    // "Nobody answered" and "the network refused me" look identical from the
+    // client, and only one of them is isolation. So the service is first
+    // required to answer from inside its own namespace. If it will not, the
+    // probe is broken and the honest verdict is Unknown — reporting Hard there
+    // would let every startup race, image pull and scheduling delay masquerade
+    // as an isolation guarantee.
+    let serving = service_answers(tenant2, &service_ip).await;
+    if !serving {
+        return Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: true,
+            details: format!(
+                "tenant2's own service at {service_ip} never answered from inside \
+                 {}, so it was never established that there was anything to reach. \
+                 A failure from tenant1 would prove nothing.",
+                tenant2.namespace
+            ),
+        });
+    }
+
     // Try to connect from tenant1 to tenant2's service
     let can_reach_service = tenant1
         .cluster
@@ -413,7 +549,7 @@ async fn test_service_network_isolation(
             NETWORK_MULTITOOL_POD_NAME,
             &tenant1.namespace,
             format!(
-                "curl -sSf {}:80 --connect-timeout 10 2>&1 >/dev/null",
+                "curl -sSf {}:{WEBSERVER_PORT} --connect-timeout 10 2>&1 >/dev/null",
                 service_ip
             )
             .as_str(),
@@ -849,10 +985,9 @@ async fn test_dns_isolation(
         .wait_for_resource_creation::<Service>(WEBSERVER_SERVICE_NAME, &tenant1.namespace)
         .await?;
 
-    tenant2
-        .cluster
-        .create_pod_in_namespace(&pod, &tenant2.namespace)
-        .await?;
+    if let Some(refused) = admit_probe_pod(tenant2, &pod, "the tenant2 DNS probe").await? {
+        return Ok(refused);
+    }
     tenant2
         .cluster
         .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
@@ -1121,6 +1256,51 @@ async fn test_node_network_isolation(
 // MANIFEST CREATION HELPERS
 // =============================================================================
 
+/// A pod-level security context satisfying the `restricted` Pod Security
+/// Standard.
+///
+/// Applied to the probes that never needed privilege in the first place. None
+/// of these settings changes what such a probe measures — it drops capabilities
+/// it never used and forbids an escalation it never attempted — but without
+/// them a tenant enforcing `restricted` rejects the pod, and the measurement is
+/// lost rather than performed.
+///
+/// Deliberately *not* applied to the probes whose purpose is to request
+/// something a confined tenant should refuse: `create_host_network_pod` and
+/// `create_node_marker_pod` ask for host networking, and their rejection is the
+/// result the test is looking for. Making those compliant would delete the
+/// test.
+fn restricted_pod_security_context() -> serde_json::Value {
+    serde_json::json!({
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "seccompProfile": { "type": "RuntimeDefault" }
+    })
+}
+
+/// The container half of the same standard.
+fn restricted_container_security_context() -> serde_json::Value {
+    serde_json::json!({
+        "allowPrivilegeEscalation": false,
+        "capabilities": { "drop": ["ALL"] }
+    })
+}
+
+/// Serves `marker` over HTTP on [`WEBSERVER_PORT`], without needing root.
+///
+/// The image's own entrypoint cannot be used unprivileged: it rewrites
+/// `/etc/nginx/nginx.conf` and `/usr/share/nginx/html/index.html` at startup and
+/// dies on permission errors as a non-root user. Overriding the command skips
+/// it entirely, and busybox `httpd` serves a directory under `/tmp`, which is
+/// writable by any UID.
+fn unprivileged_http_server_command(marker: &str) -> String {
+    format!(
+        "mkdir -p /tmp/www && printf '%s' '{}' > /tmp/www/index.html && \
+         httpd -f -p {} -h /tmp/www",
+        marker, WEBSERVER_PORT
+    )
+}
+
 fn create_network_multitool_pod(name: &str) -> Pod {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
@@ -1132,10 +1312,13 @@ fn create_network_multitool_pod(name: &str) -> Pod {
             }
         },
         "spec": {
+            "securityContext": restricted_pod_security_context(),
             "containers": [{
                 "name": "multitool",
                 "image": "praqma/network-multitool",
-                "ports": [{ "containerPort": 80 }],
+                "command": ["/bin/sh", "-c", unprivileged_http_server_command(name)],
+                "securityContext": restricted_container_security_context(),
+                "ports": [{ "containerPort": WEBSERVER_PORT }],
                 "resources": {
                     "requests": {
                         "memory": "64Mi",
@@ -1189,8 +1372,8 @@ fn create_clusterip_service(namespace: &str, name: &str) -> Service {
             },
             "ports": [{
                 "protocol": "TCP",
-                "port": 80,
-                "targetPort": 80
+                "port": WEBSERVER_PORT,
+                "targetPort": WEBSERVER_PORT
             }],
             "type": "ClusterIP"
         }
@@ -1282,8 +1465,8 @@ fn create_nodeport_service_with_selector(
             "ports": [{
                 "name": "http",
                 "protocol": "TCP",
-                "port": 80,
-                "targetPort": 80,
+                "port": WEBSERVER_PORT,
+                "targetPort": WEBSERVER_PORT,
                 "nodePort": node_port
             }],
             "type": "NodePort"
@@ -1292,15 +1475,15 @@ fn create_nodeport_service_with_selector(
     .unwrap()
 }
 
-/// Creates a pod that serves a unique marker on port 80.
+/// Creates a pod that serves a unique marker on [`WEBSERVER_PORT`].
 /// Used for NodePort isolation testing.
+///
+/// The pod itself asks for no privilege — what the NodePort test exercises is
+/// the *Service*, and it is the Service that a confined tenant refuses. So this
+/// runs unprivileged, and the refusal, when it comes, arrives at the Service
+/// rather than here. That distinction is what lets the test report "NodePort
+/// forbidden" instead of "the probe would not start".
 fn create_nodeport_marker_pod(name: &str, marker: &str) -> Pod {
-    // Use nginx to serve the marker
-    let serve_cmd = format!(
-        "echo '{}' > /usr/share/nginx/html/index.html && nginx -g 'daemon off;'",
-        marker
-    );
-
     serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -1311,12 +1494,14 @@ fn create_nodeport_marker_pod(name: &str, marker: &str) -> Pod {
             }
         },
         "spec": {
+            "securityContext": restricted_pod_security_context(),
             "containers": [{
                 "name": "marker-server",
                 "image": "praqma/network-multitool",
-                "command": ["/bin/sh", "-c", serve_cmd],
+                "command": ["/bin/sh", "-c", unprivileged_http_server_command(marker)],
+                "securityContext": restricted_container_security_context(),
                 "ports": [{
-                    "containerPort": 80,
+                    "containerPort": WEBSERVER_PORT,
                     "protocol": "TCP"
                 }],
                 "resources": {

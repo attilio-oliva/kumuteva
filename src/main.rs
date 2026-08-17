@@ -87,6 +87,12 @@ pub enum ClusterEnvironmentType {
     Native,
     #[clap(name = "capsule", alias = "cap", alias = "caps")]
     Capsule,
+    /// Capsule with the Tenant's policy fields populated, rather than an owner
+    /// and defaults. Separate from `capsule` because the two score very
+    /// differently on policy-inspecting tools while being the same operator at
+    /// the same version.
+    #[clap(name = "capsule-hardened", alias = "caps-hard", alias = "ch")]
+    CapsuleHardened,
     #[clap(name = "capsule-proxy", alias = "cap-proxy", alias = "cp")]
     CapsuleProxy,
     #[clap(name = "kubezoo", alias = "kz")]
@@ -104,6 +110,7 @@ impl ClusterEnvironmentType {
         match self {
             ClusterEnvironmentType::Native => "native",
             ClusterEnvironmentType::Capsule => "capsule",
+            ClusterEnvironmentType::CapsuleHardened => "capsule-hardened",
             ClusterEnvironmentType::CapsuleProxy => "capsule-proxy",
             ClusterEnvironmentType::KubeZoo => "kubezoo",
             ClusterEnvironmentType::VCluster => "vcluster",
@@ -848,6 +855,29 @@ enum Commands {
         #[clap(long = "tenant2-ns", default_value = "tenant2")]
         tenant2_namespace: String,
 
+        /// Also write the report as JSON to this path.
+        ///
+        /// The printed table stays the default. This exists so the assessment
+        /// can be joined against other tools' output programmatically instead
+        /// of being transcribed by hand.
+        #[clap(long = "output-json", value_name = "PATH")]
+        output_json: Option<PathBuf>,
+
+        /// Write the full list of assessable properties to this path and exit.
+        ///
+        /// Needs no cluster. The kubectl-mtb mapping keys on the exact resource
+        /// and operation strings emitted here, and the paper's coverage count
+        /// is derived from them rather than counted by hand.
+        #[clap(long = "list-properties", value_name = "PATH")]
+        list_properties: Option<PathBuf>,
+
+        /// Multi-tenancy solution under test, recorded in the JSON report.
+        ///
+        /// Without it nothing in a result file says which solution produced it,
+        /// which is the provenance gap that left a published value untraceable.
+        #[clap(long = "solution-label", value_name = "NAME")]
+        solution_label: Option<String>,
+
         /// Assess control plane isolation (exclusive if any system is specified)
         #[clap(long = "control-plane", alias = "cp")]
         control_plane: bool,
@@ -958,13 +988,39 @@ async fn main() -> anyhow::Result<()> {
             tenant2_kubeconfig_path,
             tenant1_namespace,
             tenant2_namespace,
+            output_json,
+            list_properties,
+            solution_label,
             control_plane,
             storage,
             network,
             workload,
         } => {
             setup_logging(verbose)?;
+
+            // Before anything touches a cluster: this is an inventory of what
+            // the tool can assess, not a measurement of anything.
+            if let Some(path) = list_properties {
+                let inventory = assessment::report_json::PropertyInventoryJson::build();
+                let count = inventory.property_count;
+                std::fs::write(&path, serde_json::to_vec_pretty(&inventory)?)
+                    .with_context(|| format!("Failed to write property list to {:?}", path))?;
+                println!(
+                    "{} assessable properties written to {}",
+                    count,
+                    path.display()
+                );
+                return Ok(());
+            }
+
             println!("Verifying cluster isolation...");
+            // Taken before the assessment so the timestamp reflects when the run
+            // started, not when it happened to finish.
+            let started_at_utc = assessment::fairness_assessor::format_unix_utc(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs(),
+            );
             let assessment_config =
                 AssessmentConfig::from_flags(control_plane, storage, network, workload);
             println!("Assessment config: {}", assessment_config);
@@ -997,6 +1053,18 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", workload);
             }
             println!("{}", report);
+
+            if let Some(path) = output_json {
+                let document = assessment::report_json::VerifyReportJson::new(
+                    &report,
+                    solution_label,
+                    started_at_utc,
+                    assessment::fairness_assessor::git_commit_hash(),
+                );
+                std::fs::write(&path, serde_json::to_vec_pretty(&document)?)
+                    .with_context(|| format!("Failed to write JSON report to {:?}", path))?;
+                println!("\nJSON report written to {}", path.display());
+            }
         }
         Commands::Fairness(cli_args) => {
             setup_logging(cli_args.verbose)?;
@@ -1340,6 +1408,14 @@ async fn get_or_create_tenant_cluster(
         ClusterEnvironmentType::Capsule => {
             builder
                 .with_isolation_technology(ControlPlaneIsolation::Capsule(tenant.to_string()))
+                .build()
+                .await?
+        }
+        ClusterEnvironmentType::CapsuleHardened => {
+            builder
+                .with_isolation_technology(ControlPlaneIsolation::CapsuleHardened(
+                    tenant.to_string(),
+                ))
                 .build()
                 .await?
         }

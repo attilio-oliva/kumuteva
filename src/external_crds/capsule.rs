@@ -4,6 +4,7 @@
 
 #[allow(unused_imports)]
 mod prelude {
+    pub use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
     pub use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
     pub use kube::CustomResource;
     pub use serde::{Deserialize, Serialize};
@@ -31,6 +32,8 @@ pub struct TenantSpec {
         rename = "additionalRoleBindings"
     )]
     pub additional_role_bindings: Option<Vec<TenantAdditionalRoleBindings>>,
+    /// Deprecated: Use Enforcement.Registries instead
+    ///
     /// Specifies the trusted Image Registries assigned to the Tenant. Capsule assures that all Pods resources created in the Tenant can use only one of the allowed trusted registries. Optional.
     #[serde(
         default,
@@ -41,6 +44,17 @@ pub struct TenantSpec {
     /// Toggling the Tenant resources cordoning, when enable resources cannot be deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cordoned: Option<bool>,
+    /// Specify additional data relating to the tenant.
+    /// Mainly useable in templating and more accessible than labels/annotations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// Specifies options for the DeviceClass resources.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "deviceClasses"
+    )]
+    pub device_classes: Option<TenantDeviceClasses>,
     /// Use this if you want to disable/enable the Tenant name prefix to specific Tenants, overriding global forceTenantPrefix in CapsuleConfiguration.
     /// When set to 'true', it enforces Namespaces created for this Tenant to be named with the Tenant name prefix,
     /// separated by a dash (i.e. for Tenant 'foo', namespace names must be prefixed with 'foo-'),
@@ -55,6 +69,15 @@ pub struct TenantSpec {
         rename = "forceTenantPrefix"
     )]
     pub force_tenant_prefix: Option<bool>,
+    /// Specifies options for the GatewayClass resources.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "gatewayOptions"
+    )]
+    pub gateway_options: Option<TenantGatewayOptions>,
+    /// Deprecated: Use Enforcement.Registries instead
+    ///
     /// Specify the allowed values for the imagePullPolicies option in Pod resources. Capsule assures that all Pod resources created in the Tenant can use only one of the allowed policy. Optional.
     #[serde(
         default,
@@ -69,6 +92,8 @@ pub struct TenantSpec {
         rename = "ingressOptions"
     )]
     pub ingress_options: Option<TenantIngressOptions>,
+    /// Deprecated: Use Tenant Replications instead (https://projectcapsule.dev/docs/replications/)
+    ///
     /// Specifies the resource min/max usage restrictions to the Tenant. The assigned values are inherited by any namespace created in the Tenant. Optional.
     #[serde(
         default,
@@ -83,6 +108,8 @@ pub struct TenantSpec {
         rename = "namespaceOptions"
     )]
     pub namespace_options: Option<TenantNamespaceOptions>,
+    /// Deprecated: Use Tenant Replications instead (https://projectcapsule.dev/docs/replications/)
+    ///
     /// Specifies the NetworkPolicies assigned to the Tenant. The assigned NetworkPolicies are inherited by any namespace created in the Tenant. Optional.
     #[serde(
         default,
@@ -97,8 +124,13 @@ pub struct TenantSpec {
         rename = "nodeSelector"
     )]
     pub node_selector: Option<BTreeMap<String, String>>,
-    /// Specifies the owners of the Tenant. Mandatory.
-    pub owners: Vec<TenantOwners>,
+    /// Specifies the owners of the Tenant.
+    /// Optional
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owners: Option<Vec<TenantOwners>>,
+    /// Specify Permissions for the Tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<TenantPermissions>,
     /// Specifies options for the Pods deployed in the Tenant namespaces, such as additional metadata.
     #[serde(
         default,
@@ -131,6 +163,13 @@ pub struct TenantSpec {
         rename = "resourceQuotas"
     )]
     pub resource_quotas: Option<TenantResourceQuotas>,
+    /// Specify enforcement specifications for the scope of the Tenant.
+    ///  We are moving all configuration enforcement. per namespace into a rule construct.
+    ///  It's currently not final.
+    ///
+    /// Read More: https://projectcapsule.dev/docs/tenants/rules/
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<TenantRules>>,
     /// Specifies the allowed RuntimeClasses assigned to the Tenant.
     /// Capsule assures that all Pods resources created in the Tenant can use only one of the allowed RuntimeClasses.
     /// Optional.
@@ -161,8 +200,14 @@ pub struct TenantSpec {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantAdditionalRoleBindings {
+    /// Additional Annotations for the synchronized rolebindings
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<BTreeMap<String, String>>,
     #[serde(rename = "clusterRoleName")]
     pub cluster_role_name: String,
+    /// Additional Labels for the synchronized rolebindings
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
     /// kubebuilder:validation:Minimum=1
     pub subjects: Vec<TenantAdditionalRoleBindingsSubjects>,
 }
@@ -187,17 +232,135 @@ pub struct TenantAdditionalRoleBindingsSubjects {
     pub namespace: Option<String>,
 }
 
+/// Deprecated: Use Enforcement.Registries instead
+///
 /// Specifies the trusted Image Registries assigned to the Tenant. Capsule assures that all Pods resources created in the Tenant can use only one of the allowed trusted registries. Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantContainerRegistries {
+    /// Match exact elements which are allowed as class names within this tenant
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<String>>,
+    /// Deprecated: will be removed in a future release
+    ///
+    /// Match elements by regex.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "allowedRegex"
     )]
     pub allowed_regex: Option<String>,
+}
+
+/// Specifies options for the DeviceClass resources.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantDeviceClasses {
+    /// Match exact elements which are allowed as class names within this tenant
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed: Option<Vec<String>>,
+    /// Deprecated: will be removed in a future release
+    ///
+    /// Match elements by regex.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "allowedRegex"
+    )]
+    pub allowed_regex: Option<String>,
+    /// matchExpressions is a list of label selector requirements. The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchExpressions"
+    )]
+    pub match_expressions: Option<Vec<TenantDeviceClassesMatchExpressions>>,
+    /// matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+    /// map is equivalent to an element of matchExpressions, whose key field is "key", the
+    /// operator is "In", and the values array contains only "value". The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchLabels"
+    )]
+    pub match_labels: Option<BTreeMap<String, String>>,
+}
+
+/// A label selector requirement is a selector that contains values, a key, and an operator that
+/// relates the key and values.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantDeviceClassesMatchExpressions {
+    /// key is the label key that the selector applies to.
+    pub key: String,
+    /// operator represents a key's relationship to a set of values.
+    /// Valid operators are In, NotIn, Exists and DoesNotExist.
+    pub operator: String,
+    /// values is an array of string values. If the operator is In or NotIn,
+    /// the values array must be non-empty. If the operator is Exists or DoesNotExist,
+    /// the values array must be empty. This array is replaced during a strategic
+    /// merge patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+}
+
+/// Specifies options for the GatewayClass resources.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantGatewayOptions {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "allowedClasses"
+    )]
+    pub allowed_classes: Option<TenantGatewayOptionsAllowedClasses>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantGatewayOptionsAllowedClasses {
+    /// Match exact elements which are allowed as class names within this tenant
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed: Option<Vec<String>>,
+    /// Deprecated: will be removed in a future release
+    ///
+    /// Match elements by regex.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "allowedRegex"
+    )]
+    pub allowed_regex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// matchExpressions is a list of label selector requirements. The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchExpressions"
+    )]
+    pub match_expressions: Option<Vec<TenantGatewayOptionsAllowedClassesMatchExpressions>>,
+    /// matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+    /// map is equivalent to an element of matchExpressions, whose key field is "key", the
+    /// operator is "In", and the values array contains only "value". The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchLabels"
+    )]
+    pub match_labels: Option<BTreeMap<String, String>>,
+}
+
+/// A label selector requirement is a selector that contains values, a key, and an operator that
+/// relates the key and values.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantGatewayOptionsAllowedClassesMatchExpressions {
+    /// key is the label key that the selector applies to.
+    pub key: String,
+    /// operator represents a key's relationship to a set of values.
+    /// Valid operators are In, NotIn, Exists and DoesNotExist.
+    pub operator: String,
+    /// values is an array of string values. If the operator is In or NotIn,
+    /// the values array must be non-empty. If the operator is Exists or DoesNotExist,
+    /// the values array must be empty. This array is replaced during a strategic
+    /// merge patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
 }
 
 /// Specifies options for the Ingress resources, such as allowed hostnames and IngressClass. Optional.
@@ -250,8 +413,12 @@ pub struct TenantIngressOptions {
 /// Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantIngressOptionsAllowedClasses {
+    /// Match exact elements which are allowed as class names within this tenant
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<String>>,
+    /// Deprecated: will be removed in a future release
+    ///
+    /// Match elements by regex.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -298,8 +465,12 @@ pub struct TenantIngressOptionsAllowedClassesMatchExpressions {
 /// Specifies the allowed hostnames in Ingresses for the given Tenant. Capsule assures that all Ingress resources created in the Tenant can use only one of the allowed hostnames. Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantIngressOptionsAllowedHostnames {
+    /// Match exact elements which are allowed as class names within this tenant
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<String>>,
+    /// Deprecated: will be removed in a future release
+    ///
+    /// Match elements by regex.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -317,6 +488,8 @@ pub enum TenantIngressOptionsHostnameCollisionScope {
     Disabled,
 }
 
+/// Deprecated: Use Tenant Replications instead (https://projectcapsule.dev/docs/replications/)
+///
 /// Specifies the resource min/max usage restrictions to the Tenant. The assigned values are inherited by any namespace created in the Tenant. Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantLimitRanges {
@@ -365,6 +538,8 @@ pub struct TenantLimitRangesItemsLimits {
 /// Specifies options for the Namespaces, such as additional metadata or maximum number of namespaces allowed for that Tenant. Once the namespace quota assigned to the Tenant has been reached, the Tenant owner cannot create further namespaces. Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantNamespaceOptions {
+    /// Deprecated: Use additionalMetadataList instead (https://projectcapsule.dev/docs/tenants/metadata/#additionalmetadatalist)
+    ///
     /// Specifies additional labels and annotations the Capsule operator places on any Namespace resource in the Tenant. Optional.
     #[serde(
         default,
@@ -372,6 +547,13 @@ pub struct TenantNamespaceOptions {
         rename = "additionalMetadata"
     )]
     pub additional_metadata: Option<TenantNamespaceOptionsAdditionalMetadata>,
+    /// Specifies additional labels and annotations the Capsule operator places on any Namespace resource in the Tenant via a list. Optional.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "additionalMetadataList"
+    )]
+    pub additional_metadata_list: Option<Vec<TenantNamespaceOptionsAdditionalMetadataList>>,
     /// Define the annotations that a Tenant Owner cannot set for their Namespace resources.
     #[serde(
         default,
@@ -386,11 +568,27 @@ pub struct TenantNamespaceOptions {
         rename = "forbiddenLabels"
     )]
     pub forbidden_labels: Option<TenantNamespaceOptionsForbiddenLabels>,
+    /// If enabled only metadata from additionalMetadata is reconciled to the namespaces.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "managedMetadataOnly"
+    )]
+    pub managed_metadata_only: Option<bool>,
     /// Specifies the maximum number of namespaces allowed for that Tenant. Once the namespace quota assigned to the Tenant has been reached, the Tenant owner cannot create further namespaces. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<i32>,
+    /// Required Metadata for namespace within this tenant
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "requiredMetadata"
+    )]
+    pub required_metadata: Option<TenantNamespaceOptionsRequiredMetadata>,
 }
 
+/// Deprecated: Use additionalMetadataList instead (https://projectcapsule.dev/docs/tenants/metadata/#additionalmetadatalist)
+///
 /// Specifies additional labels and annotations the Capsule operator places on any Namespace resource in the Tenant. Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantNamespaceOptionsAdditionalMetadata {
@@ -398,6 +596,64 @@ pub struct TenantNamespaceOptionsAdditionalMetadata {
     pub annotations: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantNamespaceOptionsAdditionalMetadataList {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
+    /// A label selector is a label query over a set of resources. The result of matchLabels and
+    /// matchExpressions are ANDed. An empty label selector matches all objects. A null
+    /// label selector matches no objects.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "namespaceSelector"
+    )]
+    pub namespace_selector: Option<TenantNamespaceOptionsAdditionalMetadataListNamespaceSelector>,
+}
+
+/// A label selector is a label query over a set of resources. The result of matchLabels and
+/// matchExpressions are ANDed. An empty label selector matches all objects. A null
+/// label selector matches no objects.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantNamespaceOptionsAdditionalMetadataListNamespaceSelector {
+    /// matchExpressions is a list of label selector requirements. The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchExpressions"
+    )]
+    pub match_expressions:
+        Option<Vec<TenantNamespaceOptionsAdditionalMetadataListNamespaceSelectorMatchExpressions>>,
+    /// matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+    /// map is equivalent to an element of matchExpressions, whose key field is "key", the
+    /// operator is "In", and the values array contains only "value". The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchLabels"
+    )]
+    pub match_labels: Option<BTreeMap<String, String>>,
+}
+
+/// A label selector requirement is a selector that contains values, a key, and an operator that
+/// relates the key and values.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantNamespaceOptionsAdditionalMetadataListNamespaceSelectorMatchExpressions {
+    /// key is the label key that the selector applies to.
+    pub key: String,
+    /// operator represents a key's relationship to a set of values.
+    /// Valid operators are In, NotIn, Exists and DoesNotExist.
+    pub operator: String,
+    /// values is an array of string values. If the operator is In or NotIn,
+    /// the values array must be non-empty. If the operator is Exists or DoesNotExist,
+    /// the values array must be empty. This array is replaced during a strategic
+    /// merge patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
 }
 
 /// Define the annotations that a Tenant Owner cannot set for their Namespace resources.
@@ -426,6 +682,19 @@ pub struct TenantNamespaceOptionsForbiddenLabels {
     pub denied_regex: Option<String>,
 }
 
+/// Required Metadata for namespace within this tenant
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantNamespaceOptionsRequiredMetadata {
+    /// Annotations that must be defined for each namespace
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<BTreeMap<String, String>>,
+    /// Labels that must be defined for each namespace
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
+}
+
+/// Deprecated: Use Tenant Replications instead (https://projectcapsule.dev/docs/replications/)
+///
 /// Specifies the NetworkPolicies assigned to the Tenant. The assigned NetworkPolicies are inherited by any namespace created in the Tenant. Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantNetworkPolicies {
@@ -455,13 +724,17 @@ pub struct TenantNetworkPoliciesItems {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<Vec<TenantNetworkPoliciesItemsIngress>>,
     /// podSelector selects the pods to which this NetworkPolicy object applies.
-    /// The array of ingress rules is applied to any pods selected by this field.
+    /// The array of rules is applied to any pods selected by this field. An empty
+    /// selector matches all pods in the policy's namespace.
     /// Multiple network policies can select the same set of pods. In this case,
     /// the ingress rules for each are combined additively.
-    /// This field is NOT optional and follows standard label selector semantics.
-    /// An empty podSelector matches all pods in this namespace.
-    #[serde(rename = "podSelector")]
-    pub pod_selector: TenantNetworkPoliciesItemsPodSelector,
+    /// This field is optional. If it is not specified, it defaults to an empty selector.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "podSelector"
+    )]
+    pub pod_selector: Option<TenantNetworkPoliciesItemsPodSelector>,
     /// policyTypes is a list of rule types that the NetworkPolicy relates to.
     /// Valid options are ["Ingress"], ["Egress"], or ["Ingress", "Egress"].
     /// If this field is not specified, it will default based on the existence of ingress or egress rules;
@@ -836,11 +1109,11 @@ pub struct TenantNetworkPoliciesItemsIngressPorts {
 }
 
 /// podSelector selects the pods to which this NetworkPolicy object applies.
-/// The array of ingress rules is applied to any pods selected by this field.
+/// The array of rules is applied to any pods selected by this field. An empty
+/// selector matches all pods in the policy's namespace.
 /// Multiple network policies can select the same set of pods. In this case,
 /// the ingress rules for each are combined additively.
-/// This field is NOT optional and follows standard label selector semantics.
-/// An empty podSelector matches all pods in this namespace.
+/// This field is optional. If it is not specified, it defaults to an empty selector.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantNetworkPoliciesItemsPodSelector {
     /// matchExpressions is a list of label selector requirements. The requirements are ANDed.
@@ -880,6 +1153,9 @@ pub struct TenantNetworkPoliciesItemsPodSelectorMatchExpressions {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TenantOwners {
+    /// Additional Annotations for the synchronized rolebindings
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<BTreeMap<String, String>>,
     /// Defines additional cluster-roles for the specific Owner.
     #[serde(
         default,
@@ -887,9 +1163,12 @@ pub struct TenantOwners {
         rename = "clusterRoles"
     )]
     pub cluster_roles: Option<Vec<String>>,
-    /// Kind of tenant owner. Possible values are "User", "Group", and "ServiceAccount"
+    /// Kind of entity. Possible values are "User", "Group", and "ServiceAccount"
     pub kind: TenantOwnersKind,
-    /// Name of tenant owner.
+    /// Additional Labels for the synchronized rolebindings
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
+    /// Name of the entity.
     pub name: String,
     /// Proxy settings for tenant owner.
     #[serde(
@@ -923,6 +1202,67 @@ pub enum TenantOwnersProxySettingsKind {
     PersistentVolumes,
 }
 
+/// Specify Permissions for the Tenant.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantPermissions {
+    /// ClusterRoles granted to the promoted ServiceAccounts across the Tenant
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "allowOwnerPromotion"
+    )]
+    pub allow_owner_promotion: Option<bool>,
+    /// Matches TenantOwner objects which are promoted to owners of this tenant
+    /// The elements are OR operations and independent. You can see the resulting Tenant Owners
+    /// in the Status.Owners specification of the Tenant.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchOwners"
+    )]
+    pub match_owners: Option<Vec<TenantPermissionsMatchOwners>>,
+}
+
+/// A label selector is a label query over a set of resources. The result of matchLabels and
+/// matchExpressions are ANDed. An empty label selector matches all objects. A null
+/// label selector matches no objects.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantPermissionsMatchOwners {
+    /// matchExpressions is a list of label selector requirements. The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchExpressions"
+    )]
+    pub match_expressions: Option<Vec<TenantPermissionsMatchOwnersMatchExpressions>>,
+    /// matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+    /// map is equivalent to an element of matchExpressions, whose key field is "key", the
+    /// operator is "In", and the values array contains only "value". The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchLabels"
+    )]
+    pub match_labels: Option<BTreeMap<String, String>>,
+}
+
+/// A label selector requirement is a selector that contains values, a key, and an operator that
+/// relates the key and values.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantPermissionsMatchOwnersMatchExpressions {
+    /// key is the label key that the selector applies to.
+    pub key: String,
+    /// operator represents a key's relationship to a set of values.
+    /// Valid operators are In, NotIn, Exists and DoesNotExist.
+    pub operator: String,
+    /// values is an array of string values. If the operator is In or NotIn,
+    /// the values array must be non-empty. If the operator is Exists or DoesNotExist,
+    /// the values array must be empty. This array is replaced during a strategic
+    /// merge patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+}
+
 /// Specifies options for the Pods deployed in the Tenant namespaces, such as additional metadata.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantPodOptions {
@@ -950,8 +1290,12 @@ pub struct TenantPodOptionsAdditionalMetadata {
 /// Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantPriorityClasses {
+    /// Match exact elements which are allowed as class names within this tenant
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<String>>,
+    /// Deprecated: will be removed in a future release
+    ///
+    /// Match elements by regex.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1066,13 +1410,396 @@ pub enum TenantResourceQuotasScope {
     Namespace,
 }
 
+/// Rules Distributed via Tenants
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRules {
+    /// Enforcement for given rule
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforce: Option<TenantRulesEnforce>,
+    /// Select namespaces which are going to be targeted with this rule
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "namespaceSelector"
+    )]
+    pub namespace_selector: Option<TenantRulesNamespaceSelector>,
+    /// Permissions for given rule
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<TenantRulesPermissions>,
+}
+
+/// Enforcement for given rule
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforce {
+    /// Declare the action being performed on the enforcement rule:
+    /// deny: On match, deny admission request
+    /// allow: On match, allowed admission request
+    /// audit: On match, audit (post event) of admission request
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<TenantRulesEnforceAction>,
+    /// Enforcement for object metadata on namespaced resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Vec<TenantRulesEnforceMetadata>>,
+    /// Enforcement for Services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services: Option<TenantRulesEnforceServices>,
+    /// Enforcement for Workloads (Pods)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workloads: Option<TenantRulesEnforceWorkloads>,
+}
+
+/// Enforcement for given rule
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum TenantRulesEnforceAction {
+    #[serde(rename = "allow")]
+    Allow,
+    #[serde(rename = "deny")]
+    Deny,
+    #[serde(rename = "audit")]
+    Audit,
+}
+
+/// MetadataRule defines metadata constraints for namespaced resources.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceMetadata {
+    /// Annotations defines metadata policies by annotation key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<BTreeMap<String, TenantRulesEnforceMetadataAnnotations>>,
+    /// API groups or API group/version selectors of the referents.
+    ///
+    /// Empty or omitted APIGroups means the core Kubernetes API version "v1".
+    /// Use "*" to match all API groups and versions.
+    ///
+    /// Examples:
+    /// - [] or [""] means core "v1".
+    /// - ["v1"] means core "v1".
+    /// - ["apps"] means any version in the "apps" API group.
+    /// - ["apps/v1"] means only "apps/v1".
+    /// - ["apps", "batch/v1"] means any "apps" version and "batch/v1".
+    /// - ["*"] means all API groups and versions.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "apiGroups")]
+    pub api_groups: Option<Vec<String>>,
+    /// Kinds of the referents.
+    ///
+    /// Use "*" to match all kinds.
+    pub kinds: Vec<String>,
+    /// Labels defines metadata policies by label key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, TenantRulesEnforceMetadataLabels>>,
+}
+
+/// Annotations defines metadata policies by annotation key.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceMetadataAnnotations {
+    /// Required enforces that the metadata key must be present.
+    ///
+    /// This is mainly meaningful with action=allow. Deny and audit rules remain
+    /// value matchers and do not require missing metadata to exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Values defines allowed, denied, or audited values for the metadata key.
+    ///
+    /// If Required=true and Values is empty, only presence is enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<TenantRulesEnforceMetadataAnnotationsValues>>,
+}
+
+/// At least one of Exact or Exp must be set.
+/// Both may be set together.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceMetadataAnnotationsValues {
+    /// Exact matches one of the provided values exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Vec<String>>,
+    /// Exp matches regular expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp: Option<String>,
+    /// Negate regular Expression
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negate: Option<bool>,
+}
+
+/// Labels defines metadata policies by label key.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceMetadataLabels {
+    /// Required enforces that the metadata key must be present.
+    ///
+    /// This is mainly meaningful with action=allow. Deny and audit rules remain
+    /// value matchers and do not require missing metadata to exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Values defines allowed, denied, or audited values for the metadata key.
+    ///
+    /// If Required=true and Values is empty, only presence is enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<TenantRulesEnforceMetadataLabelsValues>>,
+}
+
+/// At least one of Exact or Exp must be set.
+/// Both may be set together.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceMetadataLabelsValues {
+    /// Exact matches one of the provided values exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Vec<String>>,
+    /// Exp matches regular expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp: Option<String>,
+    /// Negate regular Expression
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negate: Option<bool>,
+}
+
+/// Enforcement for Services.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceServices {
+    /// ExternalNames defines additional constraints for Services of type ExternalName.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "externalNames"
+    )]
+    pub external_names: Option<TenantRulesEnforceServicesExternalNames>,
+    /// LoadBalancers defines additional constraints for Services of type LoadBalancer.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "loadBalancers"
+    )]
+    pub load_balancers: Option<TenantRulesEnforceServicesLoadBalancers>,
+    /// NodePorts defines additional constraints for nodePort values.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "nodePorts")]
+    pub node_ports: Option<TenantRulesEnforceServicesNodePorts>,
+    /// Types defines the Service types matched by this rule.
+    ///
+    /// Supported values:
+    /// - ClusterIP
+    /// - NodePort
+    /// - LoadBalancer
+    /// - ExternalName
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types: Option<Vec<String>>,
+}
+
+/// ExternalNames defines additional constraints for Services of type ExternalName.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceServicesExternalNames {
+    /// Hostnames restricts spec.externalName.
+    /// Empty means no additional hostname restriction once ExternalName is allowed by types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostnames: Option<Vec<TenantRulesEnforceServicesExternalNamesHostnames>>,
+}
+
+/// At least one of Exact or Exp must be set.
+/// Both may be set together.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceServicesExternalNamesHostnames {
+    /// Exact matches one of the provided values exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Vec<String>>,
+    /// Exp matches regular expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp: Option<String>,
+    /// Negate regular Expression
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negate: Option<bool>,
+}
+
+/// LoadBalancers defines additional constraints for Services of type LoadBalancer.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceServicesLoadBalancers {
+    /// CIDRs restricts spec.loadBalancerIP and spec.loadBalancerSourceRanges.
+    /// Empty means no additional CIDR restriction once LoadBalancer is allowed by types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidrs: Option<Vec<String>>,
+}
+
+/// NodePorts defines additional constraints for nodePort values.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceServicesNodePorts {
+    /// Ports restricts explicitly requested nodePort values.
+    /// Empty means no additional port restriction once NodePort is allowed by types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<TenantRulesEnforceServicesNodePortsPorts>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceServicesNodePortsPorts {
+    pub from: i32,
+    pub to: i32,
+}
+
+/// Enforcement for Workloads (Pods)
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceWorkloads {
+    /// Define Pod QoS classes matched by this enforcement rule.
+    /// Supported values are Guaranteed, Burstable and BestEffort.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "qosClasses"
+    )]
+    pub qos_classes: Option<Vec<String>>,
+    /// Define registries which are allowed to be used within this tenant
+    /// The rules are aggregated, since you can use Regular Expressions the match registry endpoints
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registries: Option<Vec<TenantRulesEnforceWorkloadsRegistries>>,
+    /// Schedulers defines schedulerName matchers for Pod admission.
+    ///
+    /// The rule is evaluated against pod.spec.schedulerName.
+    /// Empty schedulerName is ignored and is not normalized to default-scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedulers: Option<Vec<TenantRulesEnforceWorkloadsSchedulers>>,
+    /// Define the enforcement targets this rule applies to.
+    /// If empty, each webhook applies its own backwards-compatible default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceWorkloadsRegistries {
+    /// Exact matches one of the provided values exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Vec<String>>,
+    /// Exp matches regular expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp: Option<String>,
+    /// Negate regular Expression
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negate: Option<bool>,
+    /// Allowed PullPolicy for the given registry. Supplying no value allows all policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<Vec<String>>,
+}
+
+/// At least one of Exact or Exp must be set.
+/// Both may be set together.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesEnforceWorkloadsSchedulers {
+    /// Exact matches one of the provided values exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Vec<String>>,
+    /// Exp matches regular expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp: Option<String>,
+    /// Negate regular Expression
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negate: Option<bool>,
+}
+
+/// Select namespaces which are going to be targeted with this rule
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesNamespaceSelector {
+    /// matchExpressions is a list of label selector requirements. The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchExpressions"
+    )]
+    pub match_expressions: Option<Vec<TenantRulesNamespaceSelectorMatchExpressions>>,
+    /// matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+    /// map is equivalent to an element of matchExpressions, whose key field is "key", the
+    /// operator is "In", and the values array contains only "value". The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchLabels"
+    )]
+    pub match_labels: Option<BTreeMap<String, String>>,
+}
+
+/// A label selector requirement is a selector that contains values, a key, and an operator that
+/// relates the key and values.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesNamespaceSelectorMatchExpressions {
+    /// key is the label key that the selector applies to.
+    pub key: String,
+    /// operator represents a key's relationship to a set of values.
+    /// Valid operators are In, NotIn, Exists and DoesNotExist.
+    pub operator: String,
+    /// values is an array of string values. If the operator is In or NotIn,
+    /// the values array must be non-empty. If the operator is Exists or DoesNotExist,
+    /// the values array must be empty. This array is replaced during a strategic
+    /// merge patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+}
+
+/// Permissions for given rule
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesPermissions {
+    /// Define Promotion Rules which distributed additional ClusterRoles across the Tenant
+    /// for promoted ServiceAccounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotions: Option<Vec<TenantRulesPermissionsPromotions>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesPermissionsPromotions {
+    /// ClusterRoles granted to the promoted ServiceAccounts across the Tenant
+    /// kubebuilder:validation:Minimum=1
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "clusterRoles"
+    )]
+    pub cluster_roles: Option<Vec<String>>,
+    /// Match ServiceAccounts which are promoted which are granted these additional ClusterRoles
+    /// across the Tenant
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<TenantRulesPermissionsPromotionsSelector>,
+}
+
+/// Match ServiceAccounts which are promoted which are granted these additional ClusterRoles
+/// across the Tenant
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesPermissionsPromotionsSelector {
+    /// matchExpressions is a list of label selector requirements. The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchExpressions"
+    )]
+    pub match_expressions: Option<Vec<TenantRulesPermissionsPromotionsSelectorMatchExpressions>>,
+    /// matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+    /// map is equivalent to an element of matchExpressions, whose key field is "key", the
+    /// operator is "In", and the values array contains only "value". The requirements are ANDed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "matchLabels"
+    )]
+    pub match_labels: Option<BTreeMap<String, String>>,
+}
+
+/// A label selector requirement is a selector that contains values, a key, and an operator that
+/// relates the key and values.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantRulesPermissionsPromotionsSelectorMatchExpressions {
+    /// key is the label key that the selector applies to.
+    pub key: String,
+    /// operator represents a key's relationship to a set of values.
+    /// Valid operators are In, NotIn, Exists and DoesNotExist.
+    pub operator: String,
+    /// values is an array of string values. If the operator is In or NotIn,
+    /// the values array must be non-empty. If the operator is Exists or DoesNotExist,
+    /// the values array must be empty. This array is replaced during a strategic
+    /// merge patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+}
+
 /// Specifies the allowed RuntimeClasses assigned to the Tenant.
 /// Capsule assures that all Pods resources created in the Tenant can use only one of the allowed RuntimeClasses.
 /// Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantRuntimeClasses {
+    /// Match exact elements which are allowed as class names within this tenant
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<String>>,
+    /// Deprecated: will be removed in a future release
+    ///
+    /// Match elements by regex.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1225,8 +1952,12 @@ pub struct TenantServiceOptionsForbiddenLabels {
 /// Optional.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TenantStorageClasses {
+    /// Match exact elements which are allowed as class names within this tenant
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<String>>,
+    /// Deprecated: will be removed in a future release
+    ///
+    /// Match elements by regex.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1273,13 +2004,153 @@ pub struct TenantStorageClassesMatchExpressions {
 /// Returns the observed state of the Tenant.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TenantStatus {
-    /// List of namespaces assigned to the Tenant.
+    /// Available Class Types within Tenant
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classes: Option<TenantStatusClasses>,
+    /// Tenant Condition
+    pub conditions: Vec<Condition>,
+    /// List of namespaces assigned to the Tenant. (Deprecated)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespaces: Option<Vec<String>>,
+    /// ObservedGeneration is the most recent generation the controller has observed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "observedGeneration"
+    )]
+    pub observed_generation: Option<i64>,
+    /// Collected owners for this tenant
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owners: Option<Vec<TenantStatusOwners>>,
+    /// Promoted ServiceAccounts across the Tenant
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotions: Option<Vec<TenantStatusPromotions>>,
     /// How many namespaces are assigned to the Tenant.
     pub size: i64,
-    /// The operational state of the Tenant. Possible values are "Active", "Cordoned".
+    /// Tracks state for the namespaces associated with this tenant
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spaces: Option<Vec<TenantStatusSpaces>>,
+    /// The operational state of the Tenant. Possible values are "Active", "Cordoned" or "Terminating".
     pub state: TenantStatusState,
+}
+
+/// Available Class Types within Tenant
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantStatusClasses {
+    /// Available DeviceClasses
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<Vec<String>>,
+    /// Available GatewayClasses
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<Vec<String>>,
+    /// Available PriorityClasses
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Vec<String>>,
+    /// Available StorageClasses
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<Vec<String>>,
+    /// Available Storageclasses (Only collected if any matching condition is specified)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TenantStatusOwners {
+    /// Defines additional cluster-roles for the specific Owner.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "clusterRoles"
+    )]
+    pub cluster_roles: Option<Vec<String>>,
+    /// Kind of entity. Possible values are "User", "Group", and "ServiceAccount"
+    pub kind: TenantStatusOwnersKind,
+    /// Name of the entity.
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum TenantStatusOwnersKind {
+    User,
+    Group,
+    ServiceAccount,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TenantStatusPromotions {
+    /// Defines additional cluster-roles for the specific Owner.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "clusterRoles"
+    )]
+    pub cluster_roles: Option<Vec<String>>,
+    /// Kind of entity. Possible values are "User", "Group", and "ServiceAccount"
+    pub kind: TenantStatusPromotionsKind,
+    /// Name of the entity.
+    pub name: String,
+    /// Defines additional cluster-roles for the specific Owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum TenantStatusPromotionsKind {
+    User,
+    Group,
+    ServiceAccount,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantStatusSpaces {
+    /// Conditions
+    pub conditions: Vec<Condition>,
+    /// Managed Metadata
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforce: Option<TenantStatusSpacesEnforce>,
+    /// Managed Metadata
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<TenantStatusSpacesMetadata>,
+    /// Namespace Name
+    pub name: String,
+    /// Namespace UID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+}
+
+/// Managed Metadata
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantStatusSpacesEnforce {
+    /// Registries which are allowed within this namespace
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<Vec<TenantStatusSpacesEnforceRegistry>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantStatusSpacesEnforceRegistry {
+    /// Exact matches one of the provided values exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Vec<String>>,
+    /// Exp matches regular expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp: Option<String>,
+    /// Negate regular Expression
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negate: Option<bool>,
+    /// Allowed PullPolicy for the given registry. Supplying no value allows all policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<Vec<String>>,
+}
+
+/// Managed Metadata
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TenantStatusSpacesMetadata {
+    /// Managed Annotations
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<BTreeMap<String, String>>,
+    /// Managed Labels
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
 }
 
 /// Returns the observed state of the Tenant.
@@ -1287,4 +2158,5 @@ pub struct TenantStatus {
 pub enum TenantStatusState {
     Cordoned,
     Active,
+    Terminating,
 }

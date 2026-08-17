@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf, process::Command, time::Duration
 
 use anyhow::{anyhow, Context, Ok};
 use k8s_openapi::api::{core::v1::Secret, networking::v1::NetworkPolicy};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::{api::ObjectMeta, runtime::reflector::Lookup};
 use tokio::time::sleep;
 
@@ -20,12 +21,37 @@ pub enum IsolationTechnology {
     DataPlane(DataPlaneIsolation),
 }
 
+/// How much policy the Capsule Tenant carries.
+///
+/// Capsule enforces almost nothing on its own. Its Tenant CR is a container for
+/// policy, and every field is optional; what a tenant may do is decided by
+/// which of those fields are filled in, not by installing Capsule. Notably
+/// Capsule does not implement pod security itself — it *propagates* Pod
+/// Security Admission labels onto tenant namespaces when told to.
+///
+/// The distinction is worth provisioning both ways because it is the single
+/// biggest confounder in comparing this tool against kubectl-mtb. A tenant with
+/// only an owner set fails 12 of the 19 benchmarks; the same Capsule, same
+/// version, with the policy fields populated, passes them. The score describes
+/// the Tenant CR, not Capsule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapsuleTenantPolicy {
+    /// Owner only, every policy field left at its default. What a user gets by
+    /// installing Capsule and declaring a tenant, and the configuration the
+    /// original measurements were taken under.
+    Default,
+    /// The policy fields the benchmarks actually look for, filled in.
+    Hardened,
+}
+
 #[derive(Debug, Clone)]
 pub enum ControlPlaneIsolation {
     /// Do not isolate the control plane, just create a new namespace
     None(String),
     /// Capsule with a tenant confined in the given namespace
     Capsule(String),
+    /// The same Capsule, with the Tenant's policy fields populated.
+    CapsuleHardened(String),
     CapsuleProxy(String),
     /// vCluster virtual control plane in the given namespace
     VCluster(String),
@@ -178,6 +204,9 @@ impl KubernetesClusterBuilder {
             ControlPlaneIsolation::Capsule(namespace) => {
                 self.deploy_capsule_tenant(&namespace).await
             }
+            ControlPlaneIsolation::CapsuleHardened(namespace) => {
+                self.deploy_capsule_hardened_tenant(&namespace).await
+            }
             ControlPlaneIsolation::CapsuleProxy(namespace) => {
                 self.deploy_capsule_proxy(&namespace).await
             }
@@ -300,7 +329,15 @@ impl KubernetesClusterBuilder {
         let chart_path = format!("{repo_name}/{chart}");
 
         let capsule_namespace = "capsule-system";
-        let capsule_version = "0.10.0";
+        // Kept equal to the capsule-proxy version in install_capsule_proxy: the
+        // proxy is an addon for this operator and reads its Tenant CRDs, so a
+        // skew between the two is its own failure mode.
+        //
+        // Was 0.10.0, which upstream has since withdrawn from the chart index.
+        // There is no fallback: `helm install` fails outright with "no chart
+        // version found for capsule-0.10.0". 0.13.9 is the newest release both
+        // charts still publish (capsule alone reaches 0.13.11).
+        let capsule_version = "0.13.9";
 
         let output = Command::new("helm")
             .arg("repo")
@@ -339,6 +376,26 @@ impl KubernetesClusterBuilder {
             .arg("-n")
             .arg(capsule_namespace)
             .arg("--create-namespace")
+            // Keep capsule self-contained, as it was at 0.10.0.
+            //
+            // From 0.13 the chart defaults to `certManager.generateCertificates
+            // = true` and templates a cert-manager Certificate and Issuer for
+            // its webhooks. Without cert-manager already in the cluster the
+            // install fails outright — "no matches for kind Certificate in
+            // version cert-manager.io/v1" — because the CRDs are absent.
+            //
+            // Disabling that makes capsule generate its own webhook TLS instead
+            // (`tls.create`) and run the controller that injects the CA into
+            // the webhook configurations (`tls.enableController`). The
+            // alternative, installing cert-manager alongside, would add a
+            // cluster-wide dependency to a solution that did not have one and
+            // change what is being measured.
+            .arg("--set")
+            .arg("certManager.generateCertificates=false")
+            .arg("--set")
+            .arg("tls.create=true")
+            .arg("--set")
+            .arg("tls.enableController=true")
             .output()
             .context("Failed to install capsule helm chart")?;
 
@@ -355,7 +412,7 @@ impl KubernetesClusterBuilder {
         let chart_path = format!("{repo_name}/{chart}");
 
         let capsule_namespace = "capsule-system";
-        let capsule_version = "0.10.0";
+        let capsule_version = "0.13.9";
 
         let output = Command::new("helm")
             .arg("repo")
@@ -400,6 +457,15 @@ impl KubernetesClusterBuilder {
             .arg("service.type=NodePort")
             .arg("--set")
             .arg(format!("service.nodePort={}", nodeport))
+            // Same reason as install_capsule: from 0.13 the chart defaults to
+            // issuing its serving certificate through cert-manager, which is
+            // not present. `options.generateCertificates` is the proxy's own
+            // self-signed path, and it keeps the solution self-contained
+            // instead of pulling in a cluster-wide dependency it did not have.
+            .arg("--set")
+            .arg("certManager.generateCertificates=false")
+            .arg("--set")
+            .arg("options.generateCertificates=true")
             .output()
             .context("Failed to install capsule helm chart")?;
 
@@ -419,7 +485,7 @@ impl KubernetesClusterBuilder {
         Self::install_capsule_proxy(nodeport)?;
 
         // Deploy tenant but skip namespace creation (we'll do it after adjusting kubeconfig)
-        self.deploy_capsule_tenant_without_namespace(tenant_name)
+        self.deploy_capsule_tenant_without_namespace(tenant_name, CapsuleTenantPolicy::Default)
             .await?;
 
         // Modify the kubeconfig to use the correct port and skip TLS verification
@@ -489,8 +555,231 @@ impl KubernetesClusterBuilder {
         Ok(())
     }
 
+    /// The Tenant CR for a given policy level.
+    ///
+    /// `Default` sets an owner and nothing else — the tenant you get from
+    /// following Capsule's quickstart. `Hardened` additionally fills in the
+    /// fields the multi-tenancy benchmarks look for. Each is annotated with
+    /// what it is there for, because the mapping is the point of the
+    /// comparison: none of this is Capsule behaving differently, it is Capsule
+    /// being asked for something.
+    fn capsule_tenant_spec(
+        tenant_admin_user: &str,
+        policy: CapsuleTenantPolicy,
+    ) -> capsule::TenantSpec {
+        let owners = Some(vec![capsule::TenantOwners {
+            kind: capsule::TenantOwnersKind::User,
+            name: tenant_admin_user.to_string(),
+            cluster_roles: None,
+            proxy_settings: None,
+            annotations: None,
+            labels: None,
+        }]);
+
+        if policy == CapsuleTenantPolicy::Default {
+            return capsule::TenantSpec {
+                owners,
+                ..Default::default()
+            };
+        }
+
+        // Pod Security Admission, enforced at `restricted`.
+        //
+        // Capsule has no pod security logic of its own; it stamps these labels
+        // onto every namespace it creates for the tenant and the API server's
+        // built-in admission plugin does the work. `restricted` is what makes
+        // eight benchmarks pass at once — privileged containers, privilege
+        // escalation, added capabilities, run-as-non-root, hostPath, host
+        // networking and ports, hostPID, hostIPC. Those benchmarks genuinely
+        // try to create the offending pod, so this is enforcement, not a
+        // declaration.
+        let mut namespace_labels = BTreeMap::new();
+        namespace_labels.insert(
+            "pod-security.kubernetes.io/enforce".to_string(),
+            "restricted".to_string(),
+        );
+        namespace_labels.insert(
+            "pod-security.kubernetes.io/enforce-version".to_string(),
+            "latest".to_string(),
+        );
+
+        // Compute quota. `configure_ns_quotas` joins the quota's resource names
+        // and requires the strings "cpu", "memory" and "ephemeral-storage" to
+        // appear, so the `limits.`/`requests.` prefixes satisfy it.
+        let mut compute: BTreeMap<String, IntOrString> = BTreeMap::new();
+        for (resource, amount) in [
+            ("limits.cpu", "8"),
+            ("limits.memory", "16Gi"),
+            ("limits.ephemeral-storage", "20Gi"),
+            ("requests.cpu", "8"),
+            ("requests.memory", "16Gi"),
+            ("requests.ephemeral-storage", "20Gi"),
+        ] {
+            compute.insert(
+                resource.to_string(),
+                IntOrString::String(amount.to_string()),
+            );
+        }
+
+        // Object-count quota. `configure_ns_object_quota` checks for all nine
+        // of these names, so every one has to be present even where the limit
+        // itself is generous. The values are headroom for the probes, not
+        // policy: the benchmark tests that a ceiling exists.
+        let mut objects: BTreeMap<String, IntOrString> = BTreeMap::new();
+        for (resource, count) in [
+            ("pods", "100"),
+            ("services", "50"),
+            ("replicationcontrollers", "20"),
+            ("resourcequotas", "10"),
+            ("secrets", "100"),
+            ("configmaps", "100"),
+            ("persistentvolumeclaims", "50"),
+            ("services.nodeports", "0"),
+            ("services.loadbalancers", "0"),
+        ] {
+            objects.insert(resource.to_string(), IntOrString::String(count.to_string()));
+        }
+
+        // Default limits and requests for any container that omits them.
+        //
+        // Not decoration — without it the compute quota above silently decides
+        // most of the benchmark suite. A ResourceQuota naming `limits.cpu`
+        // makes that field mandatory for every pod in the namespace, and
+        // kubectl-mtb's probe pods do not set it, so the quota rejects them
+        // before admission ever reaches Pod Security or Capsule's webhooks.
+        //
+        // That matters because the benchmarks accept *any* rejection as a
+        // pass: `block_privileged_containers` fails only if the create call
+        // returns no error at all. A tenant whose quota turns away every pod
+        // therefore scores nearly full marks without a single policy being
+        // enforced, and the run cannot tell the two situations apart.
+        //
+        // With defaults injected the quota is satisfied, and the pod is then
+        // judged on what it actually asks for. `require_always_pull_image` is
+        // the one benchmark that reads the rejection message rather than its
+        // presence — it looks for the string "admission webhook" — so it is
+        // also the only one that exposed the masking.
+        let mut default_limits: BTreeMap<String, IntOrString> = BTreeMap::new();
+        let mut default_requests: BTreeMap<String, IntOrString> = BTreeMap::new();
+        for (resource, limit, request) in [
+            ("cpu", "500m", "100m"),
+            ("memory", "512Mi", "64Mi"),
+            ("ephemeral-storage", "1Gi", "512Mi"),
+        ] {
+            default_limits.insert(resource.to_string(), IntOrString::String(limit.to_string()));
+            default_requests.insert(
+                resource.to_string(),
+                IntOrString::String(request.to_string()),
+            );
+        }
+
+        capsule::TenantSpec {
+            owners,
+            limit_ranges: Some(capsule::TenantLimitRanges {
+                items: Some(vec![capsule::TenantLimitRangesItems {
+                    limits: vec![capsule::TenantLimitRangesItemsLimits {
+                        r#type: "Container".to_string(),
+                        default: Some(default_limits),
+                        default_request: Some(default_requests),
+                        max: None,
+                        min: None,
+                        max_limit_request_ratio: None,
+                    }],
+                }]),
+            }),
+            namespace_options: Some(capsule::TenantNamespaceOptions {
+                additional_metadata: Some(capsule::TenantNamespaceOptionsAdditionalMetadata {
+                    labels: Some(namespace_labels),
+                    annotations: None,
+                }),
+                ..Default::default()
+            }),
+            resource_quotas: Some(capsule::TenantResourceQuotas {
+                scope: Some(capsule::TenantResourceQuotasScope::Namespace),
+                items: Some(vec![
+                    capsule::TenantResourceQuotasItems {
+                        hard: Some(compute),
+                        scope_selector: None,
+                        scopes: None,
+                    },
+                    capsule::TenantResourceQuotasItems {
+                        hard: Some(objects),
+                        scope_selector: None,
+                        scopes: None,
+                    },
+                ]),
+            }),
+            // "Block use of NodePort services". A NodePort punches a hole in
+            // every node, so a tenant that can open one reaches past its
+            // namespace by construction.
+            service_options: Some(capsule::TenantServiceOptions {
+                allowed_services: Some(capsule::TenantServiceOptionsAllowedServices {
+                    node_port: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            // "Require always imagePullPolicy": with Always, a tenant cannot
+            // reach an image already cached on the node without presenting
+            // credentials for it.
+            //
+            // Expressed through the rules API rather than the `imagePullPolicies`
+            // field beside it. That field still exists and still validates, but
+            // v1beta2 marks it deprecated and capsule 0.13 no longer acts on it,
+            // so setting it looks like a policy and enforces nothing — the
+            // benchmark went on failing against a tenant that appeared to
+            // configure exactly what it asked for.
+            //
+            // The semantics are match-then-constrain, not match-then-forbid: a
+            // registry reaching a final `allow` decision must then satisfy the
+            // `policy` list. So the rule allows every registry — `.*` — and the
+            // constraint it carries is that the pull policy be Always. Using
+            // `action: deny` here would do the opposite of what is wanted, since
+            // a final deny refuses the image outright and never consults the
+            // pull policy at all.
+            rules: Some(vec![capsule::TenantRules {
+                enforce: Some(capsule::TenantRulesEnforce {
+                    action: Some(capsule::TenantRulesEnforceAction::Allow),
+                    workloads: Some(capsule::TenantRulesEnforceWorkloads {
+                        // Init and ephemeral containers pull images too, and a
+                        // cached image is just as reachable from them.
+                        targets: Some(vec![
+                            "pod/containers".to_string(),
+                            "pod/initcontainers".to_string(),
+                            "pod/ephemeralcontainers".to_string(),
+                        ]),
+                        registries: Some(vec![capsule::TenantRulesEnforceWorkloadsRegistries {
+                            exp: Some(".*".to_string()),
+                            policy: Some(vec!["Always".to_string()]),
+                            exact: None,
+                            negate: None,
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
     async fn deploy_capsule_tenant(&self, tenant_name: &str) -> anyhow::Result<()> {
-        self.deploy_capsule_tenant_without_namespace(tenant_name)
+        self.deploy_capsule_tenant_with_policy(tenant_name, CapsuleTenantPolicy::Default)
+            .await
+    }
+
+    async fn deploy_capsule_hardened_tenant(&self, tenant_name: &str) -> anyhow::Result<()> {
+        self.deploy_capsule_tenant_with_policy(tenant_name, CapsuleTenantPolicy::Hardened)
+            .await
+    }
+
+    async fn deploy_capsule_tenant_with_policy(
+        &self,
+        tenant_name: &str,
+        policy: CapsuleTenantPolicy,
+    ) -> anyhow::Result<()> {
+        self.deploy_capsule_tenant_without_namespace(tenant_name, policy)
             .await?;
 
         // create a namespace for the tenant
@@ -503,6 +792,7 @@ impl KubernetesClusterBuilder {
     async fn deploy_capsule_tenant_without_namespace(
         &self,
         tenant_name: &str,
+        policy: CapsuleTenantPolicy,
     ) -> anyhow::Result<()> {
         Self::install_capsule()?;
 
@@ -516,15 +806,7 @@ impl KubernetesClusterBuilder {
             ..Default::default()
         };
 
-        let tenant_spec = capsule::TenantSpec {
-            owners: vec![capsule::TenantOwners {
-                kind: capsule::TenantOwnersKind::User,
-                name: tenant_admin_user.clone(),
-                cluster_roles: None,
-                proxy_settings: None,
-            }],
-            ..Default::default()
-        };
+        let tenant_spec = Self::capsule_tenant_spec(&tenant_admin_user, policy);
 
         let tenant_resource = capsule::Tenant {
             metadata: tenant_metadata,
@@ -1551,5 +1833,135 @@ mod tests {
         assert!(pods.is_ok(), "Failed to get pods: {:?}", pods.err());
 
         let _ = teardown_kind_cluster(temp_cluster).await;
+    }
+}
+
+#[cfg(test)]
+mod capsule_tenant_policy_tests {
+    use super::{CapsuleTenantPolicy, KubernetesClusterBuilder};
+
+    fn spec_json(policy: CapsuleTenantPolicy) -> serde_json::Value {
+        let spec = KubernetesClusterBuilder::capsule_tenant_spec("tenant1-admin", policy);
+        serde_json::to_value(spec).expect("the Tenant spec must serialise")
+    }
+
+    #[test]
+    fn the_default_tenant_carries_an_owner_and_no_policy() {
+        // The point of the `capsule` arm: what installing Capsule and declaring
+        // a tenant actually gives you. If this ever starts carrying policy, the
+        // comparison against `capsule-hardened` stops meaning anything.
+        let spec = spec_json(CapsuleTenantPolicy::Default);
+        assert_eq!(spec["owners"][0]["name"], "tenant1-admin");
+        for field in [
+            "namespaceOptions",
+            "resourceQuotas",
+            "serviceOptions",
+            "rules",
+        ] {
+            assert!(spec.get(field).is_none(), "{field} must be unset");
+        }
+    }
+
+    #[test]
+    fn the_hardened_tenant_requires_always_through_the_rules_api() {
+        // Regression: the pull policy was first written to `imagePullPolicies`,
+        // which v1beta2 deprecates and capsule 0.13 ignores. It validated, it
+        // serialised, and it enforced nothing — the benchmark kept failing
+        // against a tenant that looked correctly configured.
+        //
+        // The rule reads "allow every registry, but only with Always", because
+        // the policy list is consulted only after a registry reaches a final
+        // allow. A deny action would refuse the image and never check it.
+        let spec = spec_json(CapsuleTenantPolicy::Hardened);
+        let enforce = &spec["rules"][0]["enforce"];
+        assert_eq!(enforce["action"], "allow");
+
+        let registry = &enforce["workloads"]["registries"][0];
+        assert_eq!(registry["exp"], ".*");
+        assert_eq!(registry["policy"][0], "Always");
+
+        let targets = enforce["workloads"]["targets"]
+            .as_array()
+            .expect("targets must be a list");
+        // Init and ephemeral containers pull images too.
+        for target in [
+            "pod/containers",
+            "pod/initcontainers",
+            "pod/ephemeralcontainers",
+        ] {
+            assert!(
+                targets.iter().any(|t| t == target),
+                "{target} must be enforced"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hardened_tenant_sets_the_quota_keys_the_benchmarks_read() {
+        // kubectl-mtb joins the quota's resource names into one string and
+        // looks for substrings, so a missing key is a silent failure rather
+        // than an error.
+        let spec = spec_json(CapsuleTenantPolicy::Hardened);
+        let quotas = spec["resourceQuotas"]["items"]
+            .as_array()
+            .expect("quota items");
+        let keys: Vec<String> = quotas
+            .iter()
+            .flat_map(|item| item["hard"].as_object().unwrap().keys().cloned())
+            .collect();
+        let joined = keys.join(" ");
+
+        for compute in ["cpu", "memory", "ephemeral-storage"] {
+            assert!(joined.contains(compute), "{compute} missing from quotas");
+        }
+        for object in [
+            "pods",
+            "services",
+            "replicationcontrollers",
+            "resourcequotas",
+            "secrets",
+            "configmaps",
+            "persistentvolumeclaims",
+            "services.nodeports",
+            "services.loadbalancers",
+        ] {
+            assert!(joined.contains(object), "{object} missing from quotas");
+        }
+    }
+
+    #[test]
+    fn the_hardened_tenant_defaults_limits_so_the_quota_does_not_mask_admission() {
+        // Regression for a silent inflation of the benchmark score.
+        //
+        // Naming `limits.cpu` in a ResourceQuota makes it mandatory for every
+        // pod in the namespace. kubectl-mtb's probes omit it, so the quota
+        // rejected them before Pod Security or Capsule's webhooks were ever
+        // consulted — and since the benchmarks treat any rejection as a pass,
+        // the tenant scored well for refusing everything rather than for
+        // enforcing anything.
+        let spec = spec_json(CapsuleTenantPolicy::Hardened);
+        let limits = &spec["limitRanges"]["items"][0]["limits"][0];
+        assert_eq!(limits["type"], "Container");
+        for resource in ["cpu", "memory", "ephemeral-storage"] {
+            assert!(
+                !limits["default"][resource].is_null(),
+                "{resource} needs a default limit"
+            );
+            assert!(
+                !limits["defaultRequest"][resource].is_null(),
+                "{resource} needs a default request"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hardened_tenant_enforces_pod_security_and_blocks_nodeports() {
+        let spec = spec_json(CapsuleTenantPolicy::Hardened);
+        assert_eq!(
+            spec["namespaceOptions"]["additionalMetadata"]["labels"]
+                ["pod-security.kubernetes.io/enforce"],
+            "restricted"
+        );
+        assert_eq!(spec["serviceOptions"]["allowedServices"]["nodePort"], false);
     }
 }

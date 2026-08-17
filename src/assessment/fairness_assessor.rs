@@ -1037,7 +1037,7 @@ pub const INTRUDER_LOAD_THRESHOLD: f64 = 0.90;
 ///
 /// Hand-rolled rather than pulling in a date crate for one line of output;
 /// uses the standard days-to-civil conversion (Howard Hinnant's algorithm).
-fn format_unix_utc(secs: u64) -> String {
+pub fn format_unix_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let tod = secs % 86_400;
     let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
@@ -1062,7 +1062,7 @@ fn format_unix_utc(secs: u64) -> String {
 /// that marker the field actively misleads: a campaign run from a modified tree
 /// records the last commit, which does not describe the binary that produced the
 /// numbers — and the whole point of the field is that it should.
-fn git_commit_hash() -> Option<String> {
+pub fn git_commit_hash() -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()

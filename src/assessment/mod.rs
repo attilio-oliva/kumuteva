@@ -5,6 +5,7 @@ mod storage;
 mod workload;
 
 pub mod fairness_assessor;
+pub mod report_json;
 
 // Re-export isolation assessment types
 pub use control_plane::*;
@@ -104,6 +105,29 @@ impl Display for AssessmentConfig {
             write!(f, "Assessing {}", systems.join(", "))
         }
     }
+}
+
+/// The message from an API server that refused a request on policy grounds,
+/// or `None` if the error was something else.
+///
+/// A probe pod can be turned away by Pod Security Admission, a validating
+/// webhook, or a quota. That is a fact about the tenant being assessed, not a
+/// malfunction, and it must not be allowed to end the run: a single refused
+/// pod used to propagate out of the network subsystem and take the whole
+/// report with it, so a `capsule-hardened` tenant produced no control-plane,
+/// storage or workload results either.
+///
+/// 403 is admission or RBAC saying no. 422 is a webhook rejecting the object as
+/// invalid, which is how several policy engines express a denial.
+pub fn admission_refusal(error: &anyhow::Error) -> Option<String> {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<kube::Error>() {
+            Some(kube::Error::Api(response)) if response.code == 403 || response.code == 422 => {
+                Some(response.message.clone())
+            }
+            _ => None,
+        })
 }
 
 /// Isolation level for cross-tenant operations
@@ -1032,5 +1056,63 @@ impl Display for MultitenancyReport {
         )?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_refusal_tests {
+    use super::admission_refusal;
+
+    fn api_error(code: u16, message: &str) -> anyhow::Error {
+        anyhow::Error::new(kube::Error::Api(kube::error::ErrorResponse {
+            status: "Failure".to_string(),
+            message: message.to_string(),
+            reason: "Forbidden".to_string(),
+            code,
+        }))
+    }
+
+    #[test]
+    fn pod_security_admission_is_a_refusal_not_a_fault() {
+        // The exact shape that used to end a whole run: a probe pod turned away
+        // by the `restricted` standard on a hardened tenant.
+        let error = api_error(
+            403,
+            "pods \"network-multitool\" is forbidden: violates PodSecurity \
+             \"restricted:latest\": allowPrivilegeEscalation != false",
+        );
+        let message = admission_refusal(&error).expect("403 must be recognised");
+        assert!(message.contains("violates PodSecurity"));
+    }
+
+    #[test]
+    fn a_webhook_rejection_is_also_a_refusal() {
+        // Several policy engines deny by declaring the object invalid rather
+        // than forbidden, so 422 has to count too.
+        assert!(admission_refusal(&api_error(422, "denied by webhook")).is_some());
+    }
+
+    #[test]
+    fn other_api_errors_are_still_faults() {
+        // A missing namespace or an unreachable server is a broken run, and
+        // must keep propagating. Swallowing these would turn a botched setup
+        // into a page of confident "Hard isolation" findings.
+        assert_eq!(admission_refusal(&api_error(404, "not found")), None);
+        assert_eq!(admission_refusal(&api_error(500, "server error")), None);
+        assert_eq!(
+            admission_refusal(&anyhow::anyhow!("connection refused")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_found_through_context_layers() {
+        // Callers add context with `.context(...)`, which buries the kube error
+        // further down the chain; the search has to walk it.
+        use anyhow::Context;
+        let error = Err::<(), _>(api_error(403, "forbidden by policy"))
+            .context("creating the tenant1 network probe")
+            .unwrap_err();
+        assert!(admission_refusal(&error).is_some());
     }
 }
