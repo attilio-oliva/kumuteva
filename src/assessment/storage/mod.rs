@@ -7,7 +7,7 @@ use std::fmt::Display;
 use async_trait::async_trait;
 use k8s_openapi::api::{
     apps::v1::StatefulSet,
-    core::v1::{PersistentVolume, PersistentVolumeClaim},
+    core::v1::{PersistentVolume, PersistentVolumeClaim, Pod},
 };
 use serde::Serialize;
 use tracing::info;
@@ -29,6 +29,8 @@ const FILE_NAME: &str = "index.html";
 const FILE_CONTENT: &str = "Hello, this is a tenant1 using Kumuteva!";
 const MOUNT_PATH: &str = "/usr/share/nginx/html";
 const HOSTPATH_MOUNT_PATH: &str = "/tmp/kumuteva-hostpath";
+/// Throwaway pod used only to ask whether a hostPath mount is admitted.
+const HOSTPATH_AUTH_POD_NAME: &str = "kumuteva-hostpath-auth-probe";
 const STORAGE_SIZE: &str = "1Gi";
 const POD_CREATION_TIMEOUT: u32 = 60;
 
@@ -50,8 +52,26 @@ pub enum StorageOperation {
     CreateAndMountVolume,
     /// Create a volume and mount it to a pod with Retain reclaim policy
     CreateAndMountVolumeWithRetainPolicy,
-    /// Create a volume mapping to a host path (in the node filesystem)
+    /// Mount the node filesystem with a `hostPath` volume declared inline in a
+    /// pod spec.
+    ///
+    /// No PersistentVolume is involved, so RBAC on cluster-scoped resources does
+    /// not apply. What governs it is admission control on the pod, typically
+    /// PodSecurity.
     UseHostPath,
+    /// Mount the node filesystem through a PersistentVolumeClaim bound to a
+    /// PersistentVolume whose backing is a host path.
+    ///
+    /// The same destination by a different route, and gated differently: a
+    /// PersistentVolume is cluster-scoped, so this one is governed by RBAC.
+    ///
+    /// Kept apart from `UseHostPath` because a platform can permit one and
+    /// refuse the other. Capsule does exactly that — it blocks PersistentVolume
+    /// creation while admitting pods that declare hostPath inline. Testing only
+    /// the PersistentVolume route reports the node filesystem as unreachable
+    /// while a tenant can in fact mount it at will, which is what the comparison
+    /// against kubectl-mtb exposed.
+    UsePersistentHostPath,
 }
 
 impl AssessableResource for StorageResource {
@@ -67,6 +87,7 @@ impl AssessableResource for StorageResource {
                 StorageOperation::CreateAndMountVolume,
                 StorageOperation::CreateAndMountVolumeWithRetainPolicy,
                 StorageOperation::UseHostPath,
+                StorageOperation::UsePersistentHostPath,
             ],
         }
     }
@@ -100,9 +121,24 @@ impl MultitenancyAssessor for StorageAssessor {
                 Ok(can_create_pv.unwrap_or(false) && can_mount_pv.unwrap_or(false))
             }
             (StorageResource::Volume, StorageOperation::UseHostPath) => {
-                let can_create_hostpath = test_hostpath_creation_authorization(tenant).await;
-                let can_mount_hostpath = test_hostpath_mount_authorization(tenant).await;
-                Ok(can_create_hostpath.unwrap_or(false) && can_mount_hostpath.unwrap_or(false))
+                // Only the pod matters here. An inline hostPath volume needs no
+                // PersistentVolume, so requiring one to be creatable would gate
+                // this route behind an unrelated permission — which is precisely
+                // what used to happen: the two checks were ANDed, Capsule failed
+                // the PersistentVolume half, and the operation was reported as
+                // unauthorised while a tenant could mount the host filesystem
+                // from any pod it liked.
+                Ok(test_hostpath_mount_authorization(tenant)
+                    .await
+                    .unwrap_or(false))
+            }
+            (StorageResource::Volume, StorageOperation::UsePersistentHostPath) => {
+                // This route genuinely does need both: a cluster-scoped
+                // PersistentVolume backed by a host path, and a pod able to
+                // mount the claim that binds it.
+                let can_create_pv = test_hostpath_creation_authorization(tenant).await;
+                let can_mount_pvc = test_pv_mount_authorization(tenant).await;
+                Ok(can_create_pv.unwrap_or(false) && can_mount_pvc.unwrap_or(false))
             }
         }
     }
@@ -123,6 +159,9 @@ impl MultitenancyAssessor for StorageAssessor {
             }
             (StorageResource::Volume, StorageOperation::UseHostPath) => {
                 test_hostpath_cross_tenant_access(tenant1, tenant2).await
+            }
+            (StorageResource::Volume, StorageOperation::UsePersistentHostPath) => {
+                test_persistent_hostpath_cross_tenant_access(tenant1, tenant2).await
             }
         }
     }
@@ -184,14 +223,48 @@ async fn test_hostpath_creation_authorization(
     Ok(result.is_ok())
 }
 
+/// Will the API server accept a pod that mounts a host directory?
+///
+/// A bare Pod, not a StatefulSet, because that is the question. PodSecurity
+/// enforces at *Pod* admission; a controller's pod template is at most warned
+/// about. So a StatefulSet carrying a forbidden hostPath is accepted, its
+/// creation returns success, and the pods are rejected afterwards by the
+/// controller — out of band, where a check on the create response cannot see it.
+/// The gate would then report the operation as permitted on a cluster that
+/// forbids it.
+///
+/// Creating a Pod puts the question to the same admission path the real thing
+/// takes, and the answer arrives synchronously in the response. No wait is
+/// needed: whether the pod then schedules or pulls its image is a different
+/// matter, and not what authorization means here.
 async fn test_hostpath_mount_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
-    let test_commands = vec!["sleep", "10"];
-    let result = create_stateful_set(tenant, &test_commands, None, true, false).await;
+    let pod: Pod = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": HOSTPATH_AUTH_POD_NAME },
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": "probe",
+                "image": "nginx",
+                "command": ["sh", "-c", "sleep 1"],
+                "volumeMounts": [{ "mountPath": HOSTPATH_MOUNT_PATH, "name": "hostpath" }],
+            }],
+            "volumes": [{
+                "name": "hostpath",
+                "hostPath": { "path": HOSTPATH_MOUNT_PATH, "type": "DirectoryOrCreate" }
+            }]
+        }
+    }))?;
 
-    // Cleanup
+    let result = tenant
+        .cluster
+        .create_namespaced_resource::<Pod>(&pod, &tenant.namespace)
+        .await;
+
     let _ = tenant
         .cluster
-        .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant.namespace)
+        .delete_resource_in_namespace::<Pod>(HOSTPATH_AUTH_POD_NAME, &tenant.namespace)
         .await;
 
     Ok(result.is_ok())
@@ -270,6 +343,151 @@ async fn test_hostpath_cross_tenant_access(
             autonomy: true,
             details: format!("Could not determine HostPath isolation: {}", e),
         }),
+    }
+}
+
+async fn test_persistent_hostpath_cross_tenant_access(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<CrossTenantResult> {
+    match test_persistent_hostpath_data_isolation(tenant1, tenant2).await {
+        Ok(AccessResult::Isolated) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: "HostPath PersistentVolumes are properly isolated between tenants".to_string(),
+        }),
+        Ok(AccessResult::IsolatedByPolicy(reason)) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Soft(
+                "A policy explicitly forbid the operation for this resource".to_string(),
+            ),
+            autonomy: false,
+            details: format!("HostPath PersistentVolume isolated by policy: {}", reason),
+        }),
+        Ok(AccessResult::PartialAutonomy(reason)) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Soft(reason.clone()),
+            autonomy: false,
+            details: format!("HostPath PersistentVolume partially restricted: {}", reason),
+        }),
+        Ok(AccessResult::Accessible) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::None,
+            autonomy: true,
+            details: "Node filesystem reachable across tenants through a hostPath \
+                      PersistentVolume"
+                .to_string(),
+        }),
+        Err(e) => Ok(CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: true,
+            details: format!(
+                "Could not determine HostPath PersistentVolume isolation: {}",
+                e
+            ),
+        }),
+    }
+}
+
+/// Can tenant2 read what tenant1 wrote, when both reach the node filesystem
+/// through a hostPath-backed PersistentVolume?
+///
+/// Each tenant provisions its *own* PersistentVolume pointing at the same host
+/// directory, rather than tenant2 rebinding tenant1's. Both are realistic, but
+/// this one isolates the question being asked: the concern is the node
+/// filesystem as a shared channel, not PersistentVolume rebinding, which
+/// `CreateAndMountVolume` already covers. It also keeps the result meaningful on
+/// platforms that hide cluster-scoped objects from tenants, where tenant2 could
+/// not name tenant1's volume even if it were permitted to bind it.
+async fn test_persistent_hostpath_data_isolation(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<AccessResult> {
+    let t1_pv = "kumuteva-hostpath-pv-tenant1";
+    let t2_pv = "kumuteva-hostpath-pv-tenant2";
+
+    // Cleanup runs on every exit path, including the early returns below, so a
+    // refused run does not leave a cluster-scoped volume behind for the next one
+    // to trip over.
+    async fn cleanup(tenant: &TenantClusterConfig, pv_name: &str) {
+        let _ = tenant
+            .cluster
+            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant.namespace)
+            .await;
+        let _ = tenant
+            .cluster
+            .delete_cluster_resource::<PersistentVolume>(pv_name)
+            .await;
+    }
+
+    // --- tenant1 writes through the PersistentVolume route ---
+    if let Err(e) = tenant1
+        .cluster
+        .create_cluster_resource::<PersistentVolume>(&create_test_hostpath_pv_manifest(t1_pv))
+        .await
+    {
+        return Ok(AccessResult::IsolatedByPolicy(format!(
+            "Tenant1 cannot create a hostPath PersistentVolume: {}",
+            e
+        )));
+    }
+
+    if let Err(e) =
+        create_stateful_set(tenant1, &tenant1_commands(), Some(t1_pv), false, false).await
+    {
+        cleanup(tenant1, t1_pv).await;
+        return Ok(AccessResult::IsolatedByPolicy(format!(
+            "Tenant1 cannot mount a hostPath PersistentVolume: {}",
+            e
+        )));
+    }
+    if let Err(e) = wait_for_statefulset_ready(tenant1).await {
+        cleanup(tenant1, t1_pv).await;
+        return Ok(AccessResult::PartialAutonomy(format!(
+            "Tenant1 hostPath PersistentVolume pod never became ready: {}",
+            e
+        )));
+    }
+    info!("Tenant1 wrote through a hostPath PersistentVolume.");
+
+    // --- tenant2 attempts the same route to the same host directory ---
+    if let Err(e) = tenant2
+        .cluster
+        .create_cluster_resource::<PersistentVolume>(&create_test_hostpath_pv_manifest(t2_pv))
+        .await
+    {
+        cleanup(tenant1, t1_pv).await;
+        return Ok(AccessResult::IsolatedByPolicy(format!(
+            "Tenant2 cannot create a hostPath PersistentVolume: {}",
+            e
+        )));
+    }
+
+    if let Err(e) =
+        create_stateful_set(tenant2, &tenant2_commands(), Some(t2_pv), false, false).await
+    {
+        cleanup(tenant1, t1_pv).await;
+        cleanup(tenant2, t2_pv).await;
+        return Ok(AccessResult::IsolatedByPolicy(format!(
+            "Tenant2 cannot mount a hostPath PersistentVolume: {}",
+            e
+        )));
+    }
+    if let Err(e) = wait_for_statefulset_ready(tenant2).await {
+        cleanup(tenant1, t1_pv).await;
+        cleanup(tenant2, t2_pv).await;
+        return Ok(AccessResult::PartialAutonomy(format!(
+            "Tenant2 hostPath PersistentVolume pod never became ready: {}",
+            e
+        )));
+    }
+
+    let can_access = check_cross_tenant_mount(tenant2).await.unwrap_or(false);
+
+    cleanup(tenant1, t1_pv).await;
+    cleanup(tenant2, t2_pv).await;
+
+    if can_access {
+        Ok(AccessResult::Accessible)
+    } else {
+        Ok(AccessResult::Isolated)
     }
 }
 
@@ -970,6 +1188,9 @@ impl Display for StorageOperation {
                 write!(f, "Create And Mount Volume with Retain Reclaim Policy")
             }
             StorageOperation::UseHostPath => write!(f, "Use HostPath in a Volume"),
+            StorageOperation::UsePersistentHostPath => {
+                write!(f, "Use HostPath through a PersistentVolume")
+            }
         }
     }
 }
