@@ -1,6 +1,7 @@
 // Isolation assessment modules (for multi-tenancy isolation checks)
 mod control_plane;
 mod network;
+mod probe;
 mod storage;
 mod workload;
 

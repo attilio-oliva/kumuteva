@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use tracing::info;
 
+use crate::assessment::probe::{HostAccess, ProbePod};
 use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
     run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
@@ -36,6 +37,13 @@ const AUTONOMY_TEST_NODE_PORT: i32 = 30080;
 /// block, so reachability on 8080 asks exactly the question reachability on 80
 /// did.
 const WEBSERVER_PORT: i32 = 8080;
+
+/// How long a target is given to answer itself before the probe is declared
+/// broken and the result Unknown.
+///
+/// This is a bound on the *whole* positive control, not on one attempt, because
+/// the exec beneath it does its own retrying and nested budgets multiply.
+const POSITIVE_CONTROL_BUDGET: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 // Infrastructure network test constants
 const NODE_MARKER_POD_NAME: &str = "node-marker-service";
@@ -326,7 +334,49 @@ async fn admit_probe_pod(
     }
 }
 
+/// Delete these probe pods, whatever happened to the body.
+///
+/// Rust has no async `Drop`, so a guard cannot do this; the discipline is to
+/// run the body to completion, clean up, and only then return its result.
+///
+/// Not merely tidy. Probe pods use fixed names, so one left behind makes the
+/// next test's create fail with `AlreadyExists` — which is neither an admission
+/// refusal nor a measurement, and aborts the whole assessment. The tests below
+/// used to return early when a probe was refused, leaking any pod already
+/// created in the *other* tenant, so a hardened tenant refusing one probe could
+/// take out an unrelated subsystem several tests later.
+async fn cleanup_probes(pods: &[(&TenantClusterConfig, &str)]) {
+    for (tenant, name) in pods {
+        let _ = tenant
+            .cluster
+            .delete_pod_in_namespace(name, &tenant.namespace)
+            .await;
+    }
+    for (tenant, name) in pods {
+        let _ = tenant
+            .cluster
+            .wait_for_pod_deletion(name, &tenant.namespace)
+            .await;
+    }
+}
+
 async fn test_pod_network_isolation(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<CrossTenantResult> {
+    // The probes are cleaned up on every path out of the body — including the
+    // early returns for a refused probe, which previously leaked whichever pod
+    // had already been created in the other tenant.
+    let outcome = pod_network_isolation_body(tenant1, tenant2).await;
+    cleanup_probes(&[
+        (tenant1, NETWORK_MULTITOOL_POD_NAME),
+        (tenant2, NETWORK_MULTITOOL_POD_NAME),
+    ])
+    .await;
+    outcome
+}
+
+async fn pod_network_isolation_body(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
 ) -> anyhow::Result<CrossTenantResult> {
@@ -395,25 +445,6 @@ async fn test_pod_network_isolation(
         .await?
         .is_empty();
 
-    // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_pod_in_namespace(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_pod_in_namespace(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await;
-
-    let _ = tenant1
-        .cluster
-        .wait_for_pod_deletion(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .wait_for_pod_deletion(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await;
-
     if can_reach_other_pod {
         Ok(CrossTenantResult {
             isolation: IsolationLevel::None,
@@ -444,7 +475,24 @@ async fn test_pod_network_isolation(
 async fn service_answers(tenant: &TenantClusterConfig, service_ip: &str) -> bool {
     let probe =
         format!("curl -sSf {service_ip}:{WEBSERVER_PORT} --connect-timeout 2 2>&1 >/dev/null");
-    for attempt in 1..=15 {
+
+    // A wall-clock deadline rather than a count of attempts.
+    //
+    // Counting attempts looks bounded and is not: each `exec_command_in_container`
+    // retries internally three times with its own waits, so fifteen attempts here
+    // multiply out to forty-five execs. Against a target that never answers —
+    // exactly the case worth waiting on — that is minutes per probe, twice per
+    // subsystem. A campaign spent them looking hung.
+    //
+    // Thirty seconds is what this is actually waiting for: the gap between the
+    // kubelet reporting a pod Ready and the endpoint controller publishing it.
+    // Longer than that is not slow propagation, it is a service that will not
+    // answer.
+    let deadline = tokio::time::Instant::now() + POSITIVE_CONTROL_BUDGET;
+    let mut attempt = 0;
+
+    while tokio::time::Instant::now() < deadline {
+        attempt += 1;
         let answered = tenant
             .cluster
             .exec_command_in_container(NETWORK_MULTITOOL_POD_NAME, &tenant.namespace, &probe)
@@ -460,10 +508,33 @@ async fn service_answers(tenant: &TenantClusterConfig, service_ip: &str) -> bool
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
+
+    info!(
+        "service {} never answered from inside {} within {:?} ({} attempts)",
+        service_ip, tenant.namespace, POSITIVE_CONTROL_BUDGET, attempt
+    );
     false
 }
 
 async fn test_service_network_isolation(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<CrossTenantResult> {
+    // Cleanup runs even when a probe is refused or the positive control fails.
+    let outcome = test_service_network_isolation_body(tenant1, tenant2).await;
+    cleanup_probes(&[
+        (tenant1, NETWORK_MULTITOOL_POD_NAME),
+        (tenant2, NETWORK_MULTITOOL_POD_NAME),
+    ])
+    .await;
+    let _ = tenant2
+        .cluster
+        .delete_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant2.namespace)
+        .await;
+    outcome
+}
+
+async fn test_service_network_isolation_body(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
 ) -> anyhow::Result<CrossTenantResult> {
@@ -556,29 +627,6 @@ async fn test_service_network_isolation(
         )
         .await?
         .is_empty();
-
-    // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_pod_in_namespace(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_pod_in_namespace(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant2.namespace)
-        .await;
-
-    let _ = tenant1
-        .cluster
-        .wait_for_pod_deletion(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .wait_for_pod_deletion(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await;
 
     if can_reach_service {
         Ok(CrossTenantResult {
@@ -972,6 +1020,20 @@ async fn test_dns_isolation(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
 ) -> anyhow::Result<CrossTenantResult> {
+    // Cleanup runs even when the tenant2 probe is refused.
+    let outcome = test_dns_isolation_body(tenant1, tenant2).await;
+    cleanup_probes(&[(tenant2, NETWORK_MULTITOOL_POD_NAME)]).await;
+    let _ = tenant1
+        .cluster
+        .delete_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant1.namespace)
+        .await;
+    outcome
+}
+
+async fn test_dns_isolation_body(
+    tenant1: &TenantClusterConfig,
+    tenant2: &TenantClusterConfig,
+) -> anyhow::Result<CrossTenantResult> {
     // Create pod in tenant1 and service in tenant2
     let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
     let service = create_webserver_service(&tenant1.namespace);
@@ -1027,21 +1089,6 @@ async fn test_dns_isolation(
             false
         }
     };
-
-    // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_pod_in_namespace(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await;
-
-    let _ = tenant2
-        .cluster
-        .wait_for_pod_deletion(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await;
 
     if can_resolve_dns {
         Ok(CrossTenantResult {
@@ -1256,36 +1303,6 @@ async fn test_node_network_isolation(
 // MANIFEST CREATION HELPERS
 // =============================================================================
 
-/// A pod-level security context satisfying the `restricted` Pod Security
-/// Standard.
-///
-/// Applied to the probes that never needed privilege in the first place. None
-/// of these settings changes what such a probe measures — it drops capabilities
-/// it never used and forbids an escalation it never attempted — but without
-/// them a tenant enforcing `restricted` rejects the pod, and the measurement is
-/// lost rather than performed.
-///
-/// Deliberately *not* applied to the probes whose purpose is to request
-/// something a confined tenant should refuse: `create_host_network_pod` and
-/// `create_node_marker_pod` ask for host networking, and their rejection is the
-/// result the test is looking for. Making those compliant would delete the
-/// test.
-fn restricted_pod_security_context() -> serde_json::Value {
-    serde_json::json!({
-        "runAsNonRoot": true,
-        "runAsUser": 1000,
-        "seccompProfile": { "type": "RuntimeDefault" }
-    })
-}
-
-/// The container half of the same standard.
-fn restricted_container_security_context() -> serde_json::Value {
-    serde_json::json!({
-        "allowPrivilegeEscalation": false,
-        "capabilities": { "drop": ["ALL"] }
-    })
-}
-
 /// Serves `marker` over HTTP on [`WEBSERVER_PORT`], without needing root.
 ///
 /// The image's own entrypoint cannot be used unprivileged: it rewrites
@@ -1301,38 +1318,17 @@ fn unprivileged_http_server_command(marker: &str) -> String {
     )
 }
 
+/// A restricted, unprivileged pod that both serves a marker and probes others.
 fn create_network_multitool_pod(name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name,
-            "labels": {
-                "app": "network-multitool"
-            }
-        },
-        "spec": {
-            "securityContext": restricted_pod_security_context(),
-            "containers": [{
-                "name": "multitool",
-                "image": "praqma/network-multitool",
-                "command": ["/bin/sh", "-c", unprivileged_http_server_command(name)],
-                "securityContext": restricted_container_security_context(),
-                "ports": [{ "containerPort": WEBSERVER_PORT }],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }]
-        }
-    }))
-    .unwrap()
+    ProbePod::new(name)
+        .container("multitool")
+        .image("praqma/network-multitool")
+        .label("app", "network-multitool")
+        .restricted()
+        .port(WEBSERVER_PORT)
+        .shell(unprivileged_http_server_command(name))
+        .restart_on_failure_default()
+        .build()
 }
 
 fn create_webserver_service(namespace: &str) -> Service {
@@ -1483,84 +1479,41 @@ fn create_nodeport_service_with_selector(
 /// runs unprivileged, and the refusal, when it comes, arrives at the Service
 /// rather than here. That distinction is what lets the test report "NodePort
 /// forbidden" instead of "the probe would not start".
+/// Serves a marker behind a NodePort service the test then tries to reach.
+///
+/// The pod itself needs no privilege — the NodePort is the thing a confined
+/// tenant should be unable to create — so it is restricted like any other
+/// reachability probe.
 fn create_nodeport_marker_pod(name: &str, marker: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name,
-            "labels": {
-                "app": "nodeport-marker"
-            }
-        },
-        "spec": {
-            "securityContext": restricted_pod_security_context(),
-            "containers": [{
-                "name": "marker-server",
-                "image": "praqma/network-multitool",
-                "command": ["/bin/sh", "-c", unprivileged_http_server_command(marker)],
-                "securityContext": restricted_container_security_context(),
-                "ports": [{
-                    "containerPort": WEBSERVER_PORT,
-                    "protocol": "TCP"
-                }],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never"
-        }
-    }))
-    .unwrap()
+    ProbePod::new(name)
+        .container("marker-server")
+        .image("praqma/network-multitool")
+        .label("app", "nodeport-marker")
+        .restricted()
+        .port_tcp(WEBSERVER_PORT)
+        .shell(unprivileged_http_server_command(marker))
+        .build()
 }
 
+/// Requests host networking. Its refusal on a confined tenant is the finding.
 fn create_host_network_pod(name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name,
-            "labels": {
-                "app": "host-network-test"
-            }
-        },
-        "spec": {
-            "hostNetwork": true,
-            "containers": [{
-                "name": "probe",
-                "image": "praqma/network-multitool",
-                "command": ["/bin/sh", "-c", "sleep 3600"],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never"
-        }
-    }))
-    .unwrap()
+    ProbePod::new(name)
+        .image("praqma/network-multitool")
+        .label("app", "host-network-test")
+        .requests(HostAccess::Network)
+        .shell("sleep 3600")
+        .build()
 }
 
 /// Creates a hostNetwork pod that serves a unique marker on a specified port.
 /// This is used to create an observable state that can be verified by another tenant.
+/// A host-network pod serving a marker on a chosen node port.
+///
+/// Host networking is deliberate: the marker must be reachable from another
+/// tenant via the node's address, which is exactly what should be isolated.
 fn create_node_marker_pod(name: &str, marker: &str, port: i32) -> Pod {
-    // praqma/network-multitool has nginx built-in. We'll:
-    // 1. Write our marker to the nginx html directory
-    // 2. Reconfigure nginx to listen on our custom port
-    // 3. Start nginx
+    // praqma/network-multitool ships nginx; point it at a custom port and serve
+    // the marker.
     let serve_cmd = format!(
         "echo '{}' > /usr/share/nginx/html/index.html && \
          sed -i 's/listen.*80/listen {}/g' /etc/nginx/nginx.conf && \
@@ -1568,41 +1521,14 @@ fn create_node_marker_pod(name: &str, marker: &str, port: i32) -> Pod {
         marker, port
     );
 
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name,
-            "labels": {
-                "app": "node-marker-service"
-            }
-        },
-        "spec": {
-            "hostNetwork": true,
-            "containers": [{
-                "name": "marker-server",
-                "image": "praqma/network-multitool",
-                "command": ["/bin/sh", "-c", serve_cmd],
-                "ports": [{
-                    "containerPort": port,
-                    "hostPort": port,
-                    "protocol": "TCP"
-                }],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never"
-        }
-    }))
-    .unwrap()
+    ProbePod::new(name)
+        .container("marker-server")
+        .image("praqma/network-multitool")
+        .label("app", "node-marker-service")
+        .requests(HostAccess::Network)
+        .host_port(port)
+        .shell(serve_cmd)
+        .build()
 }
 
 // =============================================================================
@@ -1629,5 +1555,96 @@ impl Display for NetworkOperation {
             NetworkOperation::ExposeNodePort => write!(f, "Expose NodePort"),
             NetworkOperation::ResolveDns => write!(f, "Resolve DNS"),
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_requests_what_it_claims {
+    //! The network counterpart of the workload guard of the same name.
+    //!
+    //! k8s-openapi silently drops keys it does not recognise, so a probe can
+    //! fail to request the very thing it is testing and report isolation it
+    //! never exercised. These assertions run against the typed struct, which is
+    //! what the API server actually receives.
+    //!
+    //! The two directions matter equally here. The host-network probes must
+    //! *keep* their privilege, because their rejection is the finding; the
+    //! reachability probes must *keep* their restricted security context, or a
+    //! hardened tenant refuses them and the measurement is lost rather than
+    //! made.
+
+    use super::*;
+
+    fn spec(pod: &Pod) -> &k8s_openapi::api::core::v1::PodSpec {
+        pod.spec.as_ref().expect("probe pod must have a spec")
+    }
+
+    #[test]
+    fn the_host_network_probes_request_host_networking() {
+        assert_eq!(
+            spec(&create_host_network_pod("p")).host_network,
+            Some(true),
+            "without hostNetwork this probe tests nothing and reads as isolated"
+        );
+
+        let marker = create_node_marker_pod("m", "marker", NODE_MARKER_PORT);
+        assert_eq!(spec(&marker).host_network, Some(true));
+        assert_eq!(
+            spec(&marker).containers[0].ports.as_ref().unwrap()[0].host_port,
+            Some(NODE_MARKER_PORT),
+            "the marker is only observable from another tenant via its hostPort"
+        );
+    }
+
+    #[test]
+    fn the_reachability_probes_stay_restricted_and_unprivileged() {
+        // These need no privilege, and must satisfy the `restricted` Pod
+        // Security Standard so they still run on a hardened tenant. If they
+        // regress to requesting privilege, capsule-hardened refuses them and
+        // the network columns go Unknown.
+        for pod in [
+            create_network_multitool_pod("p"),
+            create_nodeport_marker_pod("p", "marker"),
+        ] {
+            let s = spec(&pod);
+            assert_ne!(s.host_network, Some(true));
+            assert_ne!(s.host_pid, Some(true));
+
+            let pod_ctx = s.security_context.as_ref().expect("pod securityContext");
+            assert_eq!(pod_ctx.run_as_non_root, Some(true));
+            assert!(
+                pod_ctx.seccomp_profile.is_some(),
+                "restricted needs seccomp"
+            );
+
+            let container_ctx = s.containers[0]
+                .security_context
+                .as_ref()
+                .expect("container securityContext");
+            assert_eq!(container_ctx.allow_privilege_escalation, Some(false));
+            assert_eq!(
+                container_ctx.capabilities.as_ref().unwrap().drop,
+                Some(vec!["ALL".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn the_reachability_probes_serve_on_an_unprivileged_port() {
+        // Bound together: runAsNonRoot cannot bind below 1024, so the port and
+        // the security context have to move as a pair. Splitting them yields a
+        // probe that is admitted and then never answers.
+        assert!(
+            WEBSERVER_PORT >= 1024,
+            "non-root cannot bind {WEBSERVER_PORT}"
+        );
+        assert_eq!(
+            spec(&create_network_multitool_pod("p")).containers[0]
+                .ports
+                .as_ref()
+                .unwrap()[0]
+                .container_port,
+            WEBSERVER_PORT
+        );
     }
 }

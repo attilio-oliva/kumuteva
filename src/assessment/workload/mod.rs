@@ -7,6 +7,7 @@ use k8s_openapi::api::core::v1::Pod;
 use std::fmt::Display;
 use tracing::info;
 
+use crate::assessment::probe::{HostAccess, ProbePod};
 use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
     run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
@@ -1097,55 +1098,69 @@ impl HostDistro {
         let mut lines: Vec<&str> = vec![
             "",
             "# --- Portable eBPF breach (primary) ---------------------------------",
-            "# Header-free via BTF. We do NOT use a BPF task iterator: it is",
-            "# PID-namespace-scoped on modern kernels, so from a pod it only sees the",
-            "# pod's own tasks (never other tenants). Instead we attach the global",
-            "# sched:sched_switch tracepoint, which fires for EVERY context switch on",
-            "# EVERY CPU host-wide, regardless of namespace — the same cross-tenant",
-            "# visibility the kernel module's for_each_process() has. Seeing the",
-            "# tenant2 sentinel, or many distinct host comms, means a shared kernel.",
+            "# Header-free via BTF. We read the GLOBAL task-list STATE directly - the",
+            "# exact analog of the module's for_each_process(): a BEGIN program walks",
+            "# the circular task list from curtask in kernel memory. Unlike a BPF task",
+            "# iterator (PID-namespace scoped, sees only the pod) or a scheduler",
+            "# tracepoint (perf-based, and restricted/misreported under a nesting",
+            "# runtime like Docker/kind), reading state is not namespaced, needs no",
+            "# tracefs and no scheduling luck, and enumerates every host task. A",
+            "# positive result skips the module build. If injection is REFUSED while",
+            "# BPF is advertised and the caps are held, that is Soft confinement and we",
+            "# conclude it here; any other quiet/error result falls through to the",
+            "# authoritative module build - we never conclude isolation from silence.",
             "if [ -r /sys/kernel/btf/vmlinux ]; then",
         ];
         lines.extend(install.iter().copied());
         lines.extend([
             "  if command -v bpftrace >/dev/null 2>&1; then",
-            "    # bpftrace attaches tracepoints through tracefs; a privileged",
-            "    # container can mount it even when the runtime did not expose it.",
-            "    mount -t debugfs none /sys/kernel/debug 2>/dev/null || true",
-            "    mount -t tracefs none /sys/kernel/tracing 2>/dev/null || true",
-            "    # Let the tenant2 sentinel be scheduled a few times first.",
-            "    sleep 5",
-            // Aggregate the comm of every task switched-to over a 15s window into
-            // a map; bpftrace prints the map on exit as "@c[<comm>]: <n>" lines.
-            "    bt=$(timeout 30 bpftrace -e 'tracepoint:sched:sched_switch { @c[args->next_comm] = count(); } interval:s:15 { exit(); }' 2>&1)",
+            // Raising memlock helps BPF map creation on hosts that still gate it on
+            // RLIMIT_MEMLOCK; harmless where it is already unlimited or unraisable.
+            "    ulimit -l unlimited 2>/dev/null || true",
+            // Let the tenant2 sentinel finish launching before we snapshot the
+            // task list (the target pod is already Ready; this is a safety margin).
+            "    sleep 2",
+            // Walk the global process list from `curtask` (bpftrace's own task - a
+            // real task on the shared host kernel). container_of(t->tasks.next,
+            // task_struct, tasks) advances the circular list; stop when we return
+            // to the start. curtask avoids kaddr(\"init_task\"), whose address is
+            // zeroed by kptr_restrict inside a container. Bounded (4096) for the
+            // verifier; BTF gives correct field offsets on any kernel. Single quotes
+            // keep the shell from expanding bpftrace's $s/$t/$n variables.
+            "    bt=$(timeout 30 bpftrace -e 'BEGIN { $s = curtask; $t = $s; $n = 0; while ($n < 4096) { $t = (struct task_struct *)((uint64)$t->tasks.next - (uint64)offsetof(struct task_struct, tasks)); if ($t == $s) { break; } printf(\"BPFTASK %d %s\\n\", $t->pid, $t->comm); $n = $n + 1; } printf(\"BPFWALK_TOTAL %d\\n\", $n); exit(); }' 2>&1)",
             "    bpf_verdict=''",
-            // Distinct host comms observed = the cross-namespace visibility signal.
-            // A sandbox/VM would surface only this pod's own handful; a shared
-            // kernel surfaces the whole node (kubelet, kworkers, other tenants).
-            "    bpf_comms=$(printf '%s' \"$bt\" | grep -cF '@c[')",
-            "    echo \"BPF_DISTINCT_COMMS: $bpf_comms\"",
-            "    if printf '%s' \"$bt\" | grep -qF '@c[__SENTINEL__]'; then",
-            "      echo 'TENANT2_PROCESS_FOUND: scheduler tracepoint observed the tenant2 sentinel running on a shared kernel'",
+            // Reading the tenant2 sentinel, or the whole host process list, from
+            // the global task list proves a shared kernel with no isolation.
+            "    bpf_tasks=$(printf '%s' \"$bt\" | grep -c '^BPFTASK')",
+            "    echo \"BPF_TASKS_WALKED: $bpf_tasks\"",
+            "    if printf '%s' \"$bt\" | grep -q '__SENTINEL__'; then",
+            "      echo 'TENANT2_PROCESS_FOUND: walked the global task list and read the tenant2 sentinel from kernel space'",
             "      bpf_verdict=done",
-            "    elif [ \"$bpf_comms\" -gt 10 ]; then",
-            "      echo 'TENANT2_PROCESS_FOUND: scheduler tracepoint observed many host processes across namespaces - shared kernel, no isolation'",
-            "      bpf_verdict=done",
-            "    elif [ \"$bpf_comms\" -ge 1 ]; then",
-            // Only this pod's own comms scheduled: the kernel view is scoped to
-            // the pod (an isolating runtime — sandbox/VM). Same signal the
-            // module's "loaded, saw nobody" produces.
-            "      echo 'MODULE_LOADED: scheduler tracepoint saw only this pod - kernel view is isolated (sandbox/VM)'",
+            "    elif [ \"$bpf_tasks\" -gt 20 ]; then",
+            "      echo 'TENANT2_PROCESS_FOUND: walked the global task list and read the whole host - shared kernel, no isolation'",
             "      bpf_verdict=done",
             "    else",
-            // No events at all: a clear permission/lockdown denial is confinement
-            // (Soft); anything else (attach/BTF/tracefs error) is inconclusive and
-            // falls through to the module build.
+            // No task lines. Distinguish two very different reasons. We only reach
+            // here because /sys/kernel/btf/vmlinux exists, i.e. the kernel ADVERTISES
+            // BPF, and the caps are held (CAPS_FULL above). If BPF program injection
+            // is nonetheless REFUSED (EPERM) - a user-namespace remap, an LSM, or
+            // kernel lockdown - then a privileged operation we should be able to do
+            // was blocked: that is Soft isolation, and the BPF stage concludes it
+            // directly (no need to also fail the same way via the module).
+            // BTF present (this guard) proves the kernel is modern and BPF-capable,
+            // so bpftrace saying \"your kernel is too old / missing BPF_MAP_TYPE_*\"
+            // is a FALSE conclusion from a feature-probe bpf() call being EPERM'd -
+            // i.e. injection was blocked, not absent. Together with an outright
+            // EPERM/lockdown, that is confinement despite held caps => Soft.
             "      case \"$bt\" in",
-            "        *'Operation not permitted'*|*'Permission denied'*|*lockdown*|*'Operation not supported'*|*'Error attaching'*)",
-            "          echo 'MODULE_DENIED_EPERM: eBPF/tracepoint attach refused despite capabilities (lockdown or stripped bpf)'",
+            "        *'Operation not permitted'*|*'Permission denied'*|*'Creation of the required BPF maps has failed'*|*'not confined'*|*lockdown*|*'too old'*|*'missing the BPF'*|*'BPF_MAP_TYPE_'*)",
+            "          echo 'MODULE_DENIED_EPERM: kernel advertises BPF (BTF present) and the caps are held, but BPF program injection was refused/blocked - user-namespace / LSM / lockdown confinement'",
             "          bpf_verdict=done ;;",
             "        *)",
-            "          echo \"BPFTRACE_INCONCLUSIVE: $(printf '%s' \"$bt\" | tail -n 2 | tr '\\n' ' ')\" ;;",
+            // A program-level error instead (bpftrace ran but disliked our script,
+            // e.g. a version too old for the walk syntax). Not proof of isolation -
+            // fall through to the authoritative kernel-module build.
+            "          echo \"BPFTRACE_INCONCLUSIVE: walked_tasks=$bpf_tasks - verifying via kernel module ($(printf '%s' \"$bt\" | tail -n 1 | tr '\\n' ' '))\" ;;",
             "      esac",
             "    fi",
             "    if [ \"$bpf_verdict\" = done ]; then",
@@ -1174,279 +1189,37 @@ fn create_privileged_escape_pod(pod_name: &str, node_name: &str, distro: HostDis
     // Capability backbone (distro-agnostic): report the granted set before any
     // build. A plain file read, so it never fails for kernel-version reasons;
     // the verdict leans on it so a build failure cannot masquerade as isolation.
-    let head = [
-        "echo 'Testing container escape using custom kernel module...'",
-        "capeff=$(sed -n 's/^CapEff:[[:space:]]*//p' /proc/self/status)",
-        "capbnd=$(sed -n 's/^CapBnd:[[:space:]]*//p' /proc/self/status)",
-        "echo \"CAPEFF=${capeff}\"",
-        "echo \"CAPBND=${capbnd}\"",
-        "cap=$((0x${capeff:-0}))",
-        "# CAP_SYS_ADMIN (bit 21, 0x200000) is the capability BOTH breaches need:",
-        "# the eBPF loader and the module loader alike. CAP_SYS_MODULE (bit 16,",
-        "# 0x10000) and CAP_BPF (bit 39, 0x8000000000) are reported for context",
-        "# only, so a platform that strips just CAP_SYS_MODULE — leaving the eBPF",
-        "# breach open — is not misread as fully confined.",
-        "has_admin=$(( (cap & 0x200000) != 0 ))",
-        "has_module=$(( (cap & 0x10000) != 0 ))",
-        "has_bpf=$(( (cap & 0x8000000000) != 0 ))",
-        "echo \"CAP_DETAIL: sys_admin=$has_admin sys_module=$has_module bpf=$has_bpf\"",
-        "if [ \"$has_admin\" -ne 0 ]; then",
-        "  echo 'CAPS_FULL: CAP_SYS_ADMIN present - privileged breach is possible'",
-        "else",
-        "  echo 'CAPS_DROPPED: CAP_SYS_ADMIN missing - capabilities confined'",
-        "fi",
-    ];
+    // The capability backbone and eBPF/module breach preamble, in
+    // probes/escape_head.sh. Extracted from this Rust array so it can be read,
+    // linted and syntax-highlighted as the shell it is; `include_str!` fixes it
+    // at compile time, so it cannot drift from what ships.
+    let head = include_str!("../probes/escape_head.sh");
 
     // Module source, build, and load (distro-agnostic): consumes $KDIR.
-    let tail = [
-        "# Create a simple kernel module that can access all processes",
-        "mkdir -p /tmp/kmod_test",
-        "cd /tmp/kmod_test",
-        "# Create the kernel module source",
-        "cat > tenant_spy.c << 'EOF'",
-        "#include <linux/init.h>",
-        "#include <linux/module.h>",
-        "#include <linux/kernel.h>",
-        "#include <linux/proc_fs.h>",
-        "#include <linux/uaccess.h>",
-        "#include <linux/sched/signal.h>",
-        "#include <linux/sched.h>",
-        "#include <linux/fs.h>",
-        "#include <linux/slab.h>",
-        "#include <linux/mm.h>",
-        "",
-        "MODULE_LICENSE(\"GPL\");",
-        "MODULE_DESCRIPTION(\"Tenant isolation test module\");",
-        "MODULE_VERSION(\"1.0\");",
-        "",
-        "static struct proc_dir_entry *proc_entry;",
-        "",
-        "// Function to read process cmdline",
-        "static int get_process_cmdline(struct task_struct *task, char *buffer, int buf_size) {",
-        "    struct mm_struct *mm;",
-        "    char *cmdline;",
-        "    int len = 0;",
-        "    unsigned long arg_start, arg_end;",
-        "    ",
-        "    if (!task || !buffer || buf_size <= 0)",
-        "        return 0;",
-        "    ",
-        "    mm = get_task_mm(task);",
-        "    if (!mm)",
-        "        return 0;",
-        "    ",
-        "    arg_start = mm->arg_start;",
-        "    arg_end = mm->arg_end;",
-        "    ",
-        "    if (arg_start >= arg_end) {",
-        "        mmput(mm);",
-        "        return 0;",
-        "    }",
-        "    ",
-        "    len = arg_end - arg_start;",
-        "    if (len > buf_size - 1)",
-        "        len = buf_size - 1;",
-        "    ",
-        "    cmdline = kmalloc(len + 1, GFP_KERNEL);",
-        "    if (!cmdline) {",
-        "        mmput(mm);",
-        "        return 0;",
-        "    }",
-        "    ",
-        "    if (access_process_vm(task, arg_start, cmdline, len, FOLL_FORCE) == len) {",
-        "        cmdline[len] = '\\0';",
-        "        // Replace null bytes with spaces for readability",
-        "        int i;",
-        "        for (i = 0; i < len; i++) {",
-        "            if (cmdline[i] == '\\0')",
-        "                cmdline[i] = ' ';",
-        "        }",
-        "        strncpy(buffer, cmdline, buf_size - 1);",
-        "        buffer[buf_size - 1] = '\\0';",
-        "        len = strlen(buffer);",
-        "    } else {",
-        "        len = 0;",
-        "    }",
-        "    ",
-        "    kfree(cmdline);",
-        "    mmput(mm);",
-        "    return len;",
-        "}",
-        "",
-        "static ssize_t tenant_spy_read(struct file *file, char __user *buffer, size_t count, loff_t *pos) {",
-        "    struct task_struct *task;",
-        "    char *output;",
-        "    char cmdline_buf[256];",
-        "    int len = 0;",
-        "    int process_count = 0;",
-        "    int found_tenant2 = 0;",
-        "    size_t output_size = 32768; // Even larger buffer",
-        "    ssize_t ret;",
-        "    ",
-        "    if (*pos > 0) return 0;",
-        "    ",
-        "    // Allocate kernel memory for output buffer",
-        "    output = kmalloc(output_size, GFP_KERNEL);",
-        "    if (!output) {",
-        "        return -ENOMEM;",
-        "    }",
-        "    ",
-        "    len += snprintf(output + len, output_size - len, \"KERNEL_MODULE_LOADED: Scanning all processes...\\n\");",
-        "    ",
-        "    rcu_read_lock();",
-        "    for_each_process(task) {",
-        "        // Check if we have enough space left",
-        "        if (len >= output_size - 1000) {",
-        "            len += snprintf(output + len, output_size - len, \"... (truncated due to buffer limit)\\n\");",
-        "            break;",
-        "        }",
-        "        ",
-        "        // Get process cmdline",
-        "        memset(cmdline_buf, 0, sizeof(cmdline_buf));",
-        "        get_process_cmdline(task, cmdline_buf, sizeof(cmdline_buf));",
-        "        ",
-        "        process_count++;",
-        "        ",
-        "        // Check for tenant2 in both comm and cmdline",
-        "        if (strstr(task->comm, \"tenant2\") || strstr(cmdline_buf, \"tenant2\") || ",
-        "            strstr(task->comm, \"target\") || strstr(cmdline_buf, \"echo tenant2\")) {",
-        "            len += snprintf(output + len, output_size - len, ",
-        "                          \"TENANT2_PROCESS_FOUND: PID=%d COMM=%.16s CMDLINE=%s\\n\", ",
-        "                          task->pid, task->comm, cmdline_buf);",
-        "            found_tenant2 = 1;",
-        "        }",
-        "    }",
-        "    rcu_read_unlock();",
-        "    ",
-        "    len += snprintf(output + len, output_size - len, \"TOTAL_PROCESSES_VISIBLE: %d\\n\", process_count);",
-        "    ",
-        "    if (found_tenant2) {",
-        "        len += snprintf(output + len, output_size - len, \"CONTAINER_ESCAPE_SUCCESS: Kernel module can see tenant2 processes!\\n\");",
-        "    } else {",
-        "        len += snprintf(output + len, output_size - len, \"No tenant2 processes found from kernel space\\n\");",
-        "    }",
-        "    ",
-        "    if (process_count > 20) {",
-        "        len += snprintf(output + len, output_size - len, \"HOST_PROCESS_VISIBLE: Can see %d processes - possible container escape\\n\", process_count);",
-        "    }",
-        "    ",
-        "    if (len > count) {",
-        "        len = count;",
-        "    }",
-        "    ",
-        "    if (copy_to_user(buffer, output, len)) {",
-        "        ret = -EFAULT;",
-        "    } else {",
-        "        *pos += len;",
-        "        ret = len;",
-        "    }",
-        "    ",
-        "    kfree(output);",
-        "    return ret;",
-        "}",
-        "",
-        "static const struct proc_ops tenant_spy_ops = {",
-        "    .proc_read = tenant_spy_read,",
-        "};",
-        "",
-        "static int __init tenant_spy_init(void) {",
-        "    proc_entry = proc_create(\"tenant_spy\", 0444, NULL, &tenant_spy_ops);",
-        "    if (!proc_entry) {",
-        "        printk(KERN_ERR \"Failed to create /proc/tenant_spy\\n\");",
-        "        return -ENOMEM;",
-        "    }",
-        "    printk(KERN_INFO \"Tenant spy module loaded\\n\");",
-        "    return 0;",
-        "}",
-        "",
-        "static void __exit tenant_spy_exit(void) {",
-        "    if (proc_entry) {",
-        "        proc_remove(proc_entry);",
-        "    }",
-        "    printk(KERN_INFO \"Tenant spy module unloaded\\n\");",
-        "}",
-        "",
-        "module_init(tenant_spy_init);",
-        "module_exit(tenant_spy_exit);",
-        "EOF",
-        "",
-        "# Build against the host distro's kernel build tree ($KDIR).",
-        "# kbuild reads obj-m from a Kbuild/Makefile in the module directory (M=),",
-        "# not from the command line, so write one next to the source. Without it",
-        "# kbuild tries to include a Makefile in M= and fails 'No rule to make",
-        "# target Makefile'.",
-        "echo 'obj-m := tenant_spy.o' > Kbuild",
-        "echo 'Compiling kernel module...'",
-        "if make -C \"$KDIR\" M=\"$PWD\" modules; then",
-        "  echo 'BUILD_OK'",
-        "  # Strip symbol-version CRCs. The headers are the running kernel's own,",
-        "  # so the ABI already matches; only the Module.symvers bookkeeping is",
-        "  # missing, which makes the CRC check redundant. This lets the module",
-        "  # load on CONFIG_MODVERSIONS=y kernels, the common case.",
-        "  objcopy -R __versions tenant_spy.ko 2>/dev/null || true",
-        "  echo 'Loading kernel module...'",
-        "  insmod_err=$(insmod tenant_spy.ko 2>&1)",
-        "  insmod_rc=$?",
-        "  if [ $insmod_rc -eq 0 ]; then",
-        "    echo 'MODULE_LOADED: Module loaded successfully'",
-        "    # Give the target pod a moment, then read the global task list.",
-        "    sleep 10",
-        "    if [ -f /proc/tenant_spy ]; then",
-        "      cat /proc/tenant_spy",
-        "    else",
-        "      echo 'Proc entry not created'",
-        "    fi",
-        "    rmmod tenant_spy 2>/dev/null || true",
-        "  else",
-        "    echo \"insmod failed: $insmod_err\"",
-        "    # Why the load was refused decides the verdict, so report the host's",
-        "    # module-gating state rather than guessing. EPERM here is almost",
-        "    # always kernel lockdown (Secure Boot: lockdown=integrity), which",
-        "    # refuses unsigned modules in-kernel no matter the capabilities — a",
-        "    # host protection, not tenant isolation, and uniform across every",
-        "    # solution on that host.",
-        "    ld=$(cat /sys/kernel/security/lockdown 2>/dev/null || echo n/a)",
-        "    se=$(cat /sys/module/module/parameters/sig_enforce 2>/dev/null || echo n/a)",
-        "    md=$(cat /proc/sys/kernel/modules_disabled 2>/dev/null || echo n/a)",
-        "    echo \"LOCKDOWN_STATE: lockdown=$ld sig_enforce=$se modules_disabled=$md\"",
-        "    # A user namespace is the other EPERM cause when lockdown is off:",
-        "    # module loading needs CAP_SYS_MODULE in the INIT userns, but a mapped",
-        "    # container holds it only within its own, so CapEff reads full yet the",
-        "    # load is refused. An identity map is '0 0 4294967295'; anything else",
-        "    # is a userns (typically a rootless runtime, or the platform remapping",
-        "    # capabilities as a deliberate isolation mechanism).",
-        "    um=$(tr -s ' ' < /proc/self/uid_map 2>/dev/null | tr '\\n' ';')",
-        "    echo \"USERNS_UID_MAP: ${um:-unavailable}\"",
-        "    # The reason decides the verdict, so classify it rather than lumping",
-        "    # every failure together. A denied privileged op is confinement; a",
-        "    # build/load artefact is inconclusive.",
-        "    case \"$insmod_err\" in",
-        "      *'Required key'*|*'Key was rejected'*)",
-        "        echo 'MODULE_SIG_REQUIRED: kernel demands a signed module' ;;",
-        "      *'not permitted'*)",
-        "        echo 'MODULE_DENIED_EPERM: privileged module load refused despite capabilities' ;;",
-        "      *)",
-        "        echo 'MODULE_LOAD_FAILED_TOOLING: could not load the compiled module' ;;",
-        "    esac",
-        "  fi",
-        "else",
-        "  echo 'BUILD_FAILED: module compilation failed'",
-        "fi",
-        "echo 'Kernel module container escape test completed'",
-        "exit 0",
-    ];
+    // The kernel-module build, load, and /proc/tenant_spy read — the bulk of
+    // the script, and all static. In probes/escape_tail.sh.
+    let tail = include_str!("../probes/escape_tail.sh");
 
     // head (capabilities) -> eBPF breach (primary, header-free; exits on a
     // conclusive result) -> distro-specific header setup -> tail (module
     // build/load, the fallback reached only when the eBPF stage was inconclusive).
-    let script = head
-        .iter()
-        .map(|s| s.to_string())
-        .chain(distro.bpftrace_breach_lines())
+    // head and tail already carry a trailing newline, so the distro-specific
+    // middle slots between them without extra separators. The middle stays in
+    // Rust because it is genuinely computed — the escape image's package
+    // manager and the eBPF availability check differ per distro.
+    let middle: String = distro
+        .bpftrace_breach_lines()
+        .into_iter()
         .chain(distro.header_setup_lines())
-        .chain(tail.iter().map(|s| s.to_string()))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|line| format!("{line}\n"))
+        .collect();
+    // The .sh files end with a newline, as text files should; the original
+    // `join("\n")` did not. Drop the one trailing newline so the assembled
+    // script is byte-identical to what this replaced — a trailing newline is
+    // inert to the shell, but exact equality is what makes the extraction
+    // provably a no-op.
+    let script = format!("{head}{middle}{tail}");
+    let script = script.strip_suffix('\n').unwrap_or(&script).to_string();
 
     let image = distro.escape_image();
 
@@ -1495,17 +1268,34 @@ fn create_privileged_escape_pod(pod_name: &str, node_name: &str, distro: HostDis
     .unwrap()
 }
 
+/// The tenant whose processes the escape probe tries to find.
+///
+/// Deliberately hardened: it asks for nothing, drops every capability and runs
+/// as an ordinary user. That is the point — anything the intruder can see of
+/// this pod is something the platform failed to hide, not something this pod
+/// invited.
+///
+/// `task->comm` follows the executable's basename, not `argv[0]` (so `exec -a`
+/// cannot set it), hence copying a binary to a tenant2-named path and running
+/// it in the background. It must be a standalone binary: `/bin/sleep` on modern
+/// distros is the coreutils multi-call binary, which dispatches on `argv[0]`
+/// and refuses an unknown name. A shell has no such dispatch, so bash is copied
+/// (sh as fallback) and loops. That process is what the eBPF iterator matches
+/// on `comm`; the foreground `tail -f` keeps the pod alive and its cmdline
+/// still carries the `tenant2_marker` token the kernel-module fallback matches.
+///
+/// `PROC_VERSION` and `UNAME_R` identify the host kernel this pod shares, so
+/// the tool can pick a matching image for the escape pod's module build. Both
+/// are readable by any user, are not namespaced, and need no mount.
+///
+/// One deliberate difference from the manifest this replaces: `restricted()`
+/// adds a `RuntimeDefault` seccomp profile the original omitted, and drops an
+/// `fsGroup: 1000` that was inert here because the pod mounts no volumes. The
+/// seccomp profile makes the target admissible under a tenant enforcing the
+/// `restricted` standard, where it previously would have been refused — which
+/// is a fix, but one whose effect is visible only against a live cluster.
 fn create_non_privileged_target_pod(pod_name: &str) -> Pod {
-    // task->comm follows the executable's basename, not argv[0] (so `exec -a`
-    // cannot set it) — copy a binary to a tenant2-named path and run it in the
-    // background. It MUST be a standalone binary: /bin/sleep on modern distros is
-    // the coreutils multi-call binary, which dispatches on argv[0] and refuses an
-    // unknown name ("coreutils: unknown program 'tenant2-probe'"). A shell has no
-    // such dispatch, so copy bash (sh as fallback) and loop. That process is what
-    // the eBPF iterator matches on `comm`; the foreground `tail -f` keeps the pod
-    // alive and its cmdline still carries the "tenant2_marker" token the
-    // kernel-module fallback matches on.
-    let target_cmd = format!(
+    let script = format!(
         "echo \"PROC_VERSION=$(cat /proc/version)\" && \
          echo \"UNAME_R=$(uname -r)\" && \
          echo 'TENANT2_TARGET_STARTED' && \
@@ -1514,298 +1304,109 @@ fn create_non_privileged_target_pod(pod_name: &str) -> Pod {
          mkdir -p /tmp/tenant2_marker && \
          echo \"tenant2\" > /tmp/tenant2_marker/$secret_data && \
          (cp /bin/bash /tmp/{sentinel} 2>/dev/null || cp /bin/sh /tmp/{sentinel}) && \
-         {{ /tmp/{sentinel} -c 'while true; do sleep 0.1; done' & }} && \
+         {{ /tmp/{sentinel} -c 'while true; do sleep 3600; done' & }} && \
          tail -f /tmp/tenant2_marker/$secret_data",
         sentinel = TENANT2_SENTINEL_COMM,
     );
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-            "labels": {
-                "app": "privileged-target",
-                "workload-test": "target",
-                "tenant": "tenant2"
-            }
-        },
-        "spec": {
-            "securityContext": {
-                "runAsNonRoot": true,
-                "runAsUser": 1000,
-                "fsGroup": 1000
-            },
-            "containers": [{
-                "name": "tenant2-app",
-                "image": "ubuntu:latest",
-                "securityContext": {
-                    "allowPrivilegeEscalation": false,
-                    "capabilities": {
-                        "drop": ["ALL"]
-                    },
-                    "runAsNonRoot": true,
-                    "runAsUser": 1000
-                },
-                // PROC_VERSION and UNAME_R identify the host kernel this pod
-                // shares, so the tool can pick a matching image for the escape
-                // pod's module build. Both are readable by any user, not
-                // namespaced, and need no mount. The sentinel process makes the
-                // tenant visible to the escape pod's eBPF task iterator.
-                "command": [
-                    "sh", "-c",
-                    target_cmd
-                ],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+
+    ProbePod::new(pod_name)
+        .container("tenant2-app")
+        .image("ubuntu:latest")
+        .label("app", "privileged-target")
+        .label("workload-test", "target")
+        .label("tenant", "tenant2")
+        .restricted()
+        .shell(script)
+        .build()
 }
 
+/// Asks to share the host user namespace, so UIDs are not remapped.
+///
+/// Admission refusing it is the finding; admission allowing it hands the next
+/// stage of the probe something to look for.
 fn create_host_user_test_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "hostUsers": true,
-            "containers": [{
-                "name": "test",
-                "image": "alpine:latest",
-                "command": ["sleep", "1"],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    ProbePod::new(pod_name).requests(HostAccess::Users).build()
 }
 
+/// An ordinary long-lived pod, owned by the other tenant.
+///
+/// The control in the user-namespace pairing: it asks for nothing, so anything
+/// the spy can see of it is something the platform failed to hide.
 fn create_user_target_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-            "labels": {
-                "app": "user-target",
-                "workload-test": "target"
-            }
-        },
-        "spec": {
-            "containers": [{
-                "name": "user-target",
-                "image": "alpine:latest",
-                "command": [
-                    "sleep", "3600"
-                ],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    ProbePod::new(pod_name)
+        .container("user-target")
+        .label("app", "user-target")
+        .label("workload-test", "target")
+        .command(["sleep", "3600"])
+        .build()
 }
 
+/// Reads its own UID map to see whether it shares the host user namespace.
+///
+/// An identity mapping (`0 0 ...`) means container root is host root, so a
+/// privileged container here is privileged on the node. A remapped one means
+/// the kernel is translating UIDs and the same container is far less dangerous
+/// — the distinction that made a rootless test runner look like an isolation
+/// failure.
 fn create_user_spy_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "hostUsers": true,
-            "securityContext": {
-                "runAsUser": 0
-            },
-            "containers": [{
-                "name": "user-spy",
-                "image": "alpine:latest",
-                "command": [
-                    "sh", "-c",
-                    "echo 'Testing user namespace isolation...' && \
-                     echo 'Current UID mapping:' && \
-                     cat /proc/self/uid_map && \
-                     uid_map=$(cat /proc/self/uid_map | head -1) && \
-                     first_uid=$(echo $uid_map | awk '{print $1}') && \
-                     second_uid=$(echo $uid_map | awk '{print $2}') && \
-                     echo \"First UID: $first_uid, Second UID: $second_uid\" && \
-                     if [ \"$first_uid\" = \"0\" ] && [ \"$second_uid\" = \"0\" ]; then \
-                       echo 'USER_NAMESPACE_BREACH: Using host user namespace (0->0 mapping)'; \
-                     else \
-                       echo 'User namespace properly isolated (non-host mapping)'; \
-                     fi"
-                ],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    let script = "echo 'Testing user namespace isolation...' && \
+                  echo 'Current UID mapping:' && \
+                  cat /proc/self/uid_map && \
+                  uid_map=$(cat /proc/self/uid_map | head -1) && \
+                  first_uid=$(echo $uid_map | awk '{print $1}') && \
+                  second_uid=$(echo $uid_map | awk '{print $2}') && \
+                  echo \"First UID: $first_uid, Second UID: $second_uid\" && \
+                  if [ \"$first_uid\" = \"0\" ] && [ \"$second_uid\" = \"0\" ]; then \
+                    echo 'USER_NAMESPACE_BREACH: Using host user namespace (0->0 mapping)'; \
+                  else \
+                    echo 'User namespace properly isolated (non-host mapping)'; \
+                  fi";
+
+    ProbePod::new(pod_name)
+        .container("user-spy")
+        .requests(HostAccess::Users)
+        .run_as_user(0)
+        .shell(script)
+        .build()
 }
 
+/// Asks to see every process on the node.
+///
+/// Admission refusing it is the finding; admission allowing it hands the next
+/// stage of the probe something to look for.
 fn create_host_pid_test_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "hostPID": true,
-            "containers": [{
-                "name": "test",
-                "image": "alpine:latest",
-                "command": ["sleep", "1"],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    ProbePod::new(pod_name).requests(HostAccess::Pid).build()
 }
 
+/// Asks for full privilege on the node.
 fn create_privileged_test_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "containers": [{
-                "name": "test",
-                "image": "alpine:latest",
-                "command": ["sleep", "1"],
-                "securityContext": {
-                    "privileged": true
-                },
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    ProbePod::new(pod_name)
+        .requests(HostAccess::Privileged)
+        .build()
 }
 
+/// Asks to use the node's network stack directly.
+///
+/// Admission refusing it is the finding; admission allowing it hands the next
+/// stage of the probe something to look for.
 fn create_host_network_test_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "hostNetwork": true,
-            "containers": [{
-                "name": "test",
-                "image": "alpine:latest",
-                "command": ["sleep", "1"],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    ProbePod::new(pod_name)
+        .requests(HostAccess::Network)
+        .build()
 }
 
+/// Asks to reach the node's System V IPC objects.
+///
+/// Admission refusing it is the finding; admission allowing it hands the next
+/// stage of the probe something to look for.
 fn create_host_ipc_test_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "hostIPC": true,
-            "containers": [{
-                "name": "test",
-                "image": "alpine:latest",
-                "command": ["sleep", "1"],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    ProbePod::new(pod_name).requests(HostAccess::Ipc).build()
 }
 
+/// Creates IPC objects in the host namespace for the spy to find.
+///
+/// Joins the host IPC namespace itself: if it did not, there would be nothing
+/// shared to discover and the spy's silence would look like isolation.
 fn create_ipc_target_pod(pod_name: &str) -> Pod {
     let script = [
         "echo 'Creating IPC resources...'",
@@ -1818,252 +1419,121 @@ fn create_ipc_target_pod(pod_name: &str) -> Pod {
     ]
     .join(" && ");
 
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-            "labels": {
-                "app": "ipc-target",
-                "workload-test": "target"
-            }
-        },
-        "spec": {
-            "hostIPC": true,
-            "containers": [{
-                "name": "ipc-target",
-                "image": "ubuntu:latest",
-                "command": [
-                    "sh", "-c",
-                    script
-                ],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    ProbePod::new(pod_name)
+        .container("ipc-target")
+        .image("ubuntu:latest")
+        .label("app", "ipc-target")
+        .label("workload-test", "target")
+        .requests(HostAccess::Ipc)
+        .shell(script)
+        .build()
 }
 
+/// Asks to reach the node's IPC objects, from the target's own node.
+///
+/// Fingerprints whatever segments, semaphores and queues are visible; the
+/// target publishes the same fingerprint, so a match is a breach.
 fn create_ipc_spy_pod(pod_name: &str, node_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "nodeName": node_name,
-            "hostIPC": true,
-            "containers": [{
-                "name": "ipc-spy",
-                "image": "ubuntu:latest",
-                "command": [
-                    "sh", "-c",
-                    "sleep 10 && \
-                     fingerprint=`(ipcs -m; ipcs -s; ipcs -q) | sha1sum | cut -d' ' -f1` && \
-                     echo 'Fingerprint: ' $fingerprint",
-                ],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    let script = "sleep 10 && \
+                  fingerprint=`(ipcs -m; ipcs -s; ipcs -q) | sha1sum | cut -d' ' -f1` && \
+                  echo 'Fingerprint: ' $fingerprint";
+
+    ProbePod::new(pod_name)
+        .container("ipc-spy")
+        .image("ubuntu:latest")
+        .on_node(node_name)
+        .requests(HostAccess::Ipc)
+        .shell(script)
+        .build()
 }
 
+/// Runs a process carrying a marker string, for the spy to look for.
+///
+/// Deliberately unprivileged and in its own namespaces — it is the thing that
+/// should stay invisible.
 fn create_target_process_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-            "labels": {
-                "app": "target-process",
-                "workload-test": "target"
-            }
-        },
-        "spec": {
-            "containers": [{
-                "name": "target-process",
-                "image": "alpine:latest",
-                "command": [
-                    "sh", "-c",
-                    "echo 'Starting target process with unique marker...'; \
-                     while true; do \
-                       echo 'TENANT2_UNIQUE_MARKER: Running...'; \
-                       sleep 30; \
-                     done"
-                ],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    let script = "echo 'Starting target process with unique marker...'; \
+                  while true; do \
+                    echo 'TENANT2_UNIQUE_MARKER: Running...'; \
+                    sleep 30; \
+                  done";
+
+    ProbePod::new(pod_name)
+        .container("target-process")
+        .label("app", "target-process")
+        .label("workload-test", "target")
+        .shell(script)
+        .build()
 }
 
+/// Looks for the target's processes from the host PID namespace.
+///
+/// The container name is preserved deliberately: the script excludes its own
+/// `ps` line by matching the literal `spy-process`, so renaming it would make
+/// the spy find itself and report a breach that is only its own reflection.
 fn create_process_spy_pod(pod_name: &str, node_name: &str, target_pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "nodeName": node_name,
-            "hostPID": true,
-            "containers": [{
-                "name": "spy-process",
-                "image": "alpine:latest",
-                "securityContext": {
-                    "privileged": true
-                },
-                "command": [
-                    "sh", "-c",
-                    format!(
-                        "echo 'Searching for tenant2 processes...' && \
-                         for i in $(seq 1 30); do \
-                           if ps aux | grep -i 'TENANT2_UNIQUE_MARKER\\|{}' | grep -v grep | grep -v spy-process; then \
-                             echo 'TENANT2_PROCESS_FOUND: Isolation breach detected!'; \
-                             ps aux | grep -i 'TENANT2_UNIQUE_MARKER\\|{}' | grep -v grep | grep -v spy-process; \
-                             break; \
-                           fi; \
-                           echo \"Attempt $i: No tenant2 processes visible\"; \
-                           sleep 2; \
-                         done; \
-                         echo 'Process visibility check completed'",
-                        target_pod_name, target_pod_name
-                    )
-                ],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    let script = format!(
+        "echo 'Searching for tenant2 processes...' && \
+         for i in $(seq 1 30); do \
+           if ps aux | grep -i 'TENANT2_UNIQUE_MARKER\\|{target}' | grep -v grep | grep -v spy-process; then \
+             echo 'TENANT2_PROCESS_FOUND: Isolation breach detected!'; \
+             ps aux | grep -i 'TENANT2_UNIQUE_MARKER\\|{target}' | grep -v grep | grep -v spy-process; \
+             break; \
+           fi; \
+           echo \"Attempt $i: No tenant2 processes visible\"; \
+           sleep 2; \
+         done; \
+         echo 'Process visibility check completed'",
+        target = target_pod_name
+    );
+
+    ProbePod::new(pod_name)
+        .container("spy-process")
+        .on_node(node_name)
+        .requests(HostAccess::Pid)
+        .requests(HostAccess::Privileged)
+        .shell(script)
+        .build()
 }
 
+/// Serves a marker page for the network spy to fetch.
 fn create_network_target_pod(pod_name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-            "labels": {
-                "app": "network-target",
-                "workload-test": "target"
-            }
-        },
-        "spec": {
-            "containers": [{
-                "name": "network-target",
-                "image": "nginx:alpine",
-                "ports": [{
-                    "containerPort": 80
-                }],
-                "command": [
-                    "sh", "-c",
-                    "echo 'Starting network target server...' && \
-                     echo '<h1>TENANT2_NETWORK_TARGET</h1>' > /usr/share/nginx/html/index.html && \
-                     nginx -g 'daemon off;'"
-                ],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    let script = "echo 'Starting network target server...' && \
+                  echo '<h1>TENANT2_NETWORK_TARGET</h1>' > /usr/share/nginx/html/index.html && \
+                  nginx -g 'daemon off;'";
+
+    ProbePod::new(pod_name)
+        .container("network-target")
+        .image("nginx:alpine")
+        .label("app", "network-target")
+        .label("workload-test", "target")
+        .port(80)
+        .shell(script)
+        .build()
 }
 
+/// Tries to reach the other tenant's marker page from the host network.
 fn create_network_spy_pod(pod_name: &str, target_ip: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-        },
-        "spec": {
-            "hostNetwork": true,
-            "containers": [{
-                "name": "network-spy",
-                "image": "alpine/curl:latest",
-                "command": [
-                    "sh", "-c",
-                    format!(
-                        "echo 'Testing cross-tenant network access...' && \
-                         for i in $(seq 1 10); do \
-                           echo \"Attempt $i: Trying to connect to {}:80\" && \
-                           if curl -s --connect-timeout 5 {}:80 | grep -q 'TENANT2_NETWORK_TARGET'; then \
-                             echo 'NETWORK_ACCESS_SUCCESS: Cross-tenant network access detected!'; \
-                             break; \
-                           fi; \
-                           sleep 2; \
-                         done; \
-                         echo 'Network access test completed'",
-                        target_ip, target_ip
-                    )
-                ],
-                "resources": {
-                    "requests": {
-                        "memory": "64Mi",
-                        "cpu": "250m"
-                    },
-                    "limits": {
-                        "memory": "128Mi",
-                        "cpu": "500m"
-                    }
-                }
-            }],
-            "restartPolicy": "Never",
-        }
-    }))
-    .unwrap()
+    let script = format!(
+        "echo 'Testing cross-tenant network access...' && \
+         for i in $(seq 1 10); do \
+           echo \"Attempt $i: Trying to connect to {target}:80\" && \
+           if curl -s --connect-timeout 5 {target}:80 | grep -q 'TENANT2_NETWORK_TARGET'; then \
+             echo 'NETWORK_ACCESS_SUCCESS: Cross-tenant network access detected!'; \
+             break; \
+           fi; \
+           sleep 2; \
+         done; \
+         echo 'Network access test completed'",
+        target = target_ip
+    );
+
+    ProbePod::new(pod_name)
+        .container("network-spy")
+        .image("alpine/curl:latest")
+        .requests(HostAccess::Network)
+        .shell(script)
+        .build()
 }
 
 // =============================================================================
@@ -2215,11 +1685,14 @@ mod tests {
             "node-1",
             HostDistro::Ubuntu { release: None },
         ));
-        // Primary: a header-free eBPF probe gated on the host's BTF. It must use
-        // the GLOBAL sched_switch tracepoint, not the namespace-scoped task iter.
+        // Primary: a header-free eBPF probe gated on the host's BTF. It must walk
+        // the GLOBAL task list from curtask (kernel-state read), not the
+        // namespace-scoped task iterator nor the perf-based scheduler tracepoint.
         assert!(script.contains("/sys/kernel/btf/vmlinux"));
-        assert!(script.contains("tracepoint:sched:sched_switch"));
+        assert!(script.contains("$s = curtask"));
+        assert!(script.contains("BPFTASK"));
         assert!(!script.contains("iter:task"));
+        assert!(!script.contains("sched:sched_switch"));
         assert!(script.contains("apt-get install -y bpftrace"));
         // It identifies the tenant by the sentinel's comm.
         assert!(script.contains(TENANT2_SENTINEL_COMM));
@@ -2320,5 +1793,195 @@ mod tests {
         let r = privileged_verdict(false, true, PrivilegedBreach::ToolingFailed, true);
         assert_eq!(r.isolation, IsolationLevel::Unknown);
         assert_ne!(r.isolation, IsolationLevel::Hard);
+    }
+}
+
+#[cfg(test)]
+mod probe_requests_what_it_claims {
+    //! Every probe must actually ask for the privilege its name promises.
+    //!
+    //! These probes are written as `serde_json::json!` literals deserialised
+    //! into `Pod`, and k8s-openapi's deserialiser *silently discards keys it
+    //! does not recognise* — `_ => Field::Other` followed by
+    //! `Field::Other => { let _: IgnoredAny = ... }` in its `pod_spec.rs`. So
+    //! `"hostPid": true`, with the wrong capitalisation, produces a `PodSpec`
+    //! with `host_pid: None`: no error, no panic, no warning.
+    //!
+    //! The consequence is not a crash but a wrong answer. A probe that fails to
+    //! request hostPID sees no other tenant's processes, finds no breach, and
+    //! the run reports Hard isolation — a green verdict from a probe that
+    //! tested nothing. Nothing downstream can distinguish that from real
+    //! isolation.
+    //!
+    //! Asserting on the *typed* struct rather than the literal is the point:
+    //! it checks what the API server will actually receive.
+
+    use super::*;
+
+    /// The JSON these probes were built from before the builder existed.
+    ///
+    /// Kept as the reference for the conversion: if the builder produces the
+    /// same `Pod`, the swap cannot have changed what the API server sees, and
+    /// no cluster run is needed to establish it. Only the container name
+    /// differs — `test` became `probe` — which nothing selects on, since every
+    /// probe has exactly one container and `AttachParams::default()` does not
+    /// name one.
+    fn legacy_json(pod_name: &str, host_field: Option<&str>, privileged: bool) -> Pod {
+        let mut spec = serde_json::json!({
+            "containers": [{
+                "name": "probe",
+                "image": "alpine:latest",
+                "command": ["sleep", "1"],
+                "resources": {
+                    "requests": { "memory": "64Mi", "cpu": "250m" },
+                    "limits": { "memory": "128Mi", "cpu": "500m" }
+                }
+            }],
+            "restartPolicy": "Never",
+        });
+        if let Some(field) = host_field {
+            spec[field] = serde_json::json!(true);
+        }
+        if privileged {
+            spec["containers"][0]["securityContext"] = serde_json::json!({ "privileged": true });
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": pod_name },
+            "spec": spec,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_builder_reproduces_the_json_it_replaced() {
+        assert_eq!(
+            create_host_pid_test_pod("p"),
+            legacy_json("p", Some("hostPID"), false)
+        );
+        assert_eq!(
+            create_host_ipc_test_pod("p"),
+            legacy_json("p", Some("hostIPC"), false)
+        );
+        assert_eq!(
+            create_host_network_test_pod("p"),
+            legacy_json("p", Some("hostNetwork"), false)
+        );
+        assert_eq!(
+            create_host_user_test_pod("p"),
+            legacy_json("p", Some("hostUsers"), false)
+        );
+        assert_eq!(
+            create_privileged_test_pod("p"),
+            legacy_json("p", None, true)
+        );
+    }
+
+    fn spec(pod: &Pod) -> &k8s_openapi::api::core::v1::PodSpec {
+        pod.spec.as_ref().expect("probe pod must have a spec")
+    }
+
+    #[test]
+    fn the_spy_script_survived_being_moved_into_the_builder() {
+        // Shell inside a Rust string inside a JSON literal was three levels of
+        // escaping; the builder removes one of them, and getting the remaining
+        // two wrong silently changes what the probe greps for. A `\\|`
+        // that became `\\\\|` would search for a literal backslash and never
+        // match, so the probe would find nothing and report isolation.
+        let pod = create_process_spy_pod("spy", "node-1", "victim-pod");
+        let script = &pod.spec.as_ref().unwrap().containers[0]
+            .command
+            .as_ref()
+            .expect("the script is the third element of the sh -c command")[2];
+
+        // The alternation must reach the shell as a single backslash-pipe.
+        assert!(
+            script.contains(r"TENANT2_UNIQUE_MARKER\|victim-pod"),
+            "grep alternation mangled: {script}"
+        );
+        // Self-exclusion, without which the spy matches its own command line.
+        assert!(script.contains("grep -v spy-process"));
+        // The quoting around the progress message must still be shell quoting.
+        assert!(script.contains(r#"echo "Attempt $i"#));
+    }
+
+    #[test]
+    fn host_namespace_probes_request_their_namespace() {
+        assert_eq!(
+            spec(&create_host_pid_test_pod("p")).host_pid,
+            Some(true),
+            "the hostPID probe must request hostPID or it proves nothing"
+        );
+        assert_eq!(spec(&create_host_ipc_test_pod("p")).host_ipc, Some(true));
+        assert_eq!(
+            spec(&create_host_network_test_pod("p")).host_network,
+            Some(true)
+        );
+        assert_eq!(
+            spec(&create_host_user_test_pod("p")).host_users,
+            Some(true),
+            "hostUsers is a recent field; a version of k8s-openapi without it \
+             would drop this silently"
+        );
+    }
+
+    #[test]
+    fn spy_probes_request_both_the_namespace_and_the_node() {
+        // A spy has to land on the same node as its target, or it looks past an
+        // empty machine and reports isolation it never tested.
+        let ipc = create_ipc_spy_pod("spy", "node-1");
+        assert_eq!(spec(&ipc).host_ipc, Some(true));
+        assert_eq!(spec(&ipc).node_name.as_deref(), Some("node-1"));
+
+        let process = create_process_spy_pod("spy", "node-1", "target");
+        assert_eq!(spec(&process).host_pid, Some(true));
+        assert_eq!(spec(&process).node_name.as_deref(), Some("node-1"));
+
+        let network = create_network_spy_pod("spy", "10.0.0.1");
+        assert_eq!(spec(&network).host_network, Some(true));
+
+        let user = create_user_spy_pod("spy");
+        assert_eq!(spec(&user).host_users, Some(true));
+    }
+
+    #[test]
+    fn the_ipc_target_shares_the_host_namespace_it_is_meant_to_be_seen_in() {
+        // The target is half the experiment: if it does not join the host IPC
+        // namespace there is nothing for the spy to find, and the absence
+        // reads as isolation.
+        assert_eq!(spec(&create_ipc_target_pod("t")).host_ipc, Some(true));
+    }
+
+    #[test]
+    fn the_privileged_probes_are_actually_privileged() {
+        for pod in [
+            create_privileged_test_pod("p"),
+            create_privileged_escape_pod("p", "node-1", HostDistro::Ubuntu { release: None }),
+        ] {
+            let privileged = spec(&pod).containers[0]
+                .security_context
+                .as_ref()
+                .and_then(|c| c.privileged);
+            assert_eq!(privileged, Some(true));
+        }
+    }
+
+    #[test]
+    fn the_control_targets_stay_unprivileged() {
+        // The other half of the pairing. If a "non-privileged" target quietly
+        // gained a host namespace, a breach would be attributed to the wrong
+        // cause.
+        for pod in [
+            create_non_privileged_target_pod("t"),
+            create_user_target_pod("t"),
+            create_target_process_pod("t"),
+            create_network_target_pod("t"),
+        ] {
+            let s = spec(&pod);
+            assert_ne!(s.host_pid, Some(true));
+            assert_ne!(s.host_network, Some(true));
+            assert_ne!(s.host_users, Some(true));
+        }
     }
 }

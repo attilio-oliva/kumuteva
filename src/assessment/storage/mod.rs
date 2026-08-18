@@ -12,6 +12,7 @@ use k8s_openapi::api::{
 use serde::Serialize;
 use tracing::info;
 
+use crate::assessment::probe::{HostAccess, ProbePod};
 use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
     run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
@@ -237,25 +238,24 @@ async fn test_hostpath_creation_authorization(
 /// takes, and the answer arrives synchronously in the response. No wait is
 /// needed: whether the pod then schedules or pulls its image is a different
 /// matter, and not what authorization means here.
+///
+/// The pod declares CPU and memory like every other probe, and that is load
+/// bearing rather than boilerplate. A tenant with a compute ResourceQuota makes
+/// `limits.cpu` mandatory for every pod in the namespace, so a pod without them
+/// is rejected by quota admission *before* the hostPath policy is consulted.
+/// This probe would then report hostPath as forbidden on a cluster that permits
+/// it, having never asked the question — the same masking that made kubectl-mtb
+/// score a tenant well for refusing every pod. Declaring resources gets the pod
+/// past the quota so the answer is about hostPath.
 async fn test_hostpath_mount_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
-    let pod: Pod = serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": { "name": HOSTPATH_AUTH_POD_NAME },
-        "spec": {
-            "restartPolicy": "Never",
-            "containers": [{
-                "name": "probe",
-                "image": "nginx",
-                "command": ["sh", "-c", "sleep 1"],
-                "volumeMounts": [{ "mountPath": HOSTPATH_MOUNT_PATH, "name": "hostpath" }],
-            }],
-            "volumes": [{
-                "name": "hostpath",
-                "hostPath": { "path": HOSTPATH_MOUNT_PATH, "type": "DirectoryOrCreate" }
-            }]
-        }
-    }))?;
+    let pod = ProbePod::new(HOSTPATH_AUTH_POD_NAME)
+        .image("nginx")
+        .shell("sleep 1")
+        .requests(HostAccess::HostPath {
+            host: HOSTPATH_MOUNT_PATH.to_string(),
+            mount: HOSTPATH_MOUNT_PATH.to_string(),
+        })
+        .build();
 
     let result = tenant
         .cluster
@@ -1192,5 +1192,47 @@ impl Display for StorageOperation {
                 write!(f, "Use HostPath through a PersistentVolume")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hostpath_probe_tests {
+    use super::*;
+
+    /// The hostPath authorization probe must declare resources.
+    ///
+    /// Regression guard for a conflation found during the builder conversion:
+    /// the probe used to omit CPU and memory, and on a tenant with a compute
+    /// ResourceQuota — `capsule-hardened` — quota admission rejects a pod
+    /// without limits before the hostPath policy is consulted. The probe then
+    /// reported hostPath as forbidden without ever asking, indistinguishable
+    /// from a cluster that genuinely forbids it.
+    #[test]
+    fn the_hostpath_probe_declares_resources_so_a_quota_cannot_mask_the_answer() {
+        let pod = ProbePod::new(HOSTPATH_AUTH_POD_NAME)
+            .image("nginx")
+            .shell("sleep 1")
+            .requests(HostAccess::HostPath {
+                host: HOSTPATH_MOUNT_PATH.to_string(),
+                mount: HOSTPATH_MOUNT_PATH.to_string(),
+            })
+            .build();
+
+        let resources = pod.spec.as_ref().unwrap().containers[0]
+            .resources
+            .as_ref()
+            .expect("a probe without resources is refused by quota before it is judged");
+        let limits = resources.limits.as_ref().expect("limits");
+        assert!(limits.contains_key("cpu"));
+        assert!(limits.contains_key("memory"));
+        assert!(resources
+            .requests
+            .as_ref()
+            .expect("requests")
+            .contains_key("cpu"));
+
+        // And it must still actually ask for the hostPath.
+        let volume = &pod.spec.as_ref().unwrap().volumes.as_ref().expect("volume")[0];
+        assert_eq!(volume.host_path.as_ref().unwrap().path, HOSTPATH_MOUNT_PATH);
     }
 }

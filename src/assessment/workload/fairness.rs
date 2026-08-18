@@ -170,6 +170,23 @@ impl FairnessWorkloadAssessor {
         let t1_points = collect_results(&tenant1, t1_pods).await?;
         let t2_points = collect_results(&tenant2, t2_pods).await?;
 
+        // Did the generator actually reach the rate it was asked for?
+        //
+        // Worth checking on every run rather than assuming. The generator is
+        // serial — one `sysbench --events=1 --threads=1` per iteration inside a
+        // blocking loop — so a pod cannot exceed one event per event-duration
+        // however the rate is configured. Whether the configured rate fits
+        // therefore depends on the host CPU and on `maxPrime`, which no static
+        // check can know; a config test used to assert a guess about it and was
+        // simply wrong for this machine.
+        //
+        // It matters because falling short is invisible in the result. The
+        // latencies still look fine — better, if anything, since a slower
+        // offered load contends less — so an under-driven phase quietly
+        // understates the degradation the experiment exists to measure.
+        report_rate_shortfall("tenant1", &t1_points, t1_pods, t1_rate, duration_secs);
+        report_rate_shortfall("tenant2", &t2_points, t2_pods, t2_rate, duration_secs);
+
         // Cleanup
         cleanup_pods(&tenant1, t1_pods).await?;
         cleanup_pods(&tenant2, t2_pods).await?;
@@ -688,5 +705,106 @@ mod tests {
                 Some("kata")
             );
         }
+    }
+}
+
+/// Warn when a phase generated materially fewer events than it was asked for.
+///
+/// This is the workload subsystem's validity check, and it has to be its own.
+/// Elsewhere the same question is answered by the coordinated-omission factor
+/// (`scheduled_latency_ms / latency_ms` on [`MetricPoint`]), but that requires
+/// dispatching against an `OperationSchedule`, and this generator does not —
+/// `collect_results` sets `scheduled_latency_ms: None`. Counting completed
+/// events against the target is the signal available here.
+///
+/// Returns the achieved rate in events per second per pod, or `None` when no
+/// target was set (the unlimited strategy, where there is nothing to fall short
+/// of) or when the phase produced no samples at all — the latter is already
+/// reported as a missing measurement elsewhere, and dividing by it here would
+/// only add noise.
+///
+/// The 10% tolerance is deliberate rather than exact: the generator sleeps to
+/// pace itself and the final iteration is usually truncated by the phase
+/// ending, so a small undershoot is expected even on hardware with headroom to
+/// spare. What this is looking for is the case where an event takes longer than
+/// the requested interval, which does not undershoot slightly — it halves the
+/// rate, or worse.
+fn report_rate_shortfall(
+    label: &str,
+    points: &[MetricPoint],
+    pods: u32,
+    target_rate: Option<f64>,
+    duration_secs: u64,
+) -> Option<f64> {
+    let target = target_rate?;
+    if points.is_empty() || pods == 0 || duration_secs == 0 || target <= 0.0 {
+        return None;
+    }
+
+    let achieved = points.len() as f64 / duration_secs as f64 / pods as f64;
+    let ratio = achieved / target;
+
+    if ratio < 0.9 {
+        tracing::warn!(
+            "{label}: generated {achieved:.2} events/s per pod against a target \
+             of {target:.2} ({:.0}% of it). The load offered was lower than the \
+             experiment specifies, so any degradation measured here understates \
+             the real contention. A sysbench event at the configured maxPrime \
+             probably takes longer than 1/{target:.2}s on this host.",
+            ratio * 100.0
+        );
+    } else {
+        tracing::info!("{label}: {achieved:.2} events/s per pod (target {target:.2})");
+    }
+
+    Some(achieved)
+}
+
+#[cfg(test)]
+mod rate_shortfall_tests {
+    use super::*;
+
+    fn points(n: usize) -> Vec<MetricPoint> {
+        (0..n)
+            .map(|i| MetricPoint {
+                timestamp_secs: i as f64,
+                latency_ms: 1.0,
+                // Deliberately None, matching `collect_results`: this generator
+                // does not dispatch against an `OperationSchedule`, so the
+                // coordinated-omission factor other subsystems use as their
+                // validity check does not exist here.
+                scheduled_latency_ms: None,
+                is_error: false,
+                label: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_phase_that_meets_its_target_reports_the_achieved_rate() {
+        // 2 pods x 5 events/s x 10s = 100 samples.
+        let achieved = report_rate_shortfall("t", &points(100), 2, Some(5.0), 10);
+        assert_eq!(achieved, Some(5.0));
+    }
+
+    #[test]
+    fn a_serial_generator_that_cannot_keep_up_is_detected() {
+        // The case the deleted config assertion was groping at: an event
+        // slower than the requested interval halves the achieved rate, and
+        // nothing else in the results would show it.
+        let achieved = report_rate_shortfall("t", &points(20), 2, Some(5.0), 10);
+        assert_eq!(achieved, Some(1.0));
+    }
+
+    #[test]
+    fn an_unlimited_phase_has_no_target_to_miss() {
+        assert_eq!(report_rate_shortfall("t", &points(100), 2, None, 10), None);
+    }
+
+    #[test]
+    fn an_empty_phase_is_left_to_the_missing_measurement_path() {
+        // Reported elsewhere as an absent measurement; a 0% rate warning here
+        // would be a second, less informative account of the same fact.
+        assert_eq!(report_rate_shortfall("t", &[], 2, Some(5.0), 10), None);
     }
 }

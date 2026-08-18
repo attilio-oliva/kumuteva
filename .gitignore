@@ -13,3 +13,25 @@ new_fairness_results/kumuteva_raw_results.zip
 
 # Output of validate_analysis.py — regenerated on demand.
 new_fairness_results/_validation_figures/
+
+# Measurement output written into the repository.
+#
+# `fairness --output-dir` still defaults to a repo-relative `fairness_results`
+# (main.rs OUTPUT_DIR), so a hand-run assessment drops results into the source
+# tree. The campaign scripts already write to $HOME/kumuteva-runs and
+# $HOME/kumuteva-mtb; this keeps the manual path from re-committing 300 MB of
+# CSVs and PNGs, as happened before.
+/fairness_results/
+/kumuteva-runs/
+/kumuteva-mtb/
+
+# Figures and tables regenerated from the run data by the analysis scripts.
+# The generators are the source; these are their output.
+new_fairness_results/*.pgf
+new_fairness_results/*.png
+new_fairness_results/*.tex
+new_fairness_results/*.ipynb
+new_fairness_results/mtb/
+new_fairness_results/mtb_catalogue.json
+new_fairness_results/mtb_evidence_facts.md
+new_fairness_results/mtb_feature_table.md

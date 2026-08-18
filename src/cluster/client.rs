@@ -25,6 +25,20 @@ use futures::{StreamExt, TryStreamExt};
 use serde_json::json;
 use tokio::time::sleep;
 
+/// How long a single `exec` into a probe pod may take before it is abandoned.
+///
+/// Every command the probes exec is short by construction — a `curl` with its
+/// own `--connect-timeout`, an `nslookup`, reading a file — so exceeding this
+/// means the stream is stuck rather than the work being slow. Without a bound
+/// the attached stream is read to EOF and a hung one blocks forever, which
+/// stalls the assessment silently: no output, no error, just a process that
+/// never returns.
+///
+/// Generous relative to the commands themselves, because the cost of being
+/// wrong in one direction (a real result discarded) is worse than in the other
+/// (waiting half a minute before retrying).
+const EXEC_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
@@ -1294,8 +1308,35 @@ impl KubernetesClient {
                 .await
             {
                 Ok(attached_process) => {
-                    let output = get_output(attached_process).await;
-                    return Ok(output);
+                    // Bounded, because `get_output` reads the attached stream
+                    // to EOF and joins the process, and neither has a deadline
+                    // of its own. A stream that never closes hangs the whole
+                    // assessment with no output and no error — a campaign run
+                    // sat in the network stage for minutes this way, looking
+                    // indistinguishable from slow progress.
+                    match tokio::time::timeout(EXEC_TIMEOUT, get_output(attached_process)).await {
+                        Ok(output) => return Ok(output),
+                        Err(_) => {
+                            tracing::error!(
+                                "exec attempt {} timed out after {:?}: pod={} command={}",
+                                attempt,
+                                EXEC_TIMEOUT,
+                                pod_name,
+                                command
+                            );
+                            last_error = Some(kube::Error::Api(kube::error::ErrorResponse {
+                                status: "Failure".to_string(),
+                                message: format!(
+                                    "exec into {pod_name} timed out after {EXEC_TIMEOUT:?}"
+                                ),
+                                reason: "Timeout".to_string(),
+                                code: 504,
+                            }));
+                            if attempt < max_retries {
+                                tokio::time::sleep(retry_wait_duration).await;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!("exec attempt {} failed: {:?}", attempt, e);
@@ -1340,12 +1381,19 @@ impl KubernetesClient {
                 .await
             {
                 Ok(mut attached_process) => {
-                    let exit_status = attached_process
-                        .take_status()
-                        .ok_or(Error::msg(
-                            "Failed to get process status. The process might still be running.",
-                        ))?
+                    let status = attached_process.take_status().ok_or(Error::msg(
+                        "Failed to get process status. The process might still be running.",
+                    ))?;
+                    // Bounded for the same reason as the output path: awaiting a
+                    // status that never arrives hangs the assessment silently.
+                    let exit_status = tokio::time::timeout(EXEC_TIMEOUT, status)
                         .await
+                        .map_err(|_| {
+                            Error::msg(format!(
+                                "waiting for exit status of {pod_name} timed out \
+                                 after {EXEC_TIMEOUT:?}"
+                            ))
+                        })?
                         .ok_or(Error::msg("Failed to wait for process status"))?;
                     return Ok(exit_status);
                 }
@@ -1385,14 +1433,32 @@ impl KubernetesClient {
     }
 }
 
+/// Drain an attached process's stdout.
+///
+/// Unbounded on purpose here — the caller applies [`EXEC_TIMEOUT`], which is the
+/// right place for it, since only the caller knows which command was run.
+///
+/// Both fallible steps used to `unwrap`. Neither is a programmer error: a
+/// process attached without a stdout stream and a connection dropped mid-read
+/// are both things a cluster does, and panicking on them takes down an
+/// assessment that could have recorded the failure and carried on.
 async fn get_output(mut attached: AttachedProcess) -> String {
-    let stdout = tokio_util::io::ReaderStream::new(attached.stdout().unwrap());
-    let out = stdout
+    let Some(stdout) = attached.stdout() else {
+        tracing::warn!("attached process exposed no stdout stream");
+        return String::new();
+    };
+
+    let out = tokio_util::io::ReaderStream::new(stdout)
         .filter_map(|r| async { r.ok().and_then(|v| String::from_utf8(v.to_vec()).ok()) })
         .collect::<Vec<_>>()
         .await
         .join("");
-    attached.join().await.unwrap();
+
+    if let Err(error) = attached.join().await {
+        // The output already read is still worth returning: callers judge on
+        // its content, and a truncated read is better evidence than none.
+        tracing::warn!("attached process did not exit cleanly: {error:?}");
+    }
     out
 }
 

@@ -326,8 +326,43 @@ fn is_authorization_error(error_msg: &str) -> bool {
     error_msg.contains("BadRequest") || error_msg.contains("not allowed")
 }
 
+/// The HTTP status the API server returned, if the message carries one.
+///
+/// `kube`'s `ErrorResponse` renders as `... code: 403 })` when an error is
+/// stringified, so the structured answer is usually still present in the text.
+/// Reading it is worth the small parse: matching on words like "forbidden"
+/// depends on message wording that upstream is free to change, and if it ever
+/// does the classification degrades silently — a verdict flips and nothing
+/// announces it.
+fn status_code_in(error_msg: &str) -> Option<u16> {
+    let rest = error_msg.rsplit_once("code: ")?.1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Infer isolation level from an error message during cross-tenant operation
 fn infer_isolation_from_error(error_msg: &str) -> IsolationLevel {
+    // Prefer the status code where the message carries one. Not every error
+    // does — Pod Security Admission and quota rejections arrive as bare
+    // messages — so the substring matching below remains the fallback rather
+    // than being replaced.
+    match status_code_in(error_msg) {
+        // Absent from the intruder's scope: exactly what a single-tenant
+        // cluster would say.
+        Some(404) => return IsolationLevel::Hard,
+        // Refused, but the refusal confirms there was something to refuse.
+        Some(401) | Some(403) => {
+            return IsolationLevel::Soft(
+                "Access forbidden - reveals shared environment".to_string(),
+            )
+        }
+        // The name is taken, which tells the intruder another tenant holds it.
+        Some(409) => {
+            return IsolationLevel::Soft("Name collision - reveals resource exists".to_string())
+        }
+        _ => {}
+    }
+
     if error_msg.contains("NotFound") || error_msg.contains("not found") {
         // Resource not found in tenant2's scope - hard isolation
         // Intruder sees the same error as in a single-tenant system
@@ -1111,4 +1146,153 @@ pub async fn manual_test_autonomy(
 
     println!("=======================================================\n");
     Ok(())
+}
+
+#[cfg(test)]
+mod error_classification_tests {
+    //! Characterisation tests for the two functions that decide every
+    //! control-plane verdict in the report.
+    //!
+    //! They had none, despite `infer_isolation_from_error` being called from
+    //! seven places and mapping directly onto what the paper prints. The
+    //! strings below are real messages from this project's own runs, not
+    //! invented ones — the functions match on message text, so a test built
+    //! from paraphrase would pass while the real thing failed.
+    //!
+    //! Their purpose is to pin current behaviour before the matching is moved
+    //! onto structured status codes. Any change in these results after that
+    //! move is a change in the published numbers.
+
+    use super::*;
+
+    /// Real 403 from a cross-tenant DaemonSet create, captured from a run.
+    const FORBIDDEN_RBAC: &str = r#"ApiError: daemonsets.apps is forbidden: User "tenant2-admin" cannot create resource "daemonsets" in API group "apps" in the namespace "tenant1": Forbidden (ErrorResponse { status: "Failure", message: "daemonsets.apps is forbidden", reason: "Forbidden", code: 403 })"#;
+
+    /// Real 403 from Pod Security Admission on a hardened tenant.
+    const FORBIDDEN_POD_SECURITY: &str = r#"pods "network-multitool" is forbidden: violates PodSecurity "restricted:latest": allowPrivilegeEscalation != false"#;
+
+    /// Real 403 from a ResourceQuota that requires limits.
+    const FORBIDDEN_QUOTA: &str =
+        r#"pods "probe" is forbidden: failed quota: capsule-tenant1-0: must specify limits.cpu"#;
+
+    const NOT_FOUND: &str = r#"ApiError: configmaps "other-tenant-config" not found: NotFound (ErrorResponse { status: "Failure", message: "configmaps not found", reason: "NotFound", code: 404 })"#;
+
+    const ALREADY_EXISTS: &str = r#"ApiError: configmaps "shared-name" already exists: AlreadyExists (ErrorResponse { reason: "AlreadyExists", code: 409 })"#;
+
+    #[test]
+    fn not_found_reads_as_hard_isolation() {
+        // The intruder sees exactly what it would in a single-tenant cluster:
+        // no evidence the resource exists at all.
+        assert_eq!(infer_isolation_from_error(NOT_FOUND), IsolationLevel::Hard);
+    }
+
+    #[test]
+    fn forbidden_reads_as_soft_isolation() {
+        // Blocked, but the refusal itself confirms there is something there to
+        // be refused — the environment is shared.
+        for message in [FORBIDDEN_RBAC, FORBIDDEN_POD_SECURITY, FORBIDDEN_QUOTA] {
+            assert!(
+                matches!(infer_isolation_from_error(message), IsolationLevel::Soft(_)),
+                "expected Soft for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_collision_reads_as_soft_isolation() {
+        // The intruder learns another tenant holds that name.
+        assert!(matches!(
+            infer_isolation_from_error(ALREADY_EXISTS),
+            IsolationLevel::Soft(_)
+        ));
+    }
+
+    #[test]
+    fn not_found_wins_over_forbidden_when_a_message_contains_both() {
+        // Order matters and is not obvious: a NotFound message that also
+        // carries the word "forbidden" must still read as Hard. Swapping the
+        // branches would silently downgrade every such verdict to Soft.
+        let both = r#"configmaps "x" not found; user is forbidden from listing"#;
+        assert_eq!(infer_isolation_from_error(both), IsolationLevel::Hard);
+    }
+
+    #[test]
+    fn an_unrecognised_error_is_soft_rather_than_hard() {
+        // Deliberately conservative. An error we cannot classify might still
+        // have leaked something, so it must not be reported as the strongest
+        // isolation available.
+        let level = infer_isolation_from_error("connection reset by peer");
+        assert!(matches!(level, IsolationLevel::Soft(_)));
+    }
+
+    #[test]
+    fn the_status_code_is_preferred_over_the_wording() {
+        // The point of reading the code: classification stops depending on
+        // upstream's choice of words. A 404 whose text says "forbidden" is
+        // still Hard, and a 403 whose text says nothing recognisable is still
+        // Soft — where substring matching alone would get the second one wrong
+        // and file it under "unclassified".
+        let misleading_404 =
+            r#"something forbidden happened (ErrorResponse { reason: "NotFound", code: 404 })"#;
+        assert_eq!(
+            infer_isolation_from_error(misleading_404),
+            IsolationLevel::Hard
+        );
+
+        let wordless_403 = r#"request rejected (ErrorResponse { reason: "Forbidden", code: 403 })"#;
+        assert!(matches!(
+            infer_isolation_from_error(wordless_403),
+            IsolationLevel::Soft(_)
+        ));
+
+        let wordless_409 = r#"rejected (ErrorResponse { reason: "AlreadyExists", code: 409 })"#;
+        assert!(matches!(
+            infer_isolation_from_error(wordless_409),
+            IsolationLevel::Soft(_)
+        ));
+    }
+
+    #[test]
+    fn messages_without_a_code_still_classify_by_wording() {
+        // Pod Security Admission and quota rejections arrive as bare text, so
+        // the substring path has to stay. Removing it would send every one of
+        // them to the unclassified branch.
+        assert_eq!(status_code_in(FORBIDDEN_POD_SECURITY), None);
+        assert_eq!(status_code_in(FORBIDDEN_QUOTA), None);
+        for message in [FORBIDDEN_POD_SECURITY, FORBIDDEN_QUOTA] {
+            assert!(matches!(
+                infer_isolation_from_error(message),
+                IsolationLevel::Soft(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn the_code_parser_does_not_invent_one() {
+        assert_eq!(status_code_in("no code here"), None);
+        assert_eq!(status_code_in("code: notanumber"), None);
+        assert_eq!(status_code_in("code: 403 })"), Some(403));
+        // Several codes in one message: the last is the outermost wrapper,
+        // which is the response actually returned.
+        assert_eq!(
+            status_code_in("inner code: 404 outer code: 403 })"),
+            Some(403)
+        );
+    }
+
+    #[test]
+    fn authorization_errors_cover_the_forms_proxies_produce() {
+        // capsule-proxy answers a filtered request with BadRequest rather than
+        // Forbidden, and losing that mapping would make a proxy's refusal look
+        // like an unclassified error.
+        for message in [
+            FORBIDDEN_RBAC,
+            "Unauthorized",
+            "BadRequest: filtered",
+            "operation is not allowed",
+        ] {
+            assert!(is_authorization_error(message), "should match: {message}");
+        }
+        assert!(!is_authorization_error(NOT_FOUND));
+    }
 }
