@@ -1,9 +1,9 @@
 mod assessment;
 mod cluster;
+mod commands;
 mod external_crds;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -16,19 +16,10 @@ use kube::{api::ListParams, Api, Client};
 use serde::Deserialize;
 use tracing::Level;
 
-use crate::assessment::{
-    // New clean assessors
-    fairness_assessor::{
-        FairnessRunnerBuilder, QosClass, RateLimitStrategy as FairnessRateLimitStrategy,
-    },
-    // Legacy types for isolation assessment
-    AssessmentConfig,
+use crate::assessment::fairness_assessor::{
+    QosClass, RateLimitStrategy as FairnessRateLimitStrategy,
 };
-use crate::assessment::{
-    FairnessControlPlaneAssessor, FairnessControlPlaneConfig, FairnessNetworkAssessor,
-    FairnessNetworkConfig, FairnessStorageAssessor, FairnessStorageConfig, FairnessStorageScenario,
-    FairnessStorageVolume, FairnessWorkloadAssessor, FairnessWorkloadConfig, FairnessWorkloadNoise,
-};
+use crate::assessment::{FairnessStorageScenario, FairnessStorageVolume, FairnessWorkloadNoise};
 
 use crate::cluster::{HostClusterType, K3sCluster, PreExistingCluster};
 
@@ -45,11 +36,6 @@ mod defaults {
     pub const BASELINE_DURATION: u64 = 30;
     pub const TEST_DURATION: u64 = 60;
 
-    // FixedDelay, not Unlimited: under Unlimited the rate limiter is a no-op, so
-    // RATE below (and every per-subsystem rate) is silently ignored and the offered
-    // load becomes whatever the workers can push. That combination produced load
-    // figures that could not be reconciled with the configuration afterwards.
-    // Pass `--rate-strategy unlimited` explicitly to run without pacing.
     pub const RATE_STRATEGY: RateLimitStrategy = RateLimitStrategy::FixedDelay;
 
     pub const RATE: f64 = 10.0;
@@ -121,7 +107,7 @@ impl ClusterEnvironmentType {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum ChosenClusterProvider {
+pub enum ChosenClusterProvider {
     #[clap(name = "kind")]
     Kind,
     #[clap(name = "k3s")]
@@ -393,6 +379,94 @@ struct WorkloadConfigYaml {
 struct ExportConfigYaml {
     csv: Option<bool>,
     output_dir: Option<String>,
+}
+
+/// Arguments for `kumuteva verify`.
+#[derive(Debug, clap::Args)]
+pub struct VerifyArgs {
+    /// Path to tenant1 kubeconfig file (owner role) [required]
+    #[clap(value_name = "tenant1-kubeconfig")]
+    tenant1_kubeconfig_path: PathBuf,
+    /// Path to tenant2 kubeconfig file (attacker role) [required]
+    #[clap(value_name = "tenant2-kubeconfig")]
+    tenant2_kubeconfig_path: PathBuf,
+
+    #[clap(long = "tenant1-ns", default_value = "tenant1")]
+    tenant1_namespace: String,
+    #[clap(long = "tenant2-ns", default_value = "tenant2")]
+    tenant2_namespace: String,
+
+    /// Also write the report as JSON to this path.
+    ///
+    /// The printed table stays the default. This exists so the assessment
+    /// can be joined against other tools' output programmatically instead
+    /// of being transcribed by hand.
+    #[clap(long = "output-json", value_name = "PATH")]
+    output_json: Option<PathBuf>,
+
+    /// Write the full list of assessable properties to this path and exit.
+    ///
+    /// Needs no cluster. The kubectl-mtb mapping keys on the exact resource
+    /// and operation strings emitted here, and the paper's coverage count
+    /// is derived from them rather than counted by hand.
+    #[clap(long = "list-properties", value_name = "PATH")]
+    list_properties: Option<PathBuf>,
+
+    /// Multi-tenancy solution under test, recorded in the JSON report.
+    ///
+    /// Without it nothing in a result file says which solution produced it,
+    /// which is the provenance gap that left a published value untraceable.
+    #[clap(long = "solution-label", value_name = "NAME")]
+    solution_label: Option<String>,
+
+    /// Assess control plane isolation (exclusive if any system is specified)
+    #[clap(long = "control-plane", alias = "cp")]
+    control_plane: bool,
+    /// Assess storage isolation (exclusive if any system is specified)
+    #[clap(long = "storage", alias = "st")]
+    storage: bool,
+    /// Assess network isolation (exclusive if any system is specified)
+    #[clap(long = "network", alias = "net")]
+    network: bool,
+    /// Assess workload isolation (exclusive if any system is specified)
+    #[clap(long = "workload", alias = "wl")]
+    workload: bool,
+
+    #[clap(long, default_value = "false")]
+    verbose: bool,
+}
+
+/// Arguments for `kumuteva setup`.
+#[derive(Debug, clap::Args)]
+pub struct SetupArgs {
+    /// Use an existing cluster instead of creating a new one
+    /// Provide kubeconfig path for the existing cluster
+    #[clap(long = "existing-cluster", short = 'f')]
+    existing_cluster_kubeconfig: Option<PathBuf>,
+
+    /// Output directory for generated kubeconfig files
+    #[clap(long = "output", short = 'o')]
+    output_dir: Option<PathBuf>,
+
+    /// Name of the cluster to use or create.
+    #[clap(long)]
+    cluster_name: String,
+
+    /// Multitenancy solution for handling tenant clusters
+    #[clap(long = "type", short = 't', default_value = "vcluster")]
+    kind: ClusterEnvironmentType,
+
+    /// Host cluster provider to use for the underlying cluster
+    #[clap(long = "provider", short = 'p', default_value = "kind")]
+    provider: ChosenClusterProvider,
+    #[clap(flatten)]
+    tenant1: Tenant1SetupConfig,
+    #[clap(flatten)]
+    tenant2: Tenant2SetupConfig,
+
+    /// Enable verbose output
+    #[clap(long, default_value = "false")]
+    verbose: bool,
 }
 
 /// Layer 2: CLI Configuration
@@ -811,95 +885,15 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Setup test environment with two tenants given a cluster environment type
-    Setup {
-        /// Use an existing cluster instead of creating a new one
-        /// Provide kubeconfig path for the existing cluster
-        #[clap(long = "existing-cluster", short = 'f')]
-        existing_cluster_kubeconfig: Option<PathBuf>,
-
-        /// Output directory for generated kubeconfig files
-        #[clap(long = "output", short = 'o')]
-        output_dir: Option<PathBuf>,
-
-        /// Name of the cluster to use or create.
-        #[clap(long)]
-        cluster_name: String,
-
-        /// Multitenancy solution for handling tenant clusters
-        #[clap(long = "type", short = 't', default_value = "vcluster")]
-        kind: ClusterEnvironmentType,
-
-        /// Host cluster provider to use for the underlying cluster
-        #[clap(long = "provider", short = 'p', default_value = "kind")]
-        provider: ChosenClusterProvider,
-        #[clap(flatten)]
-        tenant1: Tenant1SetupConfig,
-        #[clap(flatten)]
-        tenant2: Tenant2SetupConfig,
-
-        /// Enable verbose output
-        #[clap(long, default_value = "false")]
-        verbose: bool,
-    },
+    Setup(SetupArgs),
     /// Verify isolation between two clusters
-    Verify {
-        /// Path to tenant1 kubeconfig file (owner role) [required]
-        #[clap(value_name = "tenant1-kubeconfig")]
-        tenant1_kubeconfig_path: PathBuf,
-        /// Path to tenant2 kubeconfig file (attacker role) [required]
-        #[clap(value_name = "tenant2-kubeconfig")]
-        tenant2_kubeconfig_path: PathBuf,
-
-        #[clap(long = "tenant1-ns", default_value = "tenant1")]
-        tenant1_namespace: String,
-        #[clap(long = "tenant2-ns", default_value = "tenant2")]
-        tenant2_namespace: String,
-
-        /// Also write the report as JSON to this path.
-        ///
-        /// The printed table stays the default. This exists so the assessment
-        /// can be joined against other tools' output programmatically instead
-        /// of being transcribed by hand.
-        #[clap(long = "output-json", value_name = "PATH")]
-        output_json: Option<PathBuf>,
-
-        /// Write the full list of assessable properties to this path and exit.
-        ///
-        /// Needs no cluster. The kubectl-mtb mapping keys on the exact resource
-        /// and operation strings emitted here, and the paper's coverage count
-        /// is derived from them rather than counted by hand.
-        #[clap(long = "list-properties", value_name = "PATH")]
-        list_properties: Option<PathBuf>,
-
-        /// Multi-tenancy solution under test, recorded in the JSON report.
-        ///
-        /// Without it nothing in a result file says which solution produced it,
-        /// which is the provenance gap that left a published value untraceable.
-        #[clap(long = "solution-label", value_name = "NAME")]
-        solution_label: Option<String>,
-
-        /// Assess control plane isolation (exclusive if any system is specified)
-        #[clap(long = "control-plane", alias = "cp")]
-        control_plane: bool,
-        /// Assess storage isolation (exclusive if any system is specified)
-        #[clap(long = "storage", alias = "st")]
-        storage: bool,
-        /// Assess network isolation (exclusive if any system is specified)
-        #[clap(long = "network", alias = "net")]
-        network: bool,
-        /// Assess workload isolation (exclusive if any system is specified)
-        #[clap(long = "workload", alias = "wl")]
-        workload: bool,
-
-        #[clap(long, default_value = "false")]
-        verbose: bool,
-    },
+    Verify(VerifyArgs),
     /// Run fairness assessment tests between two tenants
     Fairness(FairnessCliLayer),
 }
 
 #[derive(Debug, Parser)]
-struct Tenant1SetupConfig {
+pub struct Tenant1SetupConfig {
     #[clap(
         long = "tenant1",
         name = "tenant1",
@@ -919,7 +913,7 @@ struct Tenant1SetupConfig {
 }
 
 #[derive(Debug, Parser)]
-struct Tenant2SetupConfig {
+pub struct Tenant2SetupConfig {
     #[clap(
         long = "tenant2",
         name = "tenant2",
@@ -947,430 +941,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::Setup {
-            existing_cluster_kubeconfig,
-            output_dir,
-            cluster_name,
-            kind,
-            provider,
-            tenant1,
-            tenant2,
-            verbose,
-        } => {
-            setup_logging(verbose)?;
-            println!("Setting up test environment...");
-            // `--cluster-name` is used exactly as given. It previously had the
-            // solution appended, so `--cluster-name bench` silently became
-            // `bench-capsule`, and every later command that needs the real name
-            // — `kind delete cluster`, `docker update --cpuset-cpus`, reading
-            // back the kubeconfig — had to know about the rewrite to find it.
-            let solution = kind.as_str().to_string();
-            setup_test_environment(
-                existing_cluster_kubeconfig,
-                output_dir,
-                &cluster_name,
-                kind,
-                provider,
-                tenant1,
-                tenant2,
-            )
-            .await?;
-            println!("Test environment setup complete");
-            println!("  cluster:  {cluster_name}");
-            println!("  solution: {solution}");
-            println!(
-                "  pass `--solution-label {solution}` to `fairness` so the run manifest records it"
-            );
-        }
-        Commands::Verify {
-            verbose,
-            tenant1_kubeconfig_path,
-            tenant2_kubeconfig_path,
-            tenant1_namespace,
-            tenant2_namespace,
-            output_json,
-            list_properties,
-            solution_label,
-            control_plane,
-            storage,
-            network,
-            workload,
-        } => {
-            setup_logging(verbose)?;
-
-            // Before anything touches a cluster: this is an inventory of what
-            // the tool can assess, not a measurement of anything.
-            if let Some(path) = list_properties {
-                let inventory = assessment::report_json::PropertyInventoryJson::build();
-                let count = inventory.property_count;
-                std::fs::write(&path, serde_json::to_vec_pretty(&inventory)?)
-                    .with_context(|| format!("Failed to write property list to {:?}", path))?;
-                println!(
-                    "{} assessable properties written to {}",
-                    count,
-                    path.display()
-                );
-                return Ok(());
-            }
-
-            println!("Verifying cluster isolation...");
-            // Taken before the assessment so the timestamp reflects when the run
-            // started, not when it happened to finish.
-            let started_at_utc = assessment::fairness_assessor::format_unix_utc(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs(),
-            );
-            let assessment_config =
-                AssessmentConfig::from_flags(control_plane, storage, network, workload);
-            println!("Assessment config: {}", assessment_config);
-
-            let tenant1_config = Arc::new(TenantClusterConfig {
-                cluster: KubernetesClient::load_with_retry(&tenant1_kubeconfig_path, 5).await?,
-                namespace: tenant1_namespace,
-            });
-            let tenant2_config = Arc::new(TenantClusterConfig {
-                cluster: KubernetesClient::load_with_retry(&tenant2_kubeconfig_path, 5).await?,
-                namespace: tenant2_namespace,
-            });
-
-            let report =
-                assessment::assess_multitenancy(tenant1_config, tenant2_config, &assessment_config)
-                    .await
-                    .context("Failed to run multitenancy assessment")?;
-
-            println!("\nCluster isolation assessment report:");
-            if let Some(cp) = &report.control_plane {
-                println!("{}", cp);
-            }
-            if let Some(storage) = &report.storage {
-                println!("{}", storage);
-            }
-            if let Some(network) = &report.network {
-                println!("{}", network);
-            }
-            if let Some(workload) = &report.workload {
-                println!("{}", workload);
-            }
-            println!("{}", report);
-
-            if let Some(path) = output_json {
-                let document = assessment::report_json::VerifyReportJson::new(
-                    &report,
-                    solution_label,
-                    started_at_utc,
-                    assessment::fairness_assessor::git_commit_hash(),
-                );
-                std::fs::write(&path, serde_json::to_vec_pretty(&document)?)
-                    .with_context(|| format!("Failed to write JSON report to {:?}", path))?;
-                println!("\nJSON report written to {}", path.display());
-            }
-        }
-        Commands::Fairness(cli_args) => {
-            setup_logging(cli_args.verbose)?;
-            println!("Running fairness assessment...\n");
-
-            // Build Configuration (CLI > YAML > Defaults)
-            let config_path = cli_args.config_file.clone();
-
-            if let Some(ref path) = config_path {
-                println!("Loading configuration from: {}\n", path.display());
-            }
-
-            let t1_path = cli_args.tenant1_kubeconfig_path.clone();
-            let t2_path = cli_args.tenant2_kubeconfig_path.clone();
-            let t1_ns = cli_args.tenant1_namespace.clone();
-            let t2_ns = cli_args.tenant2_namespace.clone();
-
-            let config = FairnessConfigBuilder::new()
-                .with_yaml(config_path.as_ref())?
-                .with_cli(cli_args)
-                .build(); // No args passed here, logic is internal to build()
-
-            // Load tenant configurations
-            let tenant1_config = Arc::new(TenantClusterConfig {
-                cluster: KubernetesClient::load_with_retry(&t1_path, 5).await?,
-                namespace: t1_ns,
-            });
-            let tenant2_config = Arc::new(TenantClusterConfig {
-                cluster: KubernetesClient::load_with_retry(&t2_path, 5).await?,
-                namespace: t2_ns,
-            });
-
-            println!("Fairness Test Configuration:");
-            println!(
-                "  Baseline duration: {} seconds",
-                config.baseline_duration.as_secs()
-            );
-            println!(
-                "  Test duration: {} seconds",
-                config.test_duration.as_secs()
-            );
-            println!("  Rate strategy: {:?}", config.rate_strategy);
-            if !matches!(config.rate_strategy, RateLimitStrategy::Unlimited) {
-                println!("  Rate limit: {} req/s", config.rate_limit);
-            }
-            println!("  Rate multiplier: {}x", config.load_multiplier);
-            println!("  Pod multiplier: {}x", config.pod_multiplier);
-            println!();
-
-            let mut results = Vec::new();
-            let mut failed_subsystems: Vec<&str> = Vec::new();
-
-            // Helper to build a runner for a specific subsystem
-            let create_runner = |rate: f64| {
-                let mut builder = FairnessRunnerBuilder::new()
-                    .baseline_duration(config.baseline_duration)
-                    .test_duration(config.test_duration)
-                    .rate(rate)
-                    .strategy(config.rate_strategy.into())
-                    .malicious_multiplier(config.load_multiplier)
-                    .pod_multiplier(config.pod_multiplier);
-
-                if config.export_csv {
-                    builder = builder.export_csv(&config.output_dir);
-                }
-                builder
-                    .build()
-                    .with_solution_label(config.solution_label.clone())
-            };
-
-            // Control Plane
-            if config.run_cp {
-                println!("═══════════════════════════════════════════════════════════");
-                println!("Control Plane Fairness Assessment");
-                println!("  Workers: {}", config.cp_requesters);
-                if config.cp_rate != config.rate_limit {
-                    println!("  Rate limit: {} req/s (custom)", config.cp_rate);
-                }
-                println!("═══════════════════════════════════════════════════════════");
-
-                let cp_assessor = FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
-                    max_workers: config.cp_requesters,
-                });
-                let runner = create_runner(config.cp_rate);
-                match runner
-                    .run(&cp_assessor, tenant1_config.clone(), tenant2_config.clone())
-                    .await
-                {
-                    Ok(result) => results.push(("Control Plane", result)),
-                    Err(error) => {
-                        // One subsystem failing must not cancel the others. A
-                        // leftover PVC in storage previously aborted the whole
-                        // invocation, so the workload assessment never ran and
-                        // four repetitions produced no data for either.
-                        eprintln!("\n  ✗ Control Plane assessment failed: {error:#}");
-                        eprintln!("    continuing with the remaining subsystems");
-                        failed_subsystems.push("Control Plane");
-                    }
-                }
-            }
-
-            // Network
-            if config.run_network {
-                println!("\n═══════════════════════════════════════════════════════════");
-                println!("Network Fairness Assessment (TCP Ping)");
-                println!(
-                    "  Pod pairs: {}, Streams: {}, Pkt byte size: {}",
-                    config.net_pod_pairs, config.net_streams, config.net_packet_size
-                );
-                if config.net_rate != config.rate_limit {
-                    println!("  Rate limit: {} req/s (custom)", config.net_rate);
-                }
-                println!("═══════════════════════════════════════════════════════════");
-
-                let net_assessor = FairnessNetworkAssessor::new(FairnessNetworkConfig {
-                    pod_pairs: config.net_pod_pairs,
-                    streams: config.net_streams,
-                    packet_size: config.net_packet_size,
-                });
-                let runner = create_runner(config.net_rate);
-                match runner
-                    .run(
-                        &net_assessor,
-                        tenant1_config.clone(),
-                        tenant2_config.clone(),
-                    )
-                    .await
-                {
-                    Ok(result) => results.push(("Network", result)),
-                    Err(error) => {
-                        // One subsystem failing must not cancel the others. A
-                        // leftover PVC in storage previously aborted the whole
-                        // invocation, so the workload assessment never ran and
-                        // four repetitions produced no data for either.
-                        eprintln!("\n  ✗ Network assessment failed: {error:#}");
-                        eprintln!("    continuing with the remaining subsystems");
-                        failed_subsystems.push("Network");
-                    }
-                }
-            }
-
-            // Storage
-            if config.run_storage {
-                println!("\n═══════════════════════════════════════════════════════════");
-                println!("Storage Fairness Assessment");
-                println!(
-                    "  Pods: {}, Block: {}KB, File: {}MB, Scenario: {:?}, iodepth: {}",
-                    config.st_pods,
-                    config.st_block_size,
-                    config.st_file_size,
-                    config.st_scenario,
-                    config.st_iodepth
-                );
-                // Which path is under test decides what the number means, so it
-                // belongs in the log as well as the manifest.
-                println!(
-                    "  Volume: {:?}{}",
-                    config.st_volume,
-                    config
-                        .st_storage_class
-                        .as_deref()
-                        .map(|c| format!(" (storageClass {c})"))
-                        .unwrap_or_default()
-                );
-                if config.st_rate != config.rate_limit {
-                    println!("  Rate limit: {} req/s (custom)", config.st_rate);
-                }
-                println!("═══════════════════════════════════════════════════════════");
-
-                let st_assessor = FairnessStorageAssessor::new(FairnessStorageConfig {
-                    pods: config.st_pods,
-                    block_size_kb: config.st_block_size,
-                    file_size_mb: config.st_file_size,
-                    scenario: config.st_scenario.into(),
-                    iodepth: config.st_iodepth,
-                    volume: config.st_volume.into(),
-                    storage_class_name: config.st_storage_class.clone(),
-                    qos_class: config.probe_qos.into(),
-                    runtime_class_name: config.runtime_class.clone(),
-                });
-                let runner = create_runner(config.st_rate);
-                match runner
-                    .run(&st_assessor, tenant1_config.clone(), tenant2_config.clone())
-                    .await
-                {
-                    Ok(result) => results.push(("Storage", result)),
-                    Err(error) => {
-                        // One subsystem failing must not cancel the others. A
-                        // leftover PVC in storage previously aborted the whole
-                        // invocation, so the workload assessment never ran and
-                        // four repetitions produced no data for either.
-                        eprintln!("\n  ✗ Storage assessment failed: {error:#}");
-                        eprintln!("    continuing with the remaining subsystems");
-                        failed_subsystems.push("Storage");
-                    }
-                }
-            }
-
-            // Workload
-            if config.run_workload {
-                println!("\n═══════════════════════════════════════════════════════════");
-                println!("Workload (CPU) Fairness Assessment");
-                println!(
-                    "  Pods: {}, Threads: {}, Prime: {}",
-                    config.wl_pods, config.wl_threads, config.wl_max_prime
-                );
-                if config.wl_rate != config.rate_limit {
-                    println!("  Rate limit: {} req/s (custom)", config.wl_rate);
-                }
-                println!("═══════════════════════════════════════════════════════════");
-
-                let wl_assessor = FairnessWorkloadAssessor::new(FairnessWorkloadConfig {
-                    pods: config.wl_pods,
-                    threads: config.wl_threads,
-                    max_prime: config.wl_max_prime,
-                    intruder_noise: config.wl_noise.into(),
-                    probe_qos: config.probe_qos.into(),
-                    intruder_qos: config.intruder_qos.into(),
-                    runtime_class_name: config.runtime_class.clone(),
-                });
-                let runner = create_runner(config.wl_rate);
-                match runner
-                    .run(&wl_assessor, tenant1_config.clone(), tenant2_config.clone())
-                    .await
-                {
-                    Ok(result) => results.push(("Workload", result)),
-                    Err(error) => {
-                        // One subsystem failing must not cancel the others. A
-                        // leftover PVC in storage previously aborted the whole
-                        // invocation, so the workload assessment never ran and
-                        // four repetitions produced no data for either.
-                        eprintln!("\n  ✗ Workload assessment failed: {error:#}");
-                        eprintln!("    continuing with the remaining subsystems");
-                        failed_subsystems.push("Workload");
-                    }
-                }
-            }
-
-            // Summary
-            println!("\n═══════════════════════════════════════════════════════════");
-            println!("FAIRNESS ASSESSMENT SUMMARY");
-            println!("═══════════════════════════════════════════════════════════\n");
-
-            for (_, result) in &results {
-                println!("{}", result);
-            }
-
-            // State plainly which subsystems produced no data. Without this a
-            // partially failed run looks like a complete one in the summary, and
-            // the gap is only noticed later when the analysis finds no files.
-            if !failed_subsystems.is_empty() {
-                println!(
-                    "\n  ✗ no data from: {} — these subsystems failed and were skipped",
-                    failed_subsystems.join(", ")
-                );
-            }
-
-            if !results.is_empty() {
-                let avg_deg: f64 = results
-                    .iter()
-                    .map(|(_, r)| r.latency_degradation)
-                    .sum::<f64>()
-                    / results.len() as f64;
-                println!("\n───────────────────────────────────────────────────────────");
-                println!("Overall Average Latency Degradation: {:.2}x", avg_deg);
-
-                if let Some((worst_name, worst_res)) = results.iter().max_by(|a, b| {
-                    a.1.latency_degradation
-                        .partial_cmp(&b.1.latency_degradation)
-                        .unwrap()
-                }) {
-                    println!(
-                        "Worst Subsystem: {} ({:.2}x degradation, {})",
-                        worst_name,
-                        worst_res.latency_degradation,
-                        worst_res.fairness_level()
-                    );
-                }
-
-                // Throughput retention is reported separately from latency because a
-                // saturated system harms the victim on both axes at once, and a
-                // latency-only figure understates the harm.
-                let min_retention = results
-                    .iter()
-                    .map(|(_, r)| r.throughput_retention)
-                    .fold(f64::INFINITY, f64::min);
-                if min_retention.is_finite() {
-                    println!(
-                        "Lowest Regular-Tenant Throughput Retention: {:.1}%",
-                        min_retention * 100.0
-                    );
-                    if min_retention < 0.95 {
-                        println!(
-                            "  ⚠ at least one subsystem throttled the regular tenant below its"
-                        );
-                        println!(
-                            "    configured rate — degradation factors are lower bounds there"
-                        );
-                    }
-                }
-            }
-
-            if config.export_csv {
-                println!("\n📁 Results exported to: {}/", config.output_dir);
-            }
-        }
+        Commands::Setup(args) => commands::setup::run(args).await?,
+        Commands::Verify(args) => commands::verify::run(args).await?,
+        Commands::Fairness(cli_args) => commands::fairness::run(cli_args).await?,
     }
 
     Ok(())
@@ -1455,7 +1028,7 @@ async fn get_or_create_tenant_cluster(
     Ok(tenant_cluster)
 }
 
-async fn setup_test_environment(
+pub async fn setup_test_environment(
     existing_cluster_kubeconfig: Option<PathBuf>,
     output_dir: Option<PathBuf>,
     cluster_name: &str,

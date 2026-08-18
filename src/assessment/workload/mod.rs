@@ -7,6 +7,9 @@ use k8s_openapi::api::core::v1::Pod;
 use std::fmt::Display;
 use tracing::info;
 
+use crate::assessment::breach::{
+    run_breach_experiment, BreachCondition, BreachExperiment, Intruder, Secret,
+};
 use crate::assessment::probe::{HostAccess, ProbePod};
 use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
@@ -104,19 +107,19 @@ impl MultitenancyAssessor for WorkloadAssessor {
     ) -> anyhow::Result<CrossTenantResult> {
         match (resource, operation) {
             (WorkloadResource::ProcessNamespace, WorkloadOperation::ViewProcesses) => {
-                test_process_visibility_cross_tenant(tenant1, tenant2).await
+                run_breach_experiment(&process_namespace_experiment(), tenant1, tenant2).await
             }
             (WorkloadResource::NetworkNamespace, WorkloadOperation::CreateNetworkConn) => {
-                test_network_cross_tenant(tenant1, tenant2).await
+                run_breach_experiment(&network_namespace_experiment(), tenant1, tenant2).await
             }
             (WorkloadResource::UserNamespace, WorkloadOperation::AccessHostUser) => {
-                test_user_namespace_cross_tenant(tenant1, tenant2).await
+                run_breach_experiment(&user_namespace_experiment(), tenant1, tenant2).await
             }
             (WorkloadResource::IPCNamespace, WorkloadOperation::AccessIPC) => {
-                test_ipc_cross_tenant(tenant1, tenant2).await
+                run_breach_experiment(&ipc_namespace_experiment(), tenant1, tenant2).await
             }
             (WorkloadResource::PrivilegedSyscalls, WorkloadOperation::UsePrivilegedSyscalls) => {
-                test_privileged_syscalls_cross_tenant(tenant1, tenant2).await
+                run_breach_experiment(&privileged_syscalls_experiment(), tenant1, tenant2).await
             }
             _ => Ok(CrossTenantResult {
                 isolation: IsolationLevel::Unknown,
@@ -234,407 +237,70 @@ async fn test_host_user_authorization(tenant: &TenantClusterConfig) -> anyhow::R
 // CROSS-TENANT EFFECT TESTS
 // =============================================================================
 
-async fn test_process_visibility_cross_tenant(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // Create target pod in tenant2
-    let target_pod_name = "process-target";
-    let target_pod = create_target_process_pod(target_pod_name);
-
-    tenant2
-        .cluster
-        .create_pod_in_namespace(&target_pod, &tenant2.namespace)
-        .await?;
-
-    // Wait for target pod to be ready
-    tenant2
-        .cluster
-        .wait_for_pod_to_be_ready(target_pod_name, &tenant2.namespace)
-        .await?;
-
-    // Get the node where target pod is running
-    let target_pod_info = tenant2
-        .cluster
-        .get_pod_in_namespace(target_pod_name, &tenant2.namespace)
-        .await?;
-
-    let node_name = target_pod_info
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.node_name.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("Could not determine target pod node"))?;
-
-    // Create spy pod in tenant1 on the same node
-    let spy_pod_name = "process-spy";
-    let spy_pod = create_process_spy_pod(spy_pod_name, node_name, target_pod_name);
-
-    let spy_result = tenant1
-        .cluster
-        .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
-        .await;
-
-    let result = if spy_result.is_err() {
-        CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: false, // Cannot create hostPID pod
-            details: "Cannot create hostPID pod - processes isolated by policy".to_string(),
-        }
-    } else {
-        // Wait for spy pod to complete
-        tenant1
-            .cluster
-            .watch_pod_until_condition(spy_pod_name, &tenant1.namespace, |watch_event| async move {
-                match watch_event {
-                    kube::core::WatchEvent::Modified(pod) => {
-                        if let Some(status) = &pod.status {
-                            if let Some(phase) = &status.phase {
-                                return phase == "Succeeded" || phase == "Failed";
-                            }
-                        }
-                        false
-                    }
-                    _ => false,
-                }
-            })
-            .await
-            .unwrap_or(());
-
-        // Get logs to check if cross-tenant processes were visible
-        let logs = tenant1
-            .cluster
-            .get_pod_logs(spy_pod_name, &tenant1.namespace)
-            .await
-            .unwrap_or_default();
-
-        if logs.contains("TENANT2_PROCESS_FOUND") {
-            CrossTenantResult {
-                isolation: IsolationLevel::None,
-                autonomy: true,
-                details: "Cross-tenant process visibility detected - hostPID allows seeing other tenant's processes".to_string(),
-            }
-        } else {
-            CrossTenantResult {
-                isolation: IsolationLevel::Hard,
-                autonomy: true,
-                details: "No cross-tenant process visibility - processes properly isolated"
-                    .to_string(),
-            }
-        }
-    };
-
-    // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
-        .await;
-
-    Ok(result)
+/// tenant2 runs a process carrying a marker string; tenant1 joins the host PID
+/// namespace on the same node and looks for it. Seeing another tenant's
+/// processes is the breach.
+fn process_namespace_experiment() -> BreachExperiment {
+    BreachExperiment {
+        what: "host PID namespace",
+        target: create_target_process_pod("target-process"),
+        // The target loops printing this, so its presence proves the process
+        // the intruder is hunting actually exists.
+        target_service: None,
+        secret: Secret::ConfirmedBy("TENANT2_UNIQUE_MARKER".to_string()),
+        // PID namespaces are per-node.
+        intruder: Intruder::OnTargetNode(|node| {
+            create_process_spy_pod("spy-process", node, "target-process")
+        }),
+        // The intruder decides for itself and says so.
+        breach: BreachCondition::IntruderReports("TENANT2_PROCESS_FOUND"),
+    }
 }
 
-async fn test_network_cross_tenant(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // Create a target pod in tenant2 that listens on a specific port
-    let target_pod_name = "network-target";
-    let target_pod = create_network_target_pod(target_pod_name);
-
-    tenant2
-        .cluster
-        .create_pod_in_namespace(&target_pod, &tenant2.namespace)
-        .await?;
-
-    // Wait for target pod to be ready
-    tenant2
-        .cluster
-        .wait_for_pod_to_be_ready(target_pod_name, &tenant2.namespace)
-        .await?;
-
-    // Get the target pod's IP address
-    let target_pod_ip = tenant2
-        .cluster
-        .get_pod_ip(target_pod_name, &tenant2.namespace)
-        .await?;
-
-    // Create a network test pod in tenant1 with hostNetwork to test cross-tenant network access
-    let spy_pod_name = "network-spy";
-    let spy_pod = create_network_spy_pod(spy_pod_name, &target_pod_ip);
-
-    let spy_result = tenant1
-        .cluster
-        .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
-        .await;
-
-    let result = if spy_result.is_err() {
-        CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: false, // Cannot create hostNetwork pod
-            details: "Cannot create hostNetwork pod - network isolated by policy".to_string(),
-        }
-    } else {
-        // Wait for spy pod to complete
-        tenant1
-            .cluster
-            .watch_pod_until_condition(spy_pod_name, &tenant1.namespace, |watch_event| async move {
-                match watch_event {
-                    kube::core::WatchEvent::Modified(pod) => {
-                        if let Some(status) = &pod.status {
-                            if let Some(phase) = &status.phase {
-                                return phase == "Succeeded" || phase == "Failed";
-                            }
-                        }
-                        false
-                    }
-                    _ => false,
-                }
-            })
-            .await
-            .unwrap_or(());
-
-        // Get logs to check if cross-tenant network access was successful
-        let logs = tenant1
-            .cluster
-            .get_pod_logs(spy_pod_name, &tenant1.namespace)
-            .await
-            .unwrap_or_default();
-
-        if logs.contains("NETWORK_ACCESS_SUCCESS") {
-            CrossTenantResult {
-                isolation: IsolationLevel::None,
-                autonomy: true,
-                details: "Cross-tenant network access detected - hostNetwork bypass allows reaching other tenant's pods".to_string(),
-            }
-        } else {
-            CrossTenantResult {
-                isolation: IsolationLevel::Hard,
-                autonomy: true,
-                details: "No cross-tenant network access - network properly isolated".to_string(),
-            }
-        }
-    };
-
-    // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
-        .await;
-
-    Ok(result)
+/// tenant2 serves a page; tenant1 joins the host network namespace and tries to
+/// fetch it directly by pod IP.
+fn network_namespace_experiment() -> BreachExperiment {
+    BreachExperiment {
+        what: "host network namespace",
+        target: create_network_target_pod("network-target"),
+        target_service: None,
+        secret: Secret::ConfirmedBy("Starting network target server".to_string()),
+        // Needs the address rather than the node: the question is reachability.
+        intruder: Intruder::AtTargetAddress(|ip| create_network_spy_pod("network-spy", ip)),
+        breach: BreachCondition::IntruderReports("NETWORK_ACCESS_SUCCESS"),
+    }
 }
 
-async fn test_ipc_cross_tenant(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // Create IPC target pod in tenant2 that creates shared memory
-    let target_pod_name = "ipc-target";
-    let target_pod = create_ipc_target_pod(target_pod_name);
-
-    tenant2
-        .cluster
-        .create_pod_in_namespace(&target_pod, &tenant2.namespace)
-        .await?;
-
-    // Wait for target pod to be ready
-    tenant2
-        .cluster
-        .wait_for_pod_to_be_ready(target_pod_name, &tenant2.namespace)
-        .await?;
-
-    // Get the node where target pod is running
-    let target_pod_info = tenant2
-        .cluster
-        .get_pod_in_namespace(target_pod_name, &tenant2.namespace)
-        .await?;
-
-    let node_name = target_pod_info
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.node_name.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("Could not determine target pod node"))?;
-
-    // Create spy pod in tenant1 on the same node with hostIPC
-    let spy_pod_name = "ipc-spy";
-    let spy_pod = create_ipc_spy_pod(spy_pod_name, node_name);
-
-    let spy_result = tenant1
-        .cluster
-        .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
-        .await;
-
-    let result = if spy_result.is_err() {
-        CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: false, // Cannot create hostIPC pod
-            details: "Cannot create hostIPC pod - IPC isolated by policy".to_string(),
-        }
-    } else {
-        // Wait for spy pod to complete
-        tenant1
-            .cluster
-            .watch_pod_until_condition(spy_pod_name, &tenant1.namespace, |watch_event| async move {
-                match watch_event {
-                    kube::core::WatchEvent::Modified(pod) => {
-                        if let Some(status) = &pod.status {
-                            if let Some(phase) = &status.phase {
-                                return phase == "Succeeded" || phase == "Failed";
-                            }
-                        }
-                        false
-                    }
-                    _ => false,
-                }
-            })
-            .await
-            .unwrap_or(());
-
-        // Get logs to check if cross-tenant IPC resources were accessible
-        let spy_logs = tenant1
-            .cluster
-            .get_pod_logs(spy_pod_name, &tenant1.namespace)
-            .await
-            .unwrap_or_default();
-
-        let target_logs = tenant2
-            .cluster
-            .get_pod_logs(target_pod_name, &tenant2.namespace)
-            .await
-            .unwrap_or_default();
-
-        // Extract fingerprints from logs
-        let target_fingerprint = target_logs
-            .lines()
-            .find(|line| line.contains("Fingerprint:"))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("");
-
-        if spy_logs.contains(target_fingerprint) && !target_fingerprint.is_empty() {
-            CrossTenantResult {
-                isolation: IsolationLevel::None,
-                autonomy: true,
-                details: format!(
-                    "Cross-tenant IPC access detected - fingerprint {} visible to other tenant",
-                    target_fingerprint
-                ),
-            }
-        } else {
-            CrossTenantResult {
-                isolation: IsolationLevel::Hard,
-                autonomy: true,
-                details: "No cross-tenant IPC access - IPC properly isolated".to_string(),
-            }
-        }
-    };
-
-    // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
-        .await;
-
-    Ok(result)
+/// tenant1 reads its own UID map to see whether container root is host root.
+///
+/// The odd one out: there is nothing to plant. The "target" exists only so the
+/// experiment has a victim to name, and the intruder's own `/proc/self/uid_map`
+/// is the whole measurement — which is why the control here is only readiness.
+fn user_namespace_experiment() -> BreachExperiment {
+    BreachExperiment {
+        what: "host user namespace",
+        target: create_user_target_pod("user-target"),
+        target_service: None,
+        secret: Secret::ReadinessOnly,
+        intruder: Intruder::Anywhere(Box::new(create_user_spy_pod("user-spy"))),
+        breach: BreachCondition::IntruderReports("USER_NAMESPACE_BREACH"),
+    }
 }
 
-async fn test_user_namespace_cross_tenant(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // Create target pod in tenant2 with specific user
-    let target_pod_name = "user-target";
-    let target_pod = create_user_target_pod(target_pod_name);
-
-    tenant2
-        .cluster
-        .create_pod_in_namespace(&target_pod, &tenant2.namespace)
-        .await?;
-
-    tenant2
-        .cluster
-        .wait_for_pod_to_be_ready(target_pod_name, &tenant2.namespace)
-        .await?;
-
-    // Create spy pod in tenant1 with hostUser to test cross-tenant user access
-    let spy_pod_name = "user-spy";
-    let spy_pod = create_user_spy_pod(spy_pod_name);
-
-    let spy_result = tenant1
-        .cluster
-        .create_pod_in_namespace(&spy_pod, &tenant1.namespace)
-        .await;
-
-    let result = if spy_result.is_err() {
-        CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: false, // Cannot create hostUser pod
-            details: "Cannot create hostUser pod - user namespace isolated by policy".to_string(),
-        }
-    } else {
-        // Wait for spy pod to complete and analyze results
-        tenant1
-            .cluster
-            .watch_pod_until_condition(spy_pod_name, &tenant1.namespace, |watch_event| async move {
-                match watch_event {
-                    kube::core::WatchEvent::Modified(pod) => {
-                        if let Some(status) = &pod.status {
-                            if let Some(phase) = &status.phase {
-                                return phase == "Succeeded" || phase == "Failed";
-                            }
-                        }
-                        false
-                    }
-                    _ => false,
-                }
-            })
-            .await
-            .unwrap_or(());
-
-        let logs = tenant1
-            .cluster
-            .get_pod_logs(spy_pod_name, &tenant1.namespace)
-            .await
-            .unwrap_or_default();
-
-        if logs.contains("USER_NAMESPACE_BREACH") {
-            CrossTenantResult {
-                isolation: IsolationLevel::None,
-                autonomy: true,
-                details: "Cross-tenant user namespace access detected - host user namespace shared"
-                    .to_string(),
-            }
-        } else {
-            CrossTenantResult {
-                isolation: IsolationLevel::Hard,
-                autonomy: true,
-                details: "No cross-tenant user namespace access - user namespace properly isolated"
-                    .to_string(),
-            }
-        }
-    };
-
-    // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_pod_in_namespace(spy_pod_name, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
-        .await;
-
-    Ok(result)
+/// tenant2 creates System V IPC objects in the host IPC namespace and prints a
+/// fingerprint of them; tenant1 joins the same namespace and fingerprints what
+/// it can see. Matching fingerprints mean one shared namespace.
+fn ipc_namespace_experiment() -> BreachExperiment {
+    BreachExperiment {
+        what: "host IPC namespace",
+        target: create_ipc_target_pod("ipc-target"),
+        target_service: None,
+        secret: Secret::Published("Fingerprint:"),
+        // IPC namespaces do not span machines, so an intruder scheduled
+        // elsewhere would fingerprint an unrelated node and see nothing.
+        intruder: Intruder::OnTargetNode(|node| create_ipc_spy_pod("ipc-spy", node)),
+        breach: BreachCondition::IntruderRepeatsSecret,
+    }
 }
 
 /// What the escape pod's kernel-module attempt actually did.
@@ -739,145 +405,65 @@ fn privileged_verdict(
     }
 }
 
-async fn test_privileged_syscalls_cross_tenant(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    info!("Testing privileged syscalls cross-tenant isolation'");
+/// tenant1 gets a privileged container and tries to reach tenant2's processes
+/// through the kernel — eBPF first, then a hand-built kernel module.
+///
+/// The one experiment whose verdict is not binary, because the ways it can fail
+/// mean different things: denied EPERM is the platform stopping it (`Soft`),
+/// a module that loads but sees nobody means a separate kernel (`Hard`), and a
+/// toolchain that never built means we learned nothing (`Unknown`). See
+/// `BreachCondition::Decided`.
+fn privileged_syscalls_experiment() -> BreachExperiment {
+    BreachExperiment {
+        what: "privileged syscalls",
+        target: create_non_privileged_target_pod("tenant2-target"),
+        // The target reports the host kernel it shares; without that line the
+        // escape pod cannot pick a matching build image, so its absence means
+        // the experiment cannot run.
+        target_service: None,
+        secret: Secret::ConfirmedBy("UNAME_R=".to_string()),
+        intruder: Intruder::FromTarget(|target| {
+            // A container shares the host kernel but not its distribution, so
+            // the only way to learn which headers to install is to ask a pod
+            // already running on it.
+            let distro = detect_host_distro(
+                &extract_log_value(&target.logs, "PROC_VERSION="),
+                &extract_log_value(&target.logs, "UNAME_R="),
+            );
+            create_privileged_escape_pod("kernel-escape", &target.node, distro)
+        }),
+        breach: BreachCondition::Decided(classify_privileged_escape),
+    }
+}
 
-    // Create target pod in tenant2 with sensitive data (NON-PRIVILEGED)
-    let target_pod_name = "privileged-target";
-    let target_pod = create_non_privileged_target_pod(target_pod_name);
+/// Turn the escape pod's markers into one of four verdicts.
+///
+/// The capability line is the backbone: a pod that never printed one did not
+/// really run, which is a tooling failure rather than stripped capabilities,
+/// and must not be read as isolation.
+fn classify_privileged_escape(escape_logs: &str) -> CrossTenantResult {
+    let caps_reported = escape_logs.contains("CAPS_FULL") || escape_logs.contains("CAPS_DROPPED");
+    let caps_full = !caps_reported || escape_logs.contains("CAPS_FULL");
 
-    tenant2
-        .cluster
-        .create_pod_in_namespace(&target_pod, &tenant2.namespace)
-        .await?;
-
-    // Wait for target pod to be ready
-    tenant2
-        .cluster
-        .wait_for_pod_to_be_ready(target_pod_name, &tenant2.namespace)
-        .await?;
-
-    // Get the node where target pod is running
-    let target_pod_info = tenant2
-        .cluster
-        .get_pod_in_namespace(target_pod_name, &tenant2.namespace)
-        .await?;
-
-    let node_name = target_pod_info
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.node_name.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("Could not determine target pod node"))?;
-
-    info!(
-        "Target pod '{}' with sensitive data is running on node '{}'",
-        target_pod_name, node_name
-    );
-
-    // Read the host kernel identity the target printed, and pick a matching
-    // image for the escape pod so its package manager can install a buildable
-    // kernel tree for the exact running kernel.
-    let target_logs = tenant2
-        .cluster
-        .get_pod_logs(target_pod_name, &tenant2.namespace)
-        .await
-        .unwrap_or_default();
-    let proc_version = extract_log_value(&target_logs, "PROC_VERSION=");
-    let uname_r = extract_log_value(&target_logs, "UNAME_R=");
-    let distro = detect_host_distro(&proc_version, &uname_r);
-    info!("Detected host distro {:?} (uname {})", distro, uname_r);
-
-    // Create escape pod in tenant1 on the same node with ONLY privileged flag
-    let escape_pod_name = "privileged-escape";
-    let escape_pod = create_privileged_escape_pod(escape_pod_name, node_name, distro);
-
-    info!(
-        "Malicious escape pod '{}' created on the same node as target pod in tenant",
-        escape_pod_name
-    );
-
-    let escape_result = tenant1
-        .cluster
-        .create_pod_in_namespace(&escape_pod, &tenant1.namespace)
-        .await;
-
-    let result = if escape_result.is_err() {
-        // The platform would not even create a privileged pod.
-        privileged_verdict(true, false, PrivilegedBreach::ToolingFailed, true)
+    let breach = if !caps_reported {
+        PrivilegedBreach::ToolingFailed
+    } else if escape_logs.contains("TENANT2_PROCESS_FOUND") {
+        PrivilegedBreach::SawOtherTenant
+    } else if escape_logs.contains("MODULE_SIG_REQUIRED") {
+        PrivilegedBreach::SignatureRequired
+    } else if escape_logs.contains("MODULE_DENIED_EPERM") {
+        PrivilegedBreach::DeniedEperm
+    } else if escape_logs.contains("MODULE_LOADED") {
+        PrivilegedBreach::LoadedOwnOnly
     } else {
-        // Wait for escape pod to complete
-        tenant1
-            .cluster
-            .watch_pod_until_condition(
-                escape_pod_name,
-                &tenant1.namespace,
-                |watch_event| async move {
-                    match watch_event {
-                        kube::core::WatchEvent::Modified(pod) => {
-                            if let Some(status) = &pod.status {
-                                if let Some(phase) = &status.phase {
-                                    return phase == "Succeeded" || phase == "Failed";
-                                }
-                            }
-                            false
-                        }
-                        _ => false,
-                    }
-                },
-            )
-            .await
-            .unwrap_or(());
-
-        let escape_logs = tenant1
-            .cluster
-            .get_pod_logs(escape_pod_name, &tenant1.namespace)
-            .await
-            .unwrap_or_default();
-
-        // The capability line is the backbone: if the pod never printed one it
-        // did not really run, and that is a tooling failure, not stripped caps.
-        let caps_reported =
-            escape_logs.contains("CAPS_FULL") || escape_logs.contains("CAPS_DROPPED");
-        let caps_full = !caps_reported || escape_logs.contains("CAPS_FULL");
-
-        let breach = if !caps_reported {
-            PrivilegedBreach::ToolingFailed
-        } else if escape_logs.contains("TENANT2_PROCESS_FOUND") {
-            PrivilegedBreach::SawOtherTenant
-        } else if escape_logs.contains("MODULE_SIG_REQUIRED") {
-            PrivilegedBreach::SignatureRequired
-        } else if escape_logs.contains("MODULE_DENIED_EPERM") {
-            PrivilegedBreach::DeniedEperm
-        } else if escape_logs.contains("MODULE_LOADED") {
-            PrivilegedBreach::LoadedOwnOnly
-        } else {
-            // BUILD_FAILED, HEADERS_UNAVAILABLE, MODULE_LOAD_FAILED_TOOLING.
-            PrivilegedBreach::ToolingFailed
-        };
-
-        info!(
-            "Privileged escape: caps_full={}, breach={:?}",
-            caps_full, breach
-        );
-
-        // The target pod was waited on above (via `?`), so it is running.
-        privileged_verdict(false, caps_full, breach, true)
+        // BUILD_FAILED, HEADERS_UNAVAILABLE, MODULE_LOAD_FAILED_TOOLING.
+        PrivilegedBreach::ToolingFailed
     };
 
-    // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_pod_in_namespace(escape_pod_name, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_pod_in_namespace(target_pod_name, &tenant2.namespace)
-        .await;
+    info!("Privileged escape: caps_full={caps_full}, breach={breach:?}");
 
-    Ok(result)
+    // The executor only reaches here once the target is confirmed running.
+    privileged_verdict(false, caps_full, breach, true)
 }
 
 // =============================================================================

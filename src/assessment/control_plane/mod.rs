@@ -42,6 +42,17 @@ pub struct ResourceAssessment<R: AssessableResource> {
 }
 
 /// Autonomy category for control plane resources
+/// The domain name for a Kubernetes object in the control-plane assessment.
+///
+/// The same type as [`KubernetesObject`], not a parallel enum with a
+/// hand-written translation between them. It used to be exactly that: 28
+/// duplicated variants, a 28-arm `to_kubernetes_object()`, a 25-arm
+/// `autonomy_category()` and a 28-entry `all()`, all kept in agreement by hand.
+/// A resource missing from any one of them compiled and was then silently never
+/// assessed. All of it is now generated from the single list in
+/// `define_kubernetes_objects!`.
+pub use crate::assessment::KubernetesObject as ControlPlaneResource;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlPlaneAutonomyCategory {
     /// Workload resources (Pods, Deployments, Jobs, etc.) - resources running inside namespace
@@ -55,133 +66,6 @@ pub enum ControlPlaneAutonomyCategory {
 }
 
 /// Control plane resources map to Kubernetes object kinds
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ControlPlaneResource {
-    // Core API (v1)
-    Pod,
-    Service,
-    ConfigMap,
-    Secret,
-    PersistentVolume,
-    PersistentVolumeClaim,
-    Namespace,
-    ServiceAccount,
-    Endpoints,
-    LimitRange,
-    ResourceQuota,
-    Node,
-
-    // Apps API (apps/v1)
-    Deployment,
-    ReplicaSet,
-    StatefulSet,
-    DaemonSet,
-
-    // Batch API (batch/v1)
-    Job,
-    CronJob,
-
-    // Networking API (networking.k8s.io/v1)
-    NetworkPolicy,
-    Ingress,
-    IngressClass,
-
-    // RBAC API (rbac.authorization.k8s.io/v1)
-    Role,
-    RoleBinding,
-    ClusterRole,
-    ClusterRoleBinding,
-
-    // Policy API (policy/v1)
-    PodDisruptionBudget,
-
-    // Autoscaling API (autoscaling/v2)
-    HorizontalPodAutoscaler,
-
-    // Storage API (storage.k8s.io/v1)
-    StorageClass,
-}
-
-impl ControlPlaneResource {
-    /// Returns the autonomy category for this resource
-    pub fn autonomy_category(&self) -> ControlPlaneAutonomyCategory {
-        match self {
-            // Workload resources - run inside namespace
-            Self::Pod
-            | Self::Deployment
-            | Self::ReplicaSet
-            | Self::StatefulSet
-            | Self::Job
-            | Self::CronJob
-            | Self::Service
-            | Self::ConfigMap
-            | Self::Secret
-            | Self::ServiceAccount
-            | Self::Endpoints
-            | Self::NetworkPolicy
-            | Self::Ingress
-            | Self::Role
-            | Self::RoleBinding
-            | Self::PodDisruptionBudget
-            | Self::HorizontalPodAutoscaler
-            | Self::PersistentVolumeClaim => ControlPlaneAutonomyCategory::Workload,
-
-            // Scope resources - namespace-level configuration
-            Self::Namespace | Self::LimitRange | Self::ResourceQuota => {
-                ControlPlaneAutonomyCategory::Scope
-            }
-
-            // Infrastructure resources - node-level
-            Self::Node | Self::DaemonSet => ControlPlaneAutonomyCategory::Infrastructure,
-
-            // Cluster-wide resources
-            Self::PersistentVolume
-            | Self::IngressClass
-            | Self::ClusterRole
-            | Self::ClusterRoleBinding
-            | Self::StorageClass => ControlPlaneAutonomyCategory::Cluster,
-        }
-    }
-
-    /// Convert to the existing KubernetesObject for reusing existing logic
-    pub fn to_kubernetes_object(&self) -> KubernetesObject {
-        match self {
-            Self::Pod => KubernetesObject::Pod,
-            Self::Service => KubernetesObject::Service,
-            Self::ConfigMap => KubernetesObject::ConfigMap,
-            Self::Secret => KubernetesObject::Secret,
-            Self::PersistentVolume => KubernetesObject::PersistentVolume,
-            Self::PersistentVolumeClaim => KubernetesObject::PersistentVolumeClaim,
-            Self::Namespace => KubernetesObject::Namespace,
-            Self::ServiceAccount => KubernetesObject::ServiceAccount,
-            Self::Endpoints => KubernetesObject::Endpoints,
-            Self::LimitRange => KubernetesObject::LimitRange,
-            Self::ResourceQuota => KubernetesObject::ResourceQuota,
-            Self::Node => KubernetesObject::Node,
-            Self::Deployment => KubernetesObject::Deployment,
-            Self::ReplicaSet => KubernetesObject::ReplicaSet,
-            Self::StatefulSet => KubernetesObject::StatefulSet,
-            Self::DaemonSet => KubernetesObject::DaemonSet,
-            Self::Job => KubernetesObject::Job,
-            Self::CronJob => KubernetesObject::CronJob,
-            Self::NetworkPolicy => KubernetesObject::NetworkPolicy,
-            Self::Ingress => KubernetesObject::Ingress,
-            Self::IngressClass => KubernetesObject::IngressClass,
-            Self::Role => KubernetesObject::Role,
-            Self::RoleBinding => KubernetesObject::RoleBinding,
-            Self::ClusterRole => KubernetesObject::ClusterRole,
-            Self::ClusterRoleBinding => KubernetesObject::ClusterRoleBinding,
-            Self::PodDisruptionBudget => KubernetesObject::PodDisruptionBudget,
-            Self::HorizontalPodAutoscaler => KubernetesObject::HorizontalPodAutoscaler,
-            Self::StorageClass => KubernetesObject::StorageClass,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn is_namespaced(&self) -> bool {
-        self.to_kubernetes_object().is_namespaced()
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ControlPlaneOperation {
@@ -272,17 +156,15 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
         resource: &ControlPlaneResource,
         operation: &ControlPlaneOperation,
     ) -> anyhow::Result<bool> {
-        let k8s_obj = resource.to_kubernetes_object();
-
         // Actually try the operation instead of using is_authorized_to
         // This is necessary because some proxies (like Capsule) may allow operations
         // even when is_authorized_to returns false
         match operation {
-            ControlPlaneOperation::Create => test_autonomy_create(tenant, &k8s_obj).await,
-            ControlPlaneOperation::Get => test_autonomy_get(tenant, &k8s_obj).await,
-            ControlPlaneOperation::List => test_autonomy_list(tenant, &k8s_obj).await,
-            ControlPlaneOperation::Update => test_autonomy_update(tenant, &k8s_obj).await,
-            ControlPlaneOperation::Delete => test_autonomy_delete(tenant, &k8s_obj).await,
+            ControlPlaneOperation::Create => test_autonomy_create(tenant, resource).await,
+            ControlPlaneOperation::Get => test_autonomy_get(tenant, resource).await,
+            ControlPlaneOperation::List => test_autonomy_list(tenant, resource).await,
+            ControlPlaneOperation::Update => test_autonomy_update(tenant, resource).await,
+            ControlPlaneOperation::Delete => test_autonomy_delete(tenant, resource).await,
         }
     }
 
@@ -293,19 +175,17 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
         resource: &ControlPlaneResource,
         operation: &ControlPlaneOperation,
     ) -> anyhow::Result<CrossTenantResult> {
-        let k8s_obj = resource.to_kubernetes_object();
-
         match operation {
             ControlPlaneOperation::Create => {
-                test_cross_tenant_create(tenant1, tenant2, &k8s_obj).await
+                test_cross_tenant_create(tenant1, tenant2, resource).await
             }
             ControlPlaneOperation::Update => {
-                test_cross_tenant_update(tenant1, tenant2, &k8s_obj).await
+                test_cross_tenant_update(tenant1, tenant2, resource).await
             }
-            ControlPlaneOperation::Get => test_cross_tenant_get(tenant1, tenant2, &k8s_obj).await,
-            ControlPlaneOperation::List => test_cross_tenant_list(tenant1, tenant2, &k8s_obj).await,
+            ControlPlaneOperation::Get => test_cross_tenant_get(tenant1, tenant2, resource).await,
+            ControlPlaneOperation::List => test_cross_tenant_list(tenant1, tenant2, resource).await,
             ControlPlaneOperation::Delete => {
-                test_cross_tenant_delete(tenant1, tenant2, &k8s_obj).await
+                test_cross_tenant_delete(tenant1, tenant2, resource).await
             }
         }
     }
@@ -602,13 +482,6 @@ impl Display for IsolationLevel {
     }
 }
 
-impl Display for ControlPlaneResource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let k8s_obj = self.to_kubernetes_object();
-        write!(f, "{}/{}", k8s_obj.api_version(), k8s_obj.kind())
-    }
-}
-
 impl Display for ControlPlaneOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -644,16 +517,14 @@ pub async fn manual_test_cross_tenant_operation(
     operation: &ControlPlaneOperation,
     cleanup: bool,
 ) -> anyhow::Result<()> {
-    let k8s_obj = resource.to_kubernetes_object();
-
     println!("=======================================================");
     println!("MANUAL CROSS-TENANT TEST");
     println!("=======================================================");
-    println!("Resource: {} ({})", k8s_obj.kind(), k8s_obj.api_version());
+    println!("Resource: {} ({})", resource.kind(), resource.api_version());
     println!("Operation: {:?}", operation);
     println!("Tenant1 namespace: {}", tenant1.namespace);
     println!("Tenant2 namespace: {}", tenant2.namespace);
-    println!("Is namespaced: {}", k8s_obj.is_namespaced());
+    println!("Is namespaced: {}", resource.is_namespaced());
     println!("Cleanup: {}", cleanup);
     println!("-------------------------------------------------------");
 
@@ -662,14 +533,14 @@ pub async fn manual_test_cross_tenant_operation(
         uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
     );
 
-    let namespace = get_namespace_param(&k8s_obj, &tenant1.namespace);
+    let namespace = get_namespace_param(resource, &tenant1.namespace);
 
     println!("\n[STEP 1] Creating test object as Tenant1...");
     println!("  Object name: {}", test_name);
     println!("  Namespace: {:?}", namespace);
 
     // Create minimal object
-    let obj = match create_minimal_object(&k8s_obj, &test_name, &tenant1.namespace) {
+    let obj = match create_minimal_object(resource, &test_name, &tenant1.namespace) {
         Ok(o) => o,
         Err(e) => {
             println!("  ERROR creating minimal object spec: {}", e);
@@ -677,11 +548,11 @@ pub async fn manual_test_cross_tenant_operation(
         }
     };
 
-    let dynamic_obj = create_dynamic_object(&k8s_obj, &test_name, obj.clone(), "tenant1");
+    let dynamic_obj = create_dynamic_object(resource, &test_name, obj.clone(), "tenant1");
 
     let create_result = tenant1
         .cluster
-        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+        .create_resource_dyn(resource, &dynamic_obj, namespace)
         .await;
 
     match &create_result {
@@ -700,10 +571,10 @@ pub async fn manual_test_cross_tenant_operation(
     match operation {
         ControlPlaneOperation::Create => {
             println!("  Tenant2 trying to CREATE with same name in tenant1's namespace...");
-            let t2_obj = create_dynamic_object(&k8s_obj, &test_name, obj, "tenant2");
+            let t2_obj = create_dynamic_object(resource, &test_name, obj, "tenant2");
             let result = tenant2
                 .cluster
-                .create_resource_dyn(&k8s_obj, &t2_obj, namespace)
+                .create_resource_dyn(resource, &t2_obj, namespace)
                 .await;
             print_operation_result("CREATE", &result);
         }
@@ -711,7 +582,7 @@ pub async fn manual_test_cross_tenant_operation(
             println!("  Tenant2 trying to GET tenant1's object...");
             let result = tenant2
                 .cluster
-                .get_resource_dyn(&k8s_obj, &test_name, namespace)
+                .get_resource_dyn(resource, &test_name, namespace)
                 .await;
 
             match &result {
@@ -745,7 +616,7 @@ pub async fn manual_test_cross_tenant_operation(
             println!("  Tenant2 trying to LIST in tenant1's namespace...");
             let result = tenant2
                 .cluster
-                .list_resources_dyn(&k8s_obj, namespace)
+                .list_resources_dyn(resource, namespace)
                 .await;
 
             match &result {
@@ -784,7 +655,7 @@ pub async fn manual_test_cross_tenant_operation(
             }));
             let result = tenant2
                 .cluster
-                .patch_resource_dyn(&k8s_obj, &test_name, &patch, namespace)
+                .patch_resource_dyn(resource, &test_name, &patch, namespace)
                 .await;
             print_operation_result("UPDATE", &result);
 
@@ -793,7 +664,7 @@ pub async fn manual_test_cross_tenant_operation(
                 println!("  [VERIFICATION] Checking if update was applied...");
                 let verify = tenant1
                     .cluster
-                    .get_resource_dyn(&k8s_obj, &test_name, namespace)
+                    .get_resource_dyn(resource, &test_name, namespace)
                     .await;
                 if let Ok(obj) = verify {
                     let has_malicious_label = obj
@@ -816,7 +687,7 @@ pub async fn manual_test_cross_tenant_operation(
             println!("  Tenant2 trying to DELETE tenant1's object...");
             let result = tenant2
                 .cluster
-                .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                .delete_resource_dyn(resource, &test_name, namespace)
                 .await;
             print_operation_result("DELETE", &result);
 
@@ -826,7 +697,7 @@ pub async fn manual_test_cross_tenant_operation(
                 sleep(Duration::from_millis(500)).await;
                 let verify = tenant1
                     .cluster
-                    .get_resource_dyn(&k8s_obj, &test_name, namespace)
+                    .get_resource_dyn(resource, &test_name, namespace)
                     .await;
                 match verify {
                     Ok(_) => println!("    Object still exists (delete might have been blocked)"),
@@ -844,7 +715,7 @@ pub async fn manual_test_cross_tenant_operation(
     println!("-------------------------------------------------------");
 
     let kubectl_ns = namespace.map(|n| format!("-n {}", n)).unwrap_or_default();
-    let resource_kind = k8s_obj.kind().to_lowercase();
+    let resource_kind = resource.kind().to_lowercase();
 
     println!("# As Tenant1:");
     println!(
@@ -859,7 +730,7 @@ pub async fn manual_test_cross_tenant_operation(
     );
     println!();
 
-    if !k8s_obj.is_namespaced() {
+    if !resource.is_namespaced() {
         println!("# NOTE: This is a cluster-scoped resource (no namespace)");
         println!("  kubectl get {} {} -o yaml", resource_kind, test_name);
     }
@@ -868,14 +739,14 @@ pub async fn manual_test_cross_tenant_operation(
         println!("\n[CLEANUP] Deleting test object...");
         let del_result = tenant1
             .cluster
-            .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+            .delete_resource_dyn(resource, &test_name, namespace)
             .await;
         match del_result {
             Ok(_) => println!("  Cleanup successful"),
             Err(e) => println!("  Cleanup failed: {}", e),
         }
         // Also cleanup PVC for StatefulSets
-        if k8s_obj.kind() == "StatefulSet" {
+        if resource.kind() == "StatefulSet" {
             if let Some(ns) = namespace {
                 let pvc_name = format!("{}-{}-0", test_name, test_name);
                 let _delete_operation = tenant1
@@ -886,7 +757,7 @@ pub async fn manual_test_cross_tenant_operation(
         }
     } else {
         println!("\n[NO CLEANUP] Test object left in place for manual inspection:");
-        println!("  Resource: {}", k8s_obj.kind());
+        println!("  Resource: {}", resource.kind());
         println!("  Name: {}", test_name);
         println!("  Namespace: {:?}", namespace);
         println!("\nTo cleanup manually:");
@@ -947,23 +818,21 @@ pub async fn manual_test_autonomy(
     operation: &ControlPlaneOperation,
     cleanup: bool,
 ) -> anyhow::Result<()> {
-    let k8s_obj = resource.to_kubernetes_object();
-
     println!("=======================================================");
     println!("MANUAL AUTONOMY TEST");
     println!("=======================================================");
-    println!("Resource: {} ({})", k8s_obj.kind(), k8s_obj.api_version());
+    println!("Resource: {} ({})", resource.kind(), resource.api_version());
     println!("Operation: {:?}", operation);
     println!("Tenant namespace: {}", tenant.namespace);
-    println!("Is namespaced: {}", k8s_obj.is_namespaced());
+    println!("Is namespaced: {}", resource.is_namespaced());
     println!("-------------------------------------------------------");
 
-    let namespace = get_namespace_param(&k8s_obj, &tenant.namespace);
+    let namespace = get_namespace_param(resource, &tenant.namespace);
 
     match operation {
         ControlPlaneOperation::List => {
             println!("\n[TEST] Attempting LIST...");
-            let result = tenant.cluster.list_resources_dyn(&k8s_obj, namespace).await;
+            let result = tenant.cluster.list_resources_dyn(resource, namespace).await;
 
             match &result {
                 Ok(list) => {
@@ -992,25 +861,25 @@ pub async fn manual_test_autonomy(
             println!("\n[SETUP] Creating test object...");
             println!("  Name: {}", test_name);
 
-            let obj = create_minimal_object(&k8s_obj, &test_name, &tenant.namespace)?;
-            let dynamic_obj = create_dynamic_object(&k8s_obj, &test_name, obj, "autonomy-test");
+            let obj = create_minimal_object(resource, &test_name, &tenant.namespace)?;
+            let dynamic_obj = create_dynamic_object(resource, &test_name, obj, "autonomy-test");
 
             match operation {
                 ControlPlaneOperation::Create => {
                     println!("\n[TEST] Attempting CREATE...");
                     let result = tenant
                         .cluster
-                        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+                        .create_resource_dyn(resource, &dynamic_obj, namespace)
                         .await;
                     print_operation_result("CREATE", &result);
 
                     if result.is_ok() && cleanup {
                         let _ = tenant
                             .cluster
-                            .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                            .delete_resource_dyn(resource, &test_name, namespace)
                             .await;
                         // Also cleanup PVC for StatefulSets
-                        if k8s_obj.kind() == "StatefulSet" {
+                        if resource.kind() == "StatefulSet" {
                             if let Some(ns) = namespace {
                                 let pvc_name = format!("{}-{}-0", test_name, test_name);
                                 let pvc_api: Api<PersistentVolumeClaim> =
@@ -1024,19 +893,19 @@ pub async fn manual_test_autonomy(
                     // First create, then GET
                     let create_result = tenant
                         .cluster
-                        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+                        .create_resource_dyn(resource, &dynamic_obj, namespace)
                         .await;
 
                     if create_result.is_err() {
                         println!("  Cannot create test object, trying to GET existing...");
-                        let list = tenant.cluster.list_resources_dyn(&k8s_obj, namespace).await;
+                        let list = tenant.cluster.list_resources_dyn(resource, namespace).await;
                         if let Ok(l) = list {
                             if let Some(item) = l.items.first() {
                                 if let Some(name) = &item.metadata.name {
                                     println!("\n[TEST] Attempting GET on existing '{}'...", name);
                                     let result = tenant
                                         .cluster
-                                        .get_resource_dyn(&k8s_obj, name, namespace)
+                                        .get_resource_dyn(resource, name, namespace)
                                         .await;
                                     print_operation_result("GET", &result);
                                     return Ok(());
@@ -1050,17 +919,17 @@ pub async fn manual_test_autonomy(
                     println!("\n[TEST] Attempting GET...");
                     let result = tenant
                         .cluster
-                        .get_resource_dyn(&k8s_obj, &test_name, namespace)
+                        .get_resource_dyn(resource, &test_name, namespace)
                         .await;
                     print_operation_result("GET", &result);
 
                     if cleanup {
                         let _ = tenant
                             .cluster
-                            .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                            .delete_resource_dyn(resource, &test_name, namespace)
                             .await;
                         // Also cleanup PVC for StatefulSets
-                        if k8s_obj.kind() == "StatefulSet" {
+                        if resource.kind() == "StatefulSet" {
                             if let Some(ns) = namespace {
                                 let pvc_name = format!("{}-{}-0", test_name, test_name);
                                 let pvc_api: Api<PersistentVolumeClaim> =
@@ -1073,7 +942,7 @@ pub async fn manual_test_autonomy(
                 ControlPlaneOperation::Update => {
                     let create_result = tenant
                         .cluster
-                        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+                        .create_resource_dyn(resource, &dynamic_obj, namespace)
                         .await;
 
                     if create_result.is_err() {
@@ -1091,17 +960,17 @@ pub async fn manual_test_autonomy(
                     }));
                     let result = tenant
                         .cluster
-                        .patch_resource_dyn(&k8s_obj, &test_name, &patch, namespace)
+                        .patch_resource_dyn(resource, &test_name, &patch, namespace)
                         .await;
                     print_operation_result("UPDATE", &result);
 
                     if cleanup {
                         let _ = tenant
                             .cluster
-                            .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                            .delete_resource_dyn(resource, &test_name, namespace)
                             .await;
                         // Also cleanup PVC for StatefulSets
-                        if k8s_obj.kind() == "StatefulSet" {
+                        if resource.kind() == "StatefulSet" {
                             if let Some(ns) = namespace {
                                 let pvc_name = format!("{}-{}-0", test_name, test_name);
                                 let pvc_api: Api<PersistentVolumeClaim> =
@@ -1114,7 +983,7 @@ pub async fn manual_test_autonomy(
                 ControlPlaneOperation::Delete => {
                     let create_result = tenant
                         .cluster
-                        .create_resource_dyn(&k8s_obj, &dynamic_obj, namespace)
+                        .create_resource_dyn(resource, &dynamic_obj, namespace)
                         .await;
 
                     if create_result.is_err() {
@@ -1125,12 +994,12 @@ pub async fn manual_test_autonomy(
                     println!("\n[TEST] Attempting DELETE...");
                     let result = tenant
                         .cluster
-                        .delete_resource_dyn(&k8s_obj, &test_name, namespace)
+                        .delete_resource_dyn(resource, &test_name, namespace)
                         .await;
                     print_operation_result("DELETE", &result);
 
                     // For DELETE test, also cleanup PVC for StatefulSets since the delete is the test
-                    if k8s_obj.kind() == "StatefulSet" {
+                    if resource.kind() == "StatefulSet" {
                         if let Some(ns) = namespace {
                             let pvc_name = format!("{}-{}-0", test_name, test_name);
                             let pvc_api: Api<PersistentVolumeClaim> =

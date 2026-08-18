@@ -12,6 +12,9 @@ use k8s_openapi::api::{
 use serde::Serialize;
 use tracing::info;
 
+use crate::assessment::breach::{
+    run_breach_experiment, BreachCondition, BreachExperiment, Intruder, Secret,
+};
 use crate::assessment::probe::{HostAccess, ProbePod};
 use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
@@ -159,7 +162,7 @@ impl MultitenancyAssessor for StorageAssessor {
                 test_pv_cross_tenant_access(tenant1, tenant2, true).await
             }
             (StorageResource::Volume, StorageOperation::UseHostPath) => {
-                test_hostpath_cross_tenant_access(tenant1, tenant2).await
+                run_breach_experiment(&hostpath_data_experiment(), tenant2, tenant1).await
             }
             (StorageResource::Volume, StorageOperation::UsePersistentHostPath) => {
                 test_persistent_hostpath_cross_tenant_access(tenant1, tenant2).await
@@ -279,69 +282,16 @@ async fn test_pv_cross_tenant_access(
     tenant2: &TenantClusterConfig,
     use_retain_policy: bool,
 ) -> anyhow::Result<CrossTenantResult> {
+    // One translation for both tests. They previously had a match block each,
+    // and the two disagreed: the same `AccessResult` produced different
+    // autonomy and, for `PartialAutonomy`, a different isolation level
+    // depending on which test you were in.
     match attempt_other_tenant_file_access(tenant1, tenant2, use_retain_policy).await {
-        Ok(AccessResult::Isolated) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: true,
-            details: "Cross-tenant PV access is properly blocked".to_string(),
-        }),
-        Ok(AccessResult::IsolatedByPolicy(reason)) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Soft(
-                "A policy forbid the operation for this resource".to_string(),
-            ),
-            autonomy: true,
-            details: format!("Storage isolated by policy: {}", reason),
-        }),
-        Ok(AccessResult::PartialAutonomy(reason)) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: false, // Partial autonomy means not full autonomy
-            details: format!("Storage isolated but with restrictions: {}", reason),
-        }),
-        Ok(AccessResult::Accessible) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::None,
-            autonomy: true,
-            details: "Cross-tenant PV access detected - tenant2 can access tenant1's data"
-                .to_string(),
-        }),
+        Ok(result) => Ok(result.into()),
         Err(e) => Ok(CrossTenantResult {
             isolation: IsolationLevel::Unknown,
             autonomy: true,
-            details: format!("Could not determine isolation: {}", e),
-        }),
-    }
-}
-
-async fn test_hostpath_cross_tenant_access(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    match test_hostpath_data_isolation(tenant1, tenant2).await {
-        Ok(AccessResult::Isolated) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: true,
-            details: "HostPath volumes are properly isolated between tenants".to_string(),
-        }),
-        Ok(AccessResult::IsolatedByPolicy(reason)) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Soft(
-                "A policy explicitly forbid the operation for this resource".to_string(),
-            ),
-            autonomy: false, // Policy blocked it, so no autonomy for this operation
-            details: format!("HostPath isolated by policy: {}", reason),
-        }),
-        Ok(AccessResult::PartialAutonomy(reason)) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Soft(reason.clone()),
-            autonomy: false,
-            details: format!("HostPath partially restricted: {}", reason),
-        }),
-        Ok(AccessResult::Accessible) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::None,
-            autonomy: true,
-            details: "HostPath volume data is accessible across tenants".to_string(),
-        }),
-        Err(e) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Unknown,
-            autonomy: true,
-            details: format!("Could not determine HostPath isolation: {}", e),
+            details: format!("Could not determine isolation: {e}"),
         }),
     }
 }
@@ -350,38 +300,16 @@ async fn test_persistent_hostpath_cross_tenant_access(
     tenant1: &TenantClusterConfig,
     tenant2: &TenantClusterConfig,
 ) -> anyhow::Result<CrossTenantResult> {
+    // One translation for both tests. They previously had a match block each,
+    // and the two disagreed: the same `AccessResult` produced different
+    // autonomy and, for `PartialAutonomy`, a different isolation level
+    // depending on which test you were in.
     match test_persistent_hostpath_data_isolation(tenant1, tenant2).await {
-        Ok(AccessResult::Isolated) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: true,
-            details: "HostPath PersistentVolumes are properly isolated between tenants".to_string(),
-        }),
-        Ok(AccessResult::IsolatedByPolicy(reason)) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Soft(
-                "A policy explicitly forbid the operation for this resource".to_string(),
-            ),
-            autonomy: false,
-            details: format!("HostPath PersistentVolume isolated by policy: {}", reason),
-        }),
-        Ok(AccessResult::PartialAutonomy(reason)) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::Soft(reason.clone()),
-            autonomy: false,
-            details: format!("HostPath PersistentVolume partially restricted: {}", reason),
-        }),
-        Ok(AccessResult::Accessible) => Ok(CrossTenantResult {
-            isolation: IsolationLevel::None,
-            autonomy: true,
-            details: "Node filesystem reachable across tenants through a hostPath \
-                      PersistentVolume"
-                .to_string(),
-        }),
+        Ok(result) => Ok(result.into()),
         Err(e) => Ok(CrossTenantResult {
             isolation: IsolationLevel::Unknown,
             autonomy: true,
-            details: format!(
-                "Could not determine HostPath PersistentVolume isolation: {}",
-                e
-            ),
+            details: format!("Could not determine isolation: {e}"),
         }),
     }
 }
@@ -423,7 +351,7 @@ async fn test_persistent_hostpath_data_isolation(
         .create_cluster_resource::<PersistentVolume>(&create_test_hostpath_pv_manifest(t1_pv))
         .await
     {
-        return Ok(AccessResult::IsolatedByPolicy(format!(
+        return Ok(AccessResult::VictimBlocked(format!(
             "Tenant1 cannot create a hostPath PersistentVolume: {}",
             e
         )));
@@ -433,7 +361,7 @@ async fn test_persistent_hostpath_data_isolation(
         create_stateful_set(tenant1, &tenant1_commands(), Some(t1_pv), false, false).await
     {
         cleanup(tenant1, t1_pv).await;
-        return Ok(AccessResult::IsolatedByPolicy(format!(
+        return Ok(AccessResult::VictimBlocked(format!(
             "Tenant1 cannot mount a hostPath PersistentVolume: {}",
             e
         )));
@@ -454,7 +382,7 @@ async fn test_persistent_hostpath_data_isolation(
         .await
     {
         cleanup(tenant1, t1_pv).await;
-        return Ok(AccessResult::IsolatedByPolicy(format!(
+        return Ok(AccessResult::IntruderBlockedByPolicy(format!(
             "Tenant2 cannot create a hostPath PersistentVolume: {}",
             e
         )));
@@ -465,7 +393,7 @@ async fn test_persistent_hostpath_data_isolation(
     {
         cleanup(tenant1, t1_pv).await;
         cleanup(tenant2, t2_pv).await;
-        return Ok(AccessResult::IsolatedByPolicy(format!(
+        return Ok(AccessResult::IntruderBlockedByPolicy(format!(
             "Tenant2 cannot mount a hostPath PersistentVolume: {}",
             e
         )));
@@ -493,96 +421,126 @@ async fn test_persistent_hostpath_data_isolation(
 
 /// Result of attempting cross-tenant access
 #[derive(Debug, Clone)]
+/// The outcome of one cross-tenant storage attempt.
+///
+/// The variants distinguish *who* was stopped, which is the distinction the
+/// methodology turns on and which an earlier single `IsolatedByPolicy` variant
+/// lost. Autonomy asks whether the tenant can do its own legitimate work;
+/// isolation asks whether the other tenant's attack was stopped. A refusal
+/// aimed at the victim answers the first question, a refusal aimed at the
+/// intruder answers the second, and collapsing them meant the same value had
+/// to be translated two different ways in two different tests.
 enum AccessResult {
-    /// Fully isolated - no cross-tenant access possible
+    /// The intruder reached nothing, and nothing revealed that there was
+    /// anything to reach.
     Isolated,
-    /// Isolated due to a policy (e.g., RBAC denied patch on PV)
-    IsolatedByPolicy(String),
-    /// Operation works but with restrictions (partial autonomy)
+    /// The victim could not perform the operation *in its own namespace*.
+    ///
+    /// Not an isolation finding: the experiment never ran. The tenant simply
+    /// does not have this capability, so autonomy is false and the operation is
+    /// as unavailable as it would be in a single-tenant cluster.
+    VictimBlocked(String),
+    /// The intruder's attempt was refused by policy.
+    ///
+    /// Soft rather than Hard: the refusal itself confirms there was something
+    /// there to refuse. The victim's own use is unaffected, so its autonomy
+    /// stands.
+    IntruderBlockedByPolicy(String),
+    /// The operation worked, but not fully — a restriction short of refusal.
     PartialAutonomy(String),
-    /// Cross-tenant access is possible
+    /// Cross-tenant access is possible.
     Accessible,
 }
 
-async fn test_hostpath_data_isolation(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<AccessResult> {
-    let tenant1_commands = hostpath_write_commands();
-    let tenant2_commands = hostpath_read_commands();
-
-    // Create hostPath volume and write data in tenant1
-    let create_result = create_stateful_set(tenant1, &tenant1_commands, None, true, false).await;
-    if let Err(e) = create_result {
-        // Cleanup attempt
-        let _ = tenant1
-            .cluster
-            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
-            .await;
-        return Ok(AccessResult::IsolatedByPolicy(format!(
-            "Cannot create hostPath StatefulSet: {}",
-            e
-        )));
+impl From<AccessResult> for CrossTenantResult {
+    /// The single translation, replacing two that disagreed with each other.
+    fn from(result: AccessResult) -> Self {
+        match result {
+            AccessResult::Isolated => CrossTenantResult {
+                isolation: IsolationLevel::Hard,
+                autonomy: true,
+                details: "Cross-tenant storage access is blocked".to_string(),
+            },
+            AccessResult::VictimBlocked(reason) => CrossTenantResult {
+                isolation: IsolationLevel::Hard,
+                autonomy: false,
+                details: format!("The tenant cannot perform this operation at all: {reason}"),
+            },
+            AccessResult::IntruderBlockedByPolicy(reason) => CrossTenantResult {
+                isolation: IsolationLevel::Soft(
+                    "A policy forbade the cross-tenant operation".to_string(),
+                ),
+                autonomy: true,
+                details: format!("Storage isolated by policy: {reason}"),
+            },
+            AccessResult::PartialAutonomy(reason) => CrossTenantResult {
+                isolation: IsolationLevel::Hard,
+                autonomy: false,
+                details: format!("Storage isolated but with restrictions: {reason}"),
+            },
+            AccessResult::Accessible => CrossTenantResult {
+                isolation: IsolationLevel::None,
+                autonomy: true,
+                details: "Cross-tenant storage access detected".to_string(),
+            },
+        }
     }
+}
 
-    if let Err(e) = wait_for_statefulset_ready(tenant1).await {
-        let _ = tenant1
-            .cluster
-            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
-            .await;
-        return Ok(AccessResult::IsolatedByPolicy(format!(
-            "HostPath StatefulSet failed to become ready: {}",
-            e
-        )));
-    }
-    info!("Tenant1 has written data to hostPath volume.");
+/// tenant1 writes a file into a node directory via an inline hostPath volume;
+/// tenant2 mounts the same node path and tries to read it back.
+///
+/// The node's filesystem is the shared thing here: hostPath bypasses every
+/// per-tenant storage boundary by construction, so if both tenants may mount it
+/// the data is simply shared.
+///
+/// Replaces a pair of StatefulSets. Nothing about a StatefulSet was being used
+/// — `replicas: 1`, no `volumeClaimTemplates`, no ordinals — and a bare Pod is
+/// also the more honest probe, since PodSecurity admission judges Pods rather
+/// than controller templates.
+fn hostpath_data_experiment() -> BreachExperiment {
+    let mount = HostAccess::HostPath {
+        host: HOSTPATH_MOUNT_PATH.to_string(),
+        mount: HOSTPATH_MOUNT_PATH.to_string(),
+    };
 
-    // Try to read data from tenant2
-    let create_result2 = create_stateful_set(tenant2, &tenant2_commands, None, true, false).await;
-    if let Err(e) = create_result2 {
-        // Cleanup tenant1
-        let _ = tenant1
-            .cluster
-            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
-            .await;
-        return Ok(AccessResult::IsolatedByPolicy(format!(
-            "Tenant2 cannot create hostPath StatefulSet: {}",
-            e
-        )));
-    }
-
-    if let Err(e) = wait_for_statefulset_ready(tenant2).await {
-        let _ = tenant1
-            .cluster
-            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
-            .await;
-        let _ = tenant2
-            .cluster
-            .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant2.namespace)
-            .await;
-        return Ok(AccessResult::IsolatedByPolicy(format!(
-            "Tenant2 HostPath StatefulSet failed: {}",
-            e
-        )));
-    }
-    info!("Tenant2 has attempted to read data from hostPath volume.");
-
-    let can_access_data = check_cross_tenant_mount(tenant2).await.unwrap_or(false);
-
-    // Cleanup
-    let _ = tenant1
-        .cluster
-        .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant1.namespace)
-        .await;
-    let _ = tenant2
-        .cluster
-        .delete_resource_in_namespace::<StatefulSet>(POD_NAME, &tenant2.namespace)
-        .await;
-
-    if can_access_data {
-        Ok(AccessResult::Accessible)
-    } else {
-        Ok(AccessResult::Isolated)
+    BreachExperiment {
+        what: "hostPath volume",
+        target: ProbePod::new("hostpath-target")
+            .image("alpine:latest")
+            .requests(mount.clone())
+            // Echoes the marker to stdout as well as into the file. The old
+            // version only redirected it into the file, so the target's logs
+            // were empty and there was no way to tell "tenant1 wrote nothing"
+            // from "tenant2 could not read it" — the second reads as isolation.
+            .shell(format!(
+                "echo '{FILE_CONTENT}' > {HOSTPATH_MOUNT_PATH}/hostpath-test.txt && \
+                 echo 'PLANTED {FILE_CONTENT}' && sleep 5"
+            ))
+            .build(),
+        target_service: None,
+        secret: Secret::ConfirmedBy(format!("PLANTED {FILE_CONTENT}")),
+        // Any node will do: a hostPath is per-node, so the intruder must land
+        // on the same one to see the file at all.
+        intruder: Intruder::OnTargetNode(|node| {
+            ProbePod::new("hostpath-intruder")
+                .image("alpine:latest")
+                .on_node(node)
+                .requests(HostAccess::HostPath {
+                    host: HOSTPATH_MOUNT_PATH.to_string(),
+                    mount: HOSTPATH_MOUNT_PATH.to_string(),
+                })
+                .shell(format!(
+                    "if [ \"$(cat {HOSTPATH_MOUNT_PATH}/hostpath-test.txt 2>/dev/null)\" \
+                          = \"{FILE_CONTENT}\" ]; then \
+                       echo 'HOSTPATH_ACCESS_SUCCESS: Found tenant1 hostpath data'; \
+                     else \
+                       echo 'HOSTPATH_ACCESS_FAILED: not readable'; \
+                     fi"
+                ))
+                .build()
+        }),
+        breach: BreachCondition::IntruderReports("HOSTPATH_ACCESS_SUCCESS"),
     }
 }
 
@@ -631,7 +589,7 @@ async fn attempt_other_tenant_file_access(
                     "PV {} access is blocked for tenant1 (proxy or RBAC restriction). Storage is isolated.",
                     dynamic_pv_name
                 );
-                return Ok(AccessResult::IsolatedByPolicy(
+                return Ok(AccessResult::IntruderBlockedByPolicy(
                     "Cannot access PersistentVolume - cluster-scoped resource blocked by RBAC policy or reverse proxy filtering".to_string(),
                 ));
             }
@@ -670,7 +628,7 @@ async fn attempt_other_tenant_file_access(
 
         let error_msg = e.to_string();
         if error_msg.contains("forbidden") || error_msg.contains("denied") {
-            return Ok(AccessResult::IsolatedByPolicy(format!(
+            return Ok(AccessResult::IntruderBlockedByPolicy(format!(
                 "Tenant2 cannot bind to released PV: {}",
                 e
             )));
@@ -892,36 +850,6 @@ fn tenant2_commands() -> Vec<String> {
             file_path(),
             file_path(),
             FILE_CONTENT
-        ),
-    ]
-}
-
-fn hostpath_write_commands() -> Vec<String> {
-    vec![
-        "sh".to_string(),
-        "-c".to_string(),
-        format!(
-            "echo '{}' > {}/hostpath-test.txt && sleep 2",
-            FILE_CONTENT, HOSTPATH_MOUNT_PATH
-        ),
-    ]
-}
-
-fn hostpath_read_commands() -> Vec<String> {
-    vec![
-        "sh".to_string(),
-        "-c".to_string(),
-        format!(
-            "if cat {}/hostpath-test.txt 2>/dev/null; then \
-               if [ \"$(cat {}/hostpath-test.txt 2>/dev/null)\" = \"{}\" ]; then \
-                 echo 'HOSTPATH_ACCESS_SUCCESS: Found tenant1 hostpath data'; \
-               else \
-                 echo 'HOSTPATH_ACCESS_FAILED: File exists but content differs'; \
-               fi; \
-             else \
-               echo 'HOSTPATH_ACCESS_FAILED: File not found/accessible'; \
-             fi && sleep 10",
-            HOSTPATH_MOUNT_PATH, HOSTPATH_MOUNT_PATH, FILE_CONTENT
         ),
     ]
 }

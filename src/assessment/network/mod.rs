@@ -8,6 +8,9 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use tracing::info;
 
+use crate::assessment::breach::{
+    run_breach_experiment, BreachCondition, BreachExperiment, Intruder, Secret,
+};
 use crate::assessment::probe::{HostAccess, ProbePod};
 use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
@@ -37,13 +40,6 @@ const AUTONOMY_TEST_NODE_PORT: i32 = 30080;
 /// block, so reachability on 8080 asks exactly the question reachability on 80
 /// did.
 const WEBSERVER_PORT: i32 = 8080;
-
-/// How long a target is given to answer itself before the probe is declared
-/// broken and the result Unknown.
-///
-/// This is a bound on the *whole* positive control, not on one attempt, because
-/// the exec beneath it does its own retrying and nested budgets multiply.
-const POSITIVE_CONTROL_BUDGET: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 // Infrastructure network test constants
 const NODE_MARKER_POD_NAME: &str = "node-marker-service";
@@ -172,16 +168,28 @@ impl MultitenancyAssessor for NetworkAssessor {
         );
         match (resource, operation) {
             (NetworkResource::PodNetwork, NetworkOperation::ConnectToPod) => {
-                test_pod_network_isolation(tenant1, tenant2).await
+                run_breach_experiment(&pod_reachability_experiment(), tenant1, tenant2).await
             }
             (NetworkResource::ServiceNetwork, NetworkOperation::ConnectToService) => {
-                test_service_network_isolation(tenant1, tenant2).await
+                run_breach_experiment(
+                    &service_reachability_experiment(&tenant2.namespace),
+                    tenant1,
+                    tenant2,
+                )
+                .await
             }
             (NetworkResource::ServiceNetwork, NetworkOperation::ExposeNodePort) => {
                 test_nodeport_autonomy(tenant1, tenant2).await
             }
             (NetworkResource::DnsResolution, NetworkOperation::ResolveDns) => {
-                test_dns_isolation(tenant1, tenant2).await
+                // The DNS experiment plants in tenant1 and probes from tenant2,
+                // the reverse of the reachability ones.
+                run_breach_experiment(
+                    &dns_resolution_experiment(&tenant1.namespace),
+                    tenant2,
+                    tenant1,
+                )
+                .await
             }
             (NetworkResource::InfrastructureNetwork, NetworkOperation::ConnectToNode) => {
                 test_node_network_isolation(tenant1, tenant2).await
@@ -292,356 +300,116 @@ async fn test_node_network_authorization(tenant: &TenantClusterConfig) -> anyhow
 // CROSS-TENANT EFFECT TESTS
 // =============================================================================
 
-/// Puts a probe pod to a tenant's API server, separating "the cluster said no"
-/// from "the run broke".
+/// tenant2 serves a marker on an unprivileged port; tenant1 runs a one-shot pod
+/// that curls its address and reports whether it got the marker back.
 ///
-/// `Ok(None)` means the pod was admitted. `Ok(Some(result))` means it was
-/// refused, and carries the finding to return in place of a measurement. Only a
-/// genuine fault — the server unreachable, a malformed object — comes back as
-/// `Err`.
+/// Replaces an `exec` into a long-lived multitool pod. The one-shot form is
+/// what the workload subsystem already used to ask this same question
+/// (`create_network_spy_pod`), so the two subsystems were testing pod-to-pod
+/// reachability twice, in two different styles. This deletes one of them.
 ///
-/// The refusal is recorded as [`IsolationLevel::Hard`] because an operation the
-/// tenant cannot perform at all is the strongest isolation this methodology
-/// recognises, and `autonomy: false` because being unable to run a pod of one's
-/// own is precisely a loss of autonomy. Both halves matter: reporting only the
-/// isolation would make a tenant that can do nothing look ideal.
-async fn admit_probe_pod(
-    tenant: &TenantClusterConfig,
-    pod: &Pod,
-    what: &str,
-) -> anyhow::Result<Option<CrossTenantResult>> {
-    match tenant
-        .cluster
-        .create_pod_in_namespace(pod, &tenant.namespace)
-        .await
-    {
-        Ok(_) => Ok(None),
-        Err(error) => match crate::assessment::admission_refusal(&error) {
-            Some(message) => {
-                info!("{} refused in {}: {}", what, tenant.namespace, message);
-                Ok(Some(CrossTenantResult {
-                    isolation: IsolationLevel::Hard,
-                    autonomy: false,
-                    details: format!(
-                        "{} could not be created in {}, so the effect could not be \
-                         observed. The cluster refused it: {}",
-                        what, tenant.namespace, message
-                    ),
-                }))
-            }
-            None => Err(error),
-        },
+/// The target's `SERVING <marker>` line is used by the intruder to acknowledge
+/// an isolation breach: without it, "the intruder got nothing" cannot be told
+/// apart from "the server never came up", and the second reads as isolation.
+fn pod_reachability_experiment() -> BreachExperiment {
+    BreachExperiment {
+        what: "pod-to-pod reachability",
+        target: create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME),
+        target_service: None,
+        secret: Secret::ConfirmedBy(format!("SERVING {NETWORK_MULTITOOL_POD_NAME}")),
+        intruder: Intruder::AtTargetAddress(|address| {
+            create_reachability_probe_pod("network-reach-probe", address)
+        }),
+        breach: BreachCondition::IntruderReports("NETWORK_ACCESS_SUCCESS"),
     }
 }
 
-/// Delete these probe pods, whatever happened to the body.
+/// A one-shot pod that curls `address` and says whether the marker came back.
 ///
-/// Rust has no async `Drop`, so a guard cannot do this; the discipline is to
-/// run the body to completion, clean up, and only then return its result.
-///
-/// Not merely tidy. Probe pods use fixed names, so one left behind makes the
-/// next test's create fail with `AlreadyExists` — which is neither an admission
-/// refusal nor a measurement, and aborts the whole assessment. The tests below
-/// used to return early when a probe was refused, leaking any pod already
-/// created in the *other* tenant, so a hardened tenant refusing one probe could
-/// take out an unrelated subsystem several tests later.
-async fn cleanup_probes(pods: &[(&TenantClusterConfig, &str)]) {
-    for (tenant, name) in pods {
-        let _ = tenant
-            .cluster
-            .delete_pod_in_namespace(name, &tenant.namespace)
-            .await;
-    }
-    for (tenant, name) in pods {
-        let _ = tenant
-            .cluster
-            .wait_for_pod_deletion(name, &tenant.namespace)
-            .await;
-    }
-}
-
-async fn test_pod_network_isolation(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // The probes are cleaned up on every path out of the body — including the
-    // early returns for a refused probe, which previously leaked whichever pod
-    // had already been created in the other tenant.
-    let outcome = pod_network_isolation_body(tenant1, tenant2).await;
-    cleanup_probes(&[
-        (tenant1, NETWORK_MULTITOOL_POD_NAME),
-        (tenant2, NETWORK_MULTITOOL_POD_NAME),
-    ])
-    .await;
-    outcome
-}
-
-async fn pod_network_isolation_body(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // Create pods in both namespaces
-    let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
-
-    if let Some(refused) = admit_probe_pod(tenant1, &pod, "the tenant1 network probe").await? {
-        return Ok(refused);
-    }
-    if let Some(refused) = admit_probe_pod(tenant2, &pod, "the tenant2 network probe").await? {
-        return Ok(refused);
-    }
-
-    info!("Waiting for pod in tenant1 to be ready...");
-    tenant1
-        .cluster
-        .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
-        .await?;
-
-    info!("Waiting for pod in tenant2 to be ready...");
-    tenant2
-        .cluster
-        .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await?;
-
-    // Get pod IPs
-    let tenant2_pod_ip = tenant2
-        .cluster
-        .get_pod_ip(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await?;
-
-    info!("Tenant 2 pod IP: {}", tenant2_pod_ip);
-
-    // Positive control, as in the service test. `Ready` is the kubelet
-    // reporting that the container started, which is not the same as the
-    // server inside it having bound its port. The window is narrower here than
-    // for a Service — no endpoint controller is involved — but a refused
-    // connection would be read as isolation just the same, so the target is
-    // required to answer itself before its silence is allowed to mean
-    // anything.
-    if !service_answers(tenant2, &tenant2_pod_ip).await {
-        return Ok(CrossTenantResult {
-            isolation: IsolationLevel::Unknown,
-            autonomy: true,
-            details: format!(
-                "tenant2's own probe pod at {tenant2_pod_ip} never answered from \
-                 inside {}, so there was nothing established to reach and a \
-                 failure from tenant1 would prove nothing.",
-                tenant2.namespace
-            ),
-        });
-    }
-
-    // Try to connect from tenant1 to tenant2's pod
-    let can_reach_other_pod = tenant1
-        .cluster
-        .exec_command_in_container(
-            NETWORK_MULTITOOL_POD_NAME,
-            &tenant1.namespace,
-            format!(
-                "curl -sSf {}:{WEBSERVER_PORT} --connect-timeout 10 2>&1 >/dev/null",
-                tenant2_pod_ip
-            )
-            .as_str(),
-        )
-        .await?
-        .is_empty();
-
-    if can_reach_other_pod {
-        Ok(CrossTenantResult {
-            isolation: IsolationLevel::None,
-            autonomy: true,
-            details: "Tenant1 can directly connect to tenant2's pod - Network not isolated"
-                .to_string(),
-        })
-    } else {
-        Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: true,
-            details: "Pod-to-pod network isolation is enforced".to_string(),
-        })
-    }
-}
-
-/// Whether a tenant's own service answers from inside its own namespace.
-///
-/// The positive control for every cross-tenant service check. A pod being
-/// `Ready` does not mean its Service has endpoints yet: readiness is reported
-/// by the kubelet, while endpoint propagation is a separate controller writing
-/// to a separate object, and the gap between them is exactly wide enough for a
-/// curl to land in. Polling until the service answers closes that gap without
-/// guessing at a fixed sleep.
-///
-/// Retries for roughly thirty seconds. A service that has not answered its own
-/// namespace by then is not slow, it is broken.
-async fn service_answers(tenant: &TenantClusterConfig, service_ip: &str) -> bool {
-    let probe =
-        format!("curl -sSf {service_ip}:{WEBSERVER_PORT} --connect-timeout 2 2>&1 >/dev/null");
-
-    // A wall-clock deadline rather than a count of attempts.
-    //
-    // Counting attempts looks bounded and is not: each `exec_command_in_container`
-    // retries internally three times with its own waits, so fifteen attempts here
-    // multiply out to forty-five execs. Against a target that never answers —
-    // exactly the case worth waiting on — that is minutes per probe, twice per
-    // subsystem. A campaign spent them looking hung.
-    //
-    // Thirty seconds is what this is actually waiting for: the gap between the
-    // kubelet reporting a pod Ready and the endpoint controller publishing it.
-    // Longer than that is not slow propagation, it is a service that will not
-    // answer.
-    let deadline = tokio::time::Instant::now() + POSITIVE_CONTROL_BUDGET;
-    let mut attempt = 0;
-
-    while tokio::time::Instant::now() < deadline {
-        attempt += 1;
-        let answered = tenant
-            .cluster
-            .exec_command_in_container(NETWORK_MULTITOOL_POD_NAME, &tenant.namespace, &probe)
-            .await
-            .map(|output| output.is_empty())
-            .unwrap_or(false);
-        if answered {
-            info!(
-                "service {} answers from inside {} (attempt {})",
-                service_ip, tenant.namespace, attempt
-            );
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-
-    info!(
-        "service {} never answered from inside {} within {:?} ({} attempts)",
-        service_ip, tenant.namespace, POSITIVE_CONTROL_BUDGET, attempt
+/// Retries because a Service's endpoints propagate after its backing pod is
+/// Ready — the gap that made the old exec-based probe intermittently report
+/// isolation it had not measured.
+pub(crate) fn create_reachability_probe_pod(name: &str, address: &str) -> Pod {
+    let script = format!(
+        "for i in $(seq 1 15); do \
+           if curl -sSf --connect-timeout 2 {address}:{WEBSERVER_PORT} \
+              | grep -q '{NETWORK_MULTITOOL_POD_NAME}'; then \
+             echo 'NETWORK_ACCESS_SUCCESS: reached the other tenant'; \
+             exit 0; \
+           fi; \
+           sleep 2; \
+         done; \
+         echo 'NETWORK_ACCESS_FAILED: could not reach the other tenant'"
     );
-    false
+
+    ProbePod::new(name)
+        .container("reach-probe")
+        .image("praqma/network-multitool")
+        .restricted()
+        .shell(script)
+        .build()
 }
 
-async fn test_service_network_isolation(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // Cleanup runs even when a probe is refused or the positive control fails.
-    let outcome = test_service_network_isolation_body(tenant1, tenant2).await;
-    cleanup_probes(&[
-        (tenant1, NETWORK_MULTITOOL_POD_NAME),
-        (tenant2, NETWORK_MULTITOOL_POD_NAME),
-    ])
-    .await;
-    let _ = tenant2
-        .cluster
-        .delete_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant2.namespace)
-        .await;
-    outcome
+/// tenant2 serves a marker behind a ClusterIP Service; tenant1 curls the
+/// Service address.
+///
+/// Same probe as pod-to-pod reachability, aimed one layer up: the executor
+/// hands the intruder the Service's ClusterIP instead of the pod IP because the
+/// experiment declares a `target_service`.
+fn service_reachability_experiment(victim_namespace: &str) -> BreachExperiment {
+    BreachExperiment {
+        what: "service reachability",
+        target: create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME),
+        target_service: Some(create_webserver_service(victim_namespace)),
+        secret: Secret::ConfirmedBy(format!("SERVING {NETWORK_MULTITOOL_POD_NAME}")),
+        intruder: Intruder::AtTargetAddress(|address| {
+            create_reachability_probe_pod("service-reach-probe", address)
+        }),
+        breach: BreachCondition::IntruderReports("NETWORK_ACCESS_SUCCESS"),
+    }
 }
 
-async fn test_service_network_isolation_body(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // Create test pod in tenant1 and service in tenant2
-    let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
-    let service = create_webserver_service(&tenant2.namespace);
+/// tenant1 resolves the DNS name of a Service owned by tenant2.
+///
+/// Resolution alone is the breach: it discloses that the service exists and
+/// where it lives, whether or not the traffic would be allowed. The Service
+/// needs no backing pod for this — cluster DNS answers from the ClusterIP — so
+/// the target pod exists only to give the experiment something whose readiness
+/// proves the namespace is live.
+fn dns_resolution_experiment(victim_namespace: &str) -> BreachExperiment {
+    let fqdn = format!("{WEBSERVER_SERVICE_NAME}.{victim_namespace}.svc.cluster.local");
 
-    if let Some(refused) = admit_probe_pod(tenant1, &pod, "the tenant1 service probe").await? {
-        return Ok(refused);
+    BreachExperiment {
+        what: "cross-tenant DNS resolution",
+        target: create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME),
+        target_service: Some(create_webserver_service(victim_namespace)),
+        secret: Secret::ConfirmedBy(format!("SERVING {NETWORK_MULTITOOL_POD_NAME}")),
+        // Needs nothing from the target's placement: the name is known in
+        // advance, which is the whole point — the intruder guesses it.
+        intruder: Intruder::Anywhere(Box::new(create_dns_probe_pod("dns-probe", &fqdn))),
+        breach: BreachCondition::IntruderReports("DNS_RESOLVED"),
     }
-    if let Some(refused) = admit_probe_pod(tenant2, &pod, "the tenant2 service backend").await? {
-        return Ok(refused);
-    }
+}
 
-    tenant2
-        .cluster
-        .create_namespaced_resource::<Service>(&service, &tenant2.namespace)
-        .await?;
+/// A one-shot pod that resolves `fqdn` and reports whether it got an address.
+pub(crate) fn create_dns_probe_pod(name: &str, fqdn: &str) -> Pod {
+    // `nslookup` prints "Name:" followed by "Address:" on success. Requiring
+    // both avoids counting the server's own address line, which is present even
+    // when the lookup fails.
+    let script = format!(
+        "if nslookup {fqdn} 2>/dev/null | grep -A1 'Name:' | grep -q 'Address'; then \
+           echo 'DNS_RESOLVED: the name resolves from another tenant'; \
+         else \
+           echo 'DNS_NOT_RESOLVED'; \
+         fi"
+    );
 
-    // Wait for resources to be ready
-    tenant1
-        .cluster
-        .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant1.namespace)
-        .await?;
-
-    // The backend, not just the client.
-    //
-    // Its absence was a real defect rather than an oversight: the test waited
-    // for the *Service object* to exist, which says nothing about whether
-    // anything is behind it. A curl issued before the backing pod was serving
-    // got connection-refused, and the code below read that as proof of
-    // isolation. The failure therefore appeared and disappeared between runs
-    // and always in the reassuring direction.
-    tenant2
-        .cluster
-        .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await?;
-
-    tenant2
-        .cluster
-        .wait_for_resource_creation::<Service>(WEBSERVER_SERVICE_NAME, &tenant2.namespace)
-        .await?;
-
-    // Get service IP
-    let service_obj = tenant2
-        .cluster
-        .get_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant2.namespace)
-        .await?;
-
-    let service_ip = service_obj
-        .spec
-        .and_then(|s| s.cluster_ip)
-        .unwrap_or_default();
-
-    info!("Service IP: {}", service_ip);
-
-    // Positive control, before the cross-tenant attempt means anything.
-    //
-    // "Nobody answered" and "the network refused me" look identical from the
-    // client, and only one of them is isolation. So the service is first
-    // required to answer from inside its own namespace. If it will not, the
-    // probe is broken and the honest verdict is Unknown — reporting Hard there
-    // would let every startup race, image pull and scheduling delay masquerade
-    // as an isolation guarantee.
-    let serving = service_answers(tenant2, &service_ip).await;
-    if !serving {
-        return Ok(CrossTenantResult {
-            isolation: IsolationLevel::Unknown,
-            autonomy: true,
-            details: format!(
-                "tenant2's own service at {service_ip} never answered from inside \
-                 {}, so it was never established that there was anything to reach. \
-                 A failure from tenant1 would prove nothing.",
-                tenant2.namespace
-            ),
-        });
-    }
-
-    // Try to connect from tenant1 to tenant2's service
-    let can_reach_service = tenant1
-        .cluster
-        .exec_command_in_container(
-            NETWORK_MULTITOOL_POD_NAME,
-            &tenant1.namespace,
-            format!(
-                "curl -sSf {}:{WEBSERVER_PORT} --connect-timeout 10 2>&1 >/dev/null",
-                service_ip
-            )
-            .as_str(),
-        )
-        .await?
-        .is_empty();
-
-    if can_reach_service {
-        Ok(CrossTenantResult {
-            isolation: IsolationLevel::None,
-            autonomy: true,
-            details: "Tenant1 can access tenant2's services - Service network not isolated"
-                .to_string(),
-        })
-    } else {
-        Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: true,
-            details: "Service network isolation is enforced".to_string(),
-        })
-    }
+    ProbePod::new(name)
+        .container("dns-probe")
+        .image("praqma/network-multitool")
+        .restricted()
+        .shell(script)
+        .build()
 }
 
 async fn test_nodeport_autonomy(
@@ -1016,96 +784,6 @@ async fn get_node_ip_for_infra_test(
     Ok(node_ip)
 }
 
-async fn test_dns_isolation(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // Cleanup runs even when the tenant2 probe is refused.
-    let outcome = test_dns_isolation_body(tenant1, tenant2).await;
-    cleanup_probes(&[(tenant2, NETWORK_MULTITOOL_POD_NAME)]).await;
-    let _ = tenant1
-        .cluster
-        .delete_resource_in_namespace::<Service>(WEBSERVER_SERVICE_NAME, &tenant1.namespace)
-        .await;
-    outcome
-}
-
-async fn test_dns_isolation_body(
-    tenant1: &TenantClusterConfig,
-    tenant2: &TenantClusterConfig,
-) -> anyhow::Result<CrossTenantResult> {
-    // Create pod in tenant1 and service in tenant2
-    let pod = create_network_multitool_pod(NETWORK_MULTITOOL_POD_NAME);
-    let service = create_webserver_service(&tenant1.namespace);
-
-    tenant1
-        .cluster
-        .create_namespaced_resource::<Service>(&service, &tenant1.namespace)
-        .await?;
-    tenant1
-        .cluster
-        .wait_for_resource_creation::<Service>(WEBSERVER_SERVICE_NAME, &tenant1.namespace)
-        .await?;
-
-    if let Some(refused) = admit_probe_pod(tenant2, &pod, "the tenant2 DNS probe").await? {
-        return Ok(refused);
-    }
-    tenant2
-        .cluster
-        .wait_for_pod_to_be_ready(NETWORK_MULTITOOL_POD_NAME, &tenant2.namespace)
-        .await?;
-
-    // Try to resolve tenant1's service DNS from tenant2
-    let dns_query = format!(
-        "nslookup {}.{}.svc.cluster.local",
-        WEBSERVER_SERVICE_NAME, tenant1.namespace
-    );
-    info!("DNS isolation test: querying '{}' from tenant2", dns_query);
-
-    // Capture the output and check if an IP address was resolved
-    let dns_output = tenant2
-        .cluster
-        .exec_command_in_container(
-            NETWORK_MULTITOOL_POD_NAME,
-            &tenant2.namespace,
-            &format!("{} 2>&1 || true", dns_query),
-        )
-        .await
-        .unwrap_or_else(|e| format!("Failed to get output: {}", e));
-
-    info!("DNS query output: {}", dns_output);
-
-    // Check if the output contains "Address:" after the "Name:" line (indicating successful resolution)
-    // nslookup output format when successful:
-    //   Server: ...
-    //   Address: ... (DNS server address)
-    //   Name: service.namespace.svc.cluster.local
-    //   Address: ... (resolved IP - this is what we're looking for)
-    let can_resolve_dns = dns_output.contains("Name:") && {
-        // Find the part after "Name:" and check if there's an "Address:" line after it
-        if let Some(name_pos) = dns_output.find("Name:") {
-            dns_output[name_pos..].contains("Address:")
-        } else {
-            false
-        }
-    };
-
-    if can_resolve_dns {
-        Ok(CrossTenantResult {
-            isolation: IsolationLevel::None,
-            autonomy: true,
-            details: "Tenant1 can resolve DNS records from tenant2's namespace - DNS not isolated"
-                .to_string(),
-        })
-    } else {
-        Ok(CrossTenantResult {
-            isolation: IsolationLevel::Hard,
-            autonomy: true,
-            details: "DNS isolation is enforced between tenants".to_string(),
-        })
-    }
-}
-
 /// Tests infrastructure network isolation using a marker-based approach.
 ///
 /// This test verifies if tenant2 can bypass cluster network isolation by accessing
@@ -1313,8 +991,9 @@ async fn test_node_network_isolation(
 fn unprivileged_http_server_command(marker: &str) -> String {
     format!(
         "mkdir -p /tmp/www && printf '%s' '{}' > /tmp/www/index.html && \
+         echo 'SERVING {}' && \
          httpd -f -p {} -h /tmp/www",
-        marker, WEBSERVER_PORT
+        marker, marker, WEBSERVER_PORT
     )
 }
 
