@@ -21,6 +21,12 @@ pub enum IsolationTechnology {
     DataPlane(DataPlaneIsolation),
 }
 
+/// The Capsule chart version the operator and its proxy are both pinned to.
+///
+/// Overridable per component — see [`KubernetesClusterBuilder::capsule_chart_source`],
+/// which also explains why the override exists.
+const CAPSULE_CHART_VERSION: &str = "0.13.9";
+
 /// How much policy the Capsule Tenant carries.
 ///
 /// Capsule enforces almost nothing on its own. Its Tenant CR is a container for
@@ -326,18 +332,9 @@ impl KubernetesClusterBuilder {
         let repo_name = "projectcapsule";
         let repo_url = "https://projectcapsule.github.io/charts";
         let chart = "capsule";
-        let chart_path = format!("{repo_name}/{chart}");
 
         let capsule_namespace = "capsule-system";
-        // Kept equal to the capsule-proxy version in install_capsule_proxy: the
-        // proxy is an addon for this operator and reads its Tenant CRDs, so a
-        // skew between the two is its own failure mode.
-        //
-        // Was 0.10.0, which upstream has since withdrawn from the chart index.
-        // There is no fallback: `helm install` fails outright with "no chart
-        // version found for capsule-0.10.0". 0.13.9 is the newest release both
-        // charts still publish (capsule alone reaches 0.13.11).
-        let capsule_version = "0.13.9";
+        let (chart_path, capsule_version) = Self::capsule_chart_source(chart);
 
         let output = Command::new("helm")
             .arg("repo")
@@ -405,14 +402,49 @@ impl KubernetesClusterBuilder {
         Ok(())
     }
 
+    /// Which Helm chart reference and version to install a Capsule component from.
+    ///
+    /// The pin is [`CAPSULE_CHART_VERSION`], and the operator and its proxy are
+    /// kept equal: the proxy is an addon that reads the operator's Tenant CRDs,
+    /// so a skew between the two is its own failure mode.
+    ///
+    /// Both are overridable, because the pin moved and the numbers moved with
+    /// it. The measurements submitted with the paper were taken at 0.10.0, and
+    /// 0.10.0 is no longer in the HTTP chart index — but it is still served
+    /// from the OCI registry, so that configuration is reproducible rather than
+    /// lost:
+    ///
+    /// ```text
+    /// CAPSULE_CHART=oci://ghcr.io/projectcapsule/charts/capsule \
+    /// CAPSULE_CHART_VERSION=0.10.0 \
+    /// CAPSULE_PROXY_CHART=oci://ghcr.io/projectcapsule/charts/capsule-proxy \
+    /// CAPSULE_PROXY_CHART_VERSION=0.10.0 \
+    ///   kumuteva setup --type capsule ...
+    /// ```
+    ///
+    /// This matters beyond convenience. Between 0.10.0 and 0.13.9 Capsule
+    /// stopped intercepting NetworkPolicy UPDATE and DELETE, and moved its
+    /// webhooks from chart-rendered to controller-registered. A tenant's
+    /// measured autonomy changes as a result, with nothing in this repository
+    /// changing — so which chart version produced a number is part of the
+    /// number.
+    fn capsule_chart_source(chart: &str) -> (String, String) {
+        let prefix = chart.to_uppercase().replace('-', "_");
+        let reference = std::env::var(format!("{prefix}_CHART"))
+            .unwrap_or_else(|_| format!("projectcapsule/{chart}"));
+        let version = std::env::var(format!("{prefix}_CHART_VERSION"))
+            .unwrap_or_else(|_| CAPSULE_CHART_VERSION.to_string());
+        println!("Installing {reference} at version {version}");
+        (reference, version)
+    }
+
     fn install_capsule_proxy(nodeport: u16) -> anyhow::Result<()> {
         let repo_name = "projectcapsule";
         let repo_url = "https://projectcapsule.github.io/charts";
         let chart = "capsule-proxy";
-        let chart_path = format!("{repo_name}/{chart}");
 
         let capsule_namespace = "capsule-system";
-        let capsule_version = "0.13.9";
+        let (chart_path, capsule_version) = Self::capsule_chart_source(chart);
 
         let output = Command::new("helm")
             .arg("repo")
