@@ -31,6 +31,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+from pyarrow import csv as pacsv
 
 import utils.dataloader as dataloader
 import utils.preprocessing as preprocessing
@@ -41,16 +43,42 @@ import utils.stats as stats
 # it bounds the pooled frame to a few tens of MB across every solution.
 SAMPLES_PER_RUN = 20_000
 
-# Only these are read. The CSV also carries `scheduled_latency_ms`, which is a
-# validity diagnostic reported from the manifest rather than plotted, and there
-# is no reason to pay for it in every frame.
+# Only these are read. The CSV also carries `scheduled_latency_ms` and
+# `slot_timestamp_secs`, both diagnostics of whether the generator kept up
+# rather than anything plotted, and there is no reason to pay for them in every
+# frame.
 CSV_COLUMNS = ["tenant", "timestamp_secs", "latency_ms", "is_error", "label"]
 
-CSV_DTYPES = {
-    "tenant": "category",
-    "timestamp_secs": "float32",
-    "latency_ms": "float32",
-    "label": "category",
+# The shape `summarise` returns when there is nothing to summarise, so the
+# notebook's column selection still finds what it asks for.
+SUMMARY_COLUMNS = [
+    "solution",
+    "system",
+    "runs",
+    "failed_runs",
+    "delta_latency",
+    "delta_ci_low",
+    "delta_ci_high",
+    "throughput_retention",
+    "owner_throttled",
+    "delta_spread",
+    "baseline_err_pct",
+    "stress_err_pct",
+    "baseline_ops",
+    "stress_ops",
+]
+
+# How those columns are narrowed on the way in. Declaring the types up front is
+# what keeps the conversion cheap: an Arrow dictionary column becomes a pandas
+# category without a second pass, and the numerics never materialise as float64.
+# A campaign's largest frame is 109 MB this way against ~495 MB left to
+# inference.
+ARROW_TYPES = {
+    "tenant": pa.dictionary(pa.int32(), pa.string()),
+    "timestamp_secs": pa.float32(),
+    "latency_ms": pa.float32(),
+    "is_error": pa.bool_(),
+    "label": pa.dictionary(pa.int32(), pa.string()),
 }
 
 
@@ -71,17 +99,32 @@ class LoadReport:
 
 
 def _read_csv(path):
-    """Read one result CSV with narrow dtypes and only the needed columns."""
-    frame = pd.read_csv(
+    """Read one result CSV with narrow dtypes and only the needed columns.
+
+    Arrow's reader rather than `pd.read_csv`, which is the single biggest cost in
+    a load: 0.23 s against 1.21 s on the campaign's largest file (374 MB, 9.9M
+    rows). It reads the columns in parallel, and `include_columns` means the
+    three we do not plot are never converted.
+
+    Not `pd.read_csv(engine="pyarrow")`, which is nearly as fast and peaks at
+    1.76 GB on that file against 0.59 GB here. The difference is
+    `self_destruct`: it releases each Arrow buffer as it is converted, instead of
+    holding the whole table alongside the finished frame. The table is unusable
+    afterwards, hence the `del`.
+    """
+    table = pacsv.read_csv(
         path,
-        usecols=lambda name: name in CSV_COLUMNS,
-        dtype={k: v for k, v in CSV_DTYPES.items()},
+        convert_options=pacsv.ConvertOptions(
+            include_columns=CSV_COLUMNS,
+            # Older runs predate some columns. A missing one comes back as a
+            # typed all-null column, which is what the rest of the pipeline
+            # expects; without this the read would raise instead.
+            include_missing_columns=True,
+            column_types=ARROW_TYPES,
+        ),
     )
-    # Older runs predate some columns; the deserialiser's rename handles the
-    # names, but a missing column must not become a KeyError downstream.
-    for column in CSV_COLUMNS:
-        if column not in frame.columns:
-            frame[column] = np.nan
+    frame = table.to_pandas(self_destruct=True, split_blocks=True)
+    del table
     return frame
 
 
@@ -155,7 +198,11 @@ def load(src_dir, systems, selection="latest", samples_per_run=SAMPLES_PER_RUN, 
             # Measured on the full run, before anything is thrown away.
             measurements.append(
                 stats.measure(
-                    {"baseline": baseline, "stress_test": stress},
+                    {
+                        "baseline": baseline,
+                        "stress_test": stress,
+                        "manifest": dataloader.load_manifest(paths[1]),
+                    },
                     solution,
                     system,
                     confidence=confidence,
@@ -196,7 +243,14 @@ def summarise(measurements, selection, confidence=0.95):
     Under `"all"` the degradation column is the mean of per-run ratios with a
     bootstrap interval over runs — not a statistic recomputed from pooled rows,
     which would silently weight the longer runs more heavily.
+
+    Loading nothing gives an empty table rather than an error: the notebook
+    already reports "no data" per subsystem, and a traceback from the summary
+    cell buries that message under a stack trace about a missing column.
     """
+    if not measurements:
+        return pd.DataFrame(columns=SUMMARY_COLUMNS)
+
     if selection == "latest":
         return stats.to_frame(measurements)
 

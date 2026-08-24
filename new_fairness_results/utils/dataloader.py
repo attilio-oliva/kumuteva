@@ -44,6 +44,9 @@ def load_experiment_data(src_dir="./", systems_to_load=None):
             experiments[solution][system]['stress_test'] = stress_experiment
             experiments[solution][system]['baseline_metadata'] = baseline_metadata
             experiments[solution][system]['timestamp'] = timestamp
+            # `stats.measure` reads the phase durations from here; absent for
+            # runs that predate manifests.
+            experiments[solution][system]['manifest'] = load_manifest(stress_file)
         else:
             print(f"No matching baseline file for {stress_file}")
     

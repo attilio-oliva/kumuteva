@@ -31,6 +31,11 @@ import pandas as pd
 # degradation a lower bound on the true impact.
 THROUGHPUT_RETENTION_THRESHOLD = 0.95
 
+# Subsystems whose load generator runs in the tool's own process for a known
+# phase length, so the phase duration is the honest denominator for a rate. The
+# rest run inside pods and report their own elapsed time; see `achieved_rate`.
+PHASE_PACED_SYSTEMS = ("control_plane",)
+
 LATENCY_COLUMN = "duration_ms"
 ERROR_COLUMN = "is_error"
 
@@ -55,9 +60,15 @@ def error_rate(frame):
 def achieved_rate(frame, duration_seconds=None):
     """Operations per second over the window the data actually covers.
 
-    Derived from the timestamps rather than the configured phase duration: the
-    pod-based subsystems measure inside the pod, so wall-clock would charge them
-    for pod startup.
+    With no `duration_seconds`, derived from the timestamps rather than the
+    configured phase duration: the pod-based subsystems measure inside the pod,
+    so wall-clock would charge them for pod startup.
+
+    Pass `duration_seconds` for the control plane, where the generator runs in
+    this process for a known phase length and nothing is being amortised. It is
+    the stricter denominator: a phase whose last operation completed at t=12 of
+    30 s is credited with the full 30, because the tenant was trying for all
+    thirty.
     """
     if frame is None or len(frame) == 0:
         return 0.0
@@ -194,11 +205,24 @@ class FairnessMeasurement:
         return retention == retention and retention < THROUGHPUT_RETENTION_THRESHOLD
 
 
+def phase_durations(manifest):
+    """`(baseline_secs, stress_secs)` from a run manifest, or `(None, None)`.
+
+    Absent for runs that predate manifests, in which case the callers fall back
+    to the span of the data.
+    """
+    config = (manifest or {}).get("config") or {}
+    return (
+        config.get("baseline_duration_secs"),
+        config.get("test_duration_secs"),
+    )
+
+
 def measure(experiment, solution, system, confidence=0.95, seed=0):
     """Reduce one loaded experiment to a `FairnessMeasurement`.
 
     `experiment` is the per-system dict produced by `dataloader`, with
-    `baseline` and `stress_test` entries.
+    `baseline` and `stress_test` entries and optionally the run `manifest`.
     """
     baseline_all = experiment["baseline"].t1_df
     stress_all = experiment["stress_test"].t1_df
@@ -213,8 +237,17 @@ def measure(experiment, solution, system, confidence=0.95, seed=0):
     stress_mean = float(stress_latencies.mean()) if len(stress_latencies) else float("nan")
     degradation = stress_mean / baseline_mean if baseline_mean else float("nan")
 
-    baseline_rate = achieved_rate(baseline)
-    stress_rate = achieved_rate(stress)
+    # Retention is the metric that says whether the degradation figure can be
+    # read at all, so its denominator matters most: a tenant that was cut off
+    # for the second half of the phase must not be credited with a full rate
+    # over the half it survived.
+    baseline_secs, stress_secs = (
+        phase_durations(experiment.get("manifest"))
+        if system in PHASE_PACED_SYSTEMS
+        else (None, None)
+    )
+    baseline_rate = achieved_rate(baseline, baseline_secs)
+    stress_rate = achieved_rate(stress, stress_secs)
     retention = stress_rate / baseline_rate if baseline_rate else float("nan")
 
     return FairnessMeasurement(

@@ -10,14 +10,49 @@ class ExperimentData:
         # remove data that has is_error as True
         #df = df[df['is_error'] == False].copy()
         # Do not consider data points with duration_ms <= 0 as they may indicate failed or invalid measurements
-        df = df[df['duration_ms'] > 0].copy()
-        self.raw_df = df
+        # No .copy(): under pandas' copy-on-write a boolean mask already yields a
+        # new frame, and _preprocess's column assignments do not touch the input.
+        self.raw_df = df[df['duration_ms'] > 0]
         self.metadata = metadata or {}
-        self.t1_df = self._preprocess(df[df['role'] == 'tenant1'].copy())
-        self.t2_df = self._preprocess(df[df['role'] == 'tenant2'].copy())
-        # Precompute summary stats for quick access
-        self.t1_summary, self.t2_summary = self.get_summary_stats()
-        
+        # The per-tenant frames and the summaries are built on first access, not
+        # here. `analysis.load` builds one of these per run to read `t1_df` and
+        # then drops it, so eager construction spent most of its time on
+        # `t2_df` and on summaries that nothing in that path ever reads --
+        # around 10 s and 350 MB across a four-subsystem load of `./raw`.
+        self._t1_df = None
+        self._t2_df = None
+        self._summaries = None
+
+    @property
+    def t1_df(self):
+        if self._t1_df is None:
+            self._t1_df = self._preprocess(self.raw_df[self.raw_df['role'] == 'tenant1'])
+        return self._t1_df
+
+    @property
+    def t2_df(self):
+        if self._t2_df is None:
+            self._t2_df = self._preprocess(self.raw_df[self.raw_df['role'] == 'tenant2'])
+        return self._t2_df
+
+    @property
+    def t1_summary(self):
+        return self._cached_summaries()[0]
+
+    @property
+    def t2_summary(self):
+        return self._cached_summaries()[1]
+
+    def _cached_summaries(self):
+        """`get_summary_stats()` at its defaults, computed once per instance.
+
+        The method itself stays public and parameterised; this only memoises the
+        default grouping, which is what `t1_summary` / `t2_summary` expose.
+        """
+        if self._summaries is None:
+            self._summaries = self.get_summary_stats()
+        return self._summaries
+
     def _preprocess(self, df):
         # Ensure numeric types for critical columns
         if 'start_time' in df.columns:
@@ -190,7 +225,12 @@ class TestResultDeserializer:
         # Default mapping for standard fields. 
         # Update this if the new CSV format uses different column names.
         self.column_mapping = column_mapping or {
+            # The dispatch clock, so `elapsed_seconds` spans the phase that was
+            # actually run.
             'timestamp_secs': 'start_time',
+            # The schedule the operation was due on, kept for diagnostics: its
+            # gap from `start_time` is how far behind the generator fell.
+            'slot_timestamp_secs': 'slot_time',
             'latency_ms': 'duration_ms',
             'tenant': 'role',
             'is_error': 'is_error',

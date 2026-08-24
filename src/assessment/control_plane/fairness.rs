@@ -48,7 +48,15 @@ impl Default for FairnessControlPlaneConfig {
 /// what makes the configured rate equal the achieved request rate: a scenario
 /// issuing six requests and one issuing four both emit at the same ops/sec.
 ///
-/// Two latencies are recorded, and only the first is reported.
+/// Two latencies and two time bases are recorded, and only the first of each is
+/// reported.
+///
+/// `timestamp_secs` is when the request was actually dispatched, measured from
+/// the phase start. `slot_timestamp_secs` is when it was *due*. The first is a
+/// clock and the second is an operation counter (`issued / rate`), so they
+/// diverge exactly as far as the generator has fallen behind. Plots and rates
+/// use the clock; charting the schedule instead compresses a 60 s phase into
+/// however many seconds' worth of schedule the run managed to reach.
 ///
 /// `latency_ms` runs from actual dispatch to completion: the time the API server
 /// spent on the request, and the number the degradation factor is computed from.
@@ -73,10 +81,13 @@ macro_rules! timed_operation {
     ($points:expr, $schedule:expr, $label:expr, $call:expr) => {{
         let schedule_start = $schedule.start();
         let intended = $schedule.next_slot().await;
-        let timestamp_secs = intended
+        let slot_timestamp_secs = intended
             .saturating_duration_since(schedule_start)
             .as_secs_f64();
         let dispatched = Instant::now();
+        let timestamp_secs = dispatched
+            .saturating_duration_since(schedule_start)
+            .as_secs_f64();
         let result = $call.await;
         let completed = Instant::now();
 
@@ -90,6 +101,7 @@ macro_rules! timed_operation {
             timestamp_secs,
             latency_ms: service_ms,
             scheduled_latency_ms: Some(scheduled_ms),
+            slot_timestamp_secs: Some(slot_timestamp_secs),
             is_error: result.is_err(),
             label: Some($label),
         });

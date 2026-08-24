@@ -436,7 +436,15 @@ impl FairnessConfig {
 /// Raw metric data point for detailed analysis and CSV export
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MetricPoint {
-    /// Timestamp in seconds from test start
+    /// When the operation was *dispatched*, in seconds from the phase start.
+    ///
+    /// A real clock. A time series drawn against it covers the phase it was
+    /// measured in, and a rate computed from it is the rate the tenant actually
+    /// got. Both of those stop being true if the schedule is used instead —
+    /// see [`Self::slot_timestamp_secs`].
+    ///
+    /// For the pod-based subsystems the pod reports its own elapsed time, which
+    /// is the same quantity measured inside the pod rather than at the caller.
     pub timestamp_secs: f64,
     /// How long the operation took, measured from when it was actually
     /// dispatched to when it completed.
@@ -462,6 +470,23 @@ pub struct MetricPoint {
     /// overload it grows with the phase duration and is not a stable metric.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduled_latency_ms: Option<f64>,
+    /// The operation's *scheduled slot*, in seconds from the phase start, where
+    /// the subsystem dispatches against an [`OperationSchedule`].
+    ///
+    /// Not a clock: [`OperationSchedule::next_intended`] is `issued / rate`, so
+    /// this counts operations, not seconds. The two agree only while the
+    /// generator keeps up. When it falls behind, the schedule runs slow — a
+    /// phase that offered 300 ops/s and achieved 31 advances its schedule by
+    /// about four seconds over thirty real ones.
+    ///
+    /// Which makes it the wrong axis for a time series and the wrong
+    /// denominator for a rate. `ops / schedule_span` reduces to
+    /// `ops / (ops / configured_rate)` — the configured rate, restated, whatever
+    /// the run did. It is kept because paired with `scheduled_latency_ms` it is
+    /// what the coordinated-omission correction is computed from, and because
+    /// its divergence from `timestamp_secs` *is* the shortfall.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_timestamp_secs: Option<f64>,
     /// Whether this operation was an error
     pub is_error: bool,
     /// Optional operation label (e.g., "pod-0", "get-configmap")
@@ -482,9 +507,17 @@ pub struct TenantMetrics {
     pub error_rate: f64,
     /// Wall-clock span covered by the recorded operations, in seconds
     ///
-    /// Derived from the metric timestamps rather than the phase duration: the
-    /// pod-based subsystems measure inside the pod, so the phase wall clock
-    /// would include pod scheduling and startup and understate the rate.
+    /// Derived from [`MetricPoint::timestamp_secs`] rather than the phase
+    /// duration: the pod-based subsystems measure inside the pod, so the phase
+    /// wall clock would include pod scheduling and startup and understate the
+    /// rate.
+    ///
+    /// That only holds because `timestamp_secs` is a clock. Taken from
+    /// [`MetricPoint::slot_timestamp_secs`] instead, this span is
+    /// `operations / configured_rate` and the achieved rate derived from it is
+    /// the configured rate by construction — a saturated phase would report
+    /// full throughput. The distinction is the whole reason the two fields are
+    /// separate.
     pub observed_span_secs: f64,
     /// Payload bytes moved per second, where the subsystem knows its payload size
     ///
@@ -1371,11 +1404,15 @@ async fn write_csv(path: &str, phase: &PhaseResult) -> Result<()> {
     // Use a large buffer (e.g., 64KB) to minimize syscalls
     let mut writer = BufWriter::with_capacity(64 * 1024, file);
 
-    // `scheduled_latency_ms` is appended after the original columns so that
-    // readers of the pre-existing five-column format keep working unchanged.
-    // `latency_ms` holds dispatch-to-completion, the reported latency.
+    // `scheduled_latency_ms` and `slot_timestamp_secs` are appended after the
+    // original columns so that readers of the pre-existing five-column format
+    // keep working unchanged. `latency_ms` holds dispatch-to-completion, the
+    // reported latency; `timestamp_secs` holds the dispatch clock, so a reader
+    // that knows nothing of the schedule still gets a correct time axis.
     writer
-        .write_all(b"tenant,timestamp_secs,latency_ms,is_error,label,scheduled_latency_ms\n")
+        .write_all(
+            b"tenant,timestamp_secs,latency_ms,is_error,label,scheduled_latency_ms,slot_timestamp_secs\n",
+        )
         .await?;
 
     // Reusable buffer to avoid allocating a new String for every row
@@ -1400,8 +1437,12 @@ async fn write_csv(path: &str, phase: &PhaseResult) -> Result<()> {
                 point.label.as_deref().unwrap_or("")
             )
             .unwrap();
-            match point.scheduled_latency_ms {
-                Some(scheduled) => writeln!(&mut line_buf, "{scheduled:.3}").unwrap(),
+            if let Some(scheduled) = point.scheduled_latency_ms {
+                write!(&mut line_buf, "{scheduled:.3}").unwrap();
+            }
+            line_buf.push(',');
+            match point.slot_timestamp_secs {
+                Some(slot) => writeln!(&mut line_buf, "{slot:.3}").unwrap(),
                 None => writeln!(&mut line_buf).unwrap(),
             }
 
@@ -1721,9 +1762,12 @@ mod tests {
         assert_eq!(empty_phase.fairness_level(), FairnessLevel::Unknown);
     }
 
-    /// Achieved rate must come from the metric timestamps, so that pod-based
+    /// Achieved rate must come from the dispatch timestamps, so that pod-based
     /// subsystems (which measure inside the pod) are not penalised for pod
     /// startup time the way a phase wall-clock denominator would penalise them.
+    ///
+    /// See `achieved_rate_ignores_the_schedule` for the other half: those
+    /// timestamps have to be the clock, not the slot.
     #[test]
     fn achieved_rate_uses_observed_span() {
         let pts: Vec<MetricPoint> = (0..=10)
@@ -1731,6 +1775,7 @@ mod tests {
                 timestamp_secs: i as f64 * 0.5, // 11 points spanning 5 s
                 latency_ms: 1.0,
                 scheduled_latency_ms: None,
+                slot_timestamp_secs: None,
                 is_error: false,
                 label: None,
             })
@@ -1766,10 +1811,70 @@ mod tests {
             timestamp_secs: 3.0,
             latency_ms: 1.0,
             scheduled_latency_ms: None,
+            slot_timestamp_secs: None,
             is_error: false,
             label: None,
         }]);
         assert_eq!(single.achieved_ops_per_sec(), 0.0);
+    }
+
+    /// The achieved rate must be blind to the schedule.
+    ///
+    /// Numbers are one capsule 0.13.9 control-plane baseline: 474 operations
+    /// from a tenant configured for 150 ops/s, over a 30 s phase. The generator
+    /// got 15.8 ops/s and its schedule advanced 3.97 s.
+    ///
+    /// Denominated in schedule time the phase reports its own configured rate
+    /// back — the operation count is in both numerator and denominator, so it
+    /// cancels — and a run that delivered a tenth of its load looks perfect.
+    /// That is what produced a manifest claiming 119.5 ops/s and 91.9%
+    /// throughput retention for a run whose regular tenant retained 17.8%.
+    #[test]
+    fn achieved_rate_ignores_the_schedule() {
+        const OPS: u64 = 474;
+        const CONFIGURED_RATE: f64 = 150.0;
+        const PHASE_SECS: f64 = 30.0;
+
+        let points: Vec<MetricPoint> = (0..OPS)
+            .map(|i| {
+                let progress = i as f64 / (OPS - 1) as f64;
+                MetricPoint {
+                    // Dispatch is spread across the whole phase: the workers
+                    // never stopped, each request just took ~330 ms.
+                    timestamp_secs: progress * PHASE_SECS,
+                    // The schedule advanced one slot per operation issued.
+                    slot_timestamp_secs: Some(i as f64 / CONFIGURED_RATE),
+                    latency_ms: 330.0,
+                    scheduled_latency_ms: Some(13_900.0),
+                    is_error: false,
+                    label: None,
+                }
+            })
+            .collect();
+
+        let slot_span = points
+            .last()
+            .and_then(|p| p.slot_timestamp_secs)
+            .expect("slot recorded");
+        let m = TenantMetrics::from_raw(points);
+
+        assert!((m.observed_span_secs - PHASE_SECS).abs() < 1e-9);
+        assert!(
+            (m.achieved_ops_per_sec() - 15.8).abs() < 0.1,
+            "expected the delivered rate, got {}",
+            m.achieved_ops_per_sec()
+        );
+
+        // The trap, stated as an assertion: the schedule span is the operation
+        // count over the configured rate, so dividing by it restates the
+        // configured rate no matter what the run did.
+        assert!((slot_span - 3.153).abs() < 1e-3);
+        let from_schedule = OPS as f64 / slot_span;
+        assert!(
+            (from_schedule - CONFIGURED_RATE).abs() < 1.0,
+            "schedule-denominated rate should collapse onto the configured rate, got {from_schedule}"
+        );
+        assert!(from_schedule > 9.0 * m.achieved_ops_per_sec());
     }
 
     /// Reproduces the reference campaign's control-plane throughput collapse.
@@ -1892,6 +1997,7 @@ mod tests {
                     timestamp_secs: i as f64,
                     latency_ms: lat,
                     scheduled_latency_ms: None,
+                    slot_timestamp_secs: None,
                     is_error: false,
                     label: None,
                 })
@@ -1987,6 +2093,62 @@ mod tests {
         assert!(v["baseline"]["tenant1"].get("achieved_mbps").is_none());
     }
 
+    /// The CSV column contract, which the Python analysis reads by name.
+    ///
+    /// Both optional columns are emitted as empty fields when absent rather
+    /// than dropped, so every row has the same arity and a subsystem that has
+    /// no schedule (the pod-based ones) still parses.
+    #[tokio::test]
+    async fn csv_carries_dispatch_and_slot_time_in_separate_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "kumuteva-csv-{}-{}.csv",
+            std::process::id(),
+            line!()
+        ));
+        let path = path.to_str().expect("utf-8 temp path").to_string();
+
+        let phase = PhaseResult {
+            tenant1: TenantMetrics::from_raw(vec![MetricPoint {
+                // Dispatched 12 s in, but only 1.5 s worth of schedule had been
+                // consumed by then: the generator is 8x behind.
+                timestamp_secs: 12.0,
+                slot_timestamp_secs: Some(1.5),
+                latency_ms: 330.0,
+                scheduled_latency_ms: Some(10_830.0),
+                is_error: false,
+                label: Some("create-cm-0".to_string()),
+            }]),
+            tenant2: TenantMetrics::from_raw(vec![MetricPoint {
+                // A pod-based subsystem: no schedule, so no slot.
+                timestamp_secs: 4.0,
+                slot_timestamp_secs: None,
+                latency_ms: 2.0,
+                scheduled_latency_ms: None,
+                is_error: true,
+                label: Some("tcp-ping-0".to_string()),
+            }]),
+        };
+
+        write_csv(&path, &phase).await.expect("csv written");
+        let written = tokio::fs::read_to_string(&path).await.expect("csv read");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let mut lines = written.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "tenant,timestamp_secs,latency_ms,is_error,label,scheduled_latency_ms,slot_timestamp_secs"
+        );
+        assert_eq!(
+            lines.next().unwrap(),
+            "tenant1,12.000,330.000,false,create-cm-0,10830.000,1.500"
+        );
+        assert_eq!(
+            lines.next().unwrap(),
+            "tenant2,4.000,2.000,true,tcp-ping-0,,"
+        );
+        assert!(lines.next().is_none());
+    }
+
     #[test]
     fn tenant_metrics_excludes_nothing_and_reports_error_rate() {
         let pts = vec![
@@ -1994,6 +2156,7 @@ mod tests {
                 timestamp_secs: 0.0,
                 latency_ms: 10.0,
                 scheduled_latency_ms: None,
+                slot_timestamp_secs: None,
                 is_error: false,
                 label: None,
             },
@@ -2001,6 +2164,7 @@ mod tests {
                 timestamp_secs: 1.0,
                 latency_ms: 30.0,
                 scheduled_latency_ms: None,
+                slot_timestamp_secs: None,
                 is_error: false,
                 label: None,
             },
@@ -2008,6 +2172,7 @@ mod tests {
                 timestamp_secs: 2.0,
                 latency_ms: 2000.0,
                 scheduled_latency_ms: None,
+                slot_timestamp_secs: None,
                 is_error: true,
                 label: None,
             },

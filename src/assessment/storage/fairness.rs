@@ -628,8 +628,10 @@ fn parse_fio_latency_log(logs: &str, pod_index: u32) -> Vec<MetricPoint> {
 
                 points.push(MetricPoint {
                     // Pacing happens inside the pod, so there is no dispatch schedule to
-                    // measure against: the recorded latency is already the service time.
+                    // measure against: the recorded latency is already the service time,
+                    // and fio's `time_ms` is already the pod's own dispatch clock.
                     scheduled_latency_ms: None,
+                    slot_timestamp_secs: None,
                     timestamp_secs: time_ms / 1000.0, // Convert ms to seconds
                     latency_ms: latency_ns / 1_000_000.0, // Convert ns to ms
                     is_error: false,

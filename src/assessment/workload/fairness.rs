@@ -582,8 +582,10 @@ async fn collect_results(tenant: &TenantClusterConfig, pods: u32) -> Result<Vec<
                     if let (Ok(ts), Ok(secs)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
                         points.push(MetricPoint {
                             // Pacing happens inside the pod, so there is no dispatch schedule to
-                            // measure against: the recorded latency is already the service time.
+                            // measure against: the recorded latency is already the service time,
+                            // and `ts` is already the pod's own dispatch clock.
                             scheduled_latency_ms: None,
+                            slot_timestamp_secs: None,
                             timestamp_secs: ts,
                             latency_ms: secs * 1000.0, // seconds to ms
                             is_error: false,
@@ -770,10 +772,11 @@ mod rate_shortfall_tests {
                 timestamp_secs: i as f64,
                 latency_ms: 1.0,
                 // Deliberately None, matching `collect_results`: this generator
-                // does not dispatch against an `OperationSchedule`, so the
-                // coordinated-omission factor other subsystems use as their
-                // validity check does not exist here.
+                // does not dispatch against an `OperationSchedule`, so neither
+                // the coordinated-omission factor other subsystems use as their
+                // validity check nor a scheduled slot exists here.
                 scheduled_latency_ms: None,
+                slot_timestamp_secs: None,
                 is_error: false,
                 label: None,
             })
