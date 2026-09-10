@@ -2,9 +2,9 @@
 #
 # Run the fairness campaign over a set of solutions, N repetitions each.
 #
-#   experiments/run-campaign.sh --reps 5 capsule capsule-proxy vcluster kubevirt
-#   experiments/run-campaign.sh --reps 5 --volume emptydir capsule
-#   experiments/run-campaign.sh --dry-run --reps 5 capsule
+#   experiments/run-fairness-campaign.sh --reps 5 capsule capsule-proxy vcluster kubevirt
+#   experiments/run-fairness-campaign.sh --reps 5 --volume emptydir capsule
+#   experiments/run-fairness-campaign.sh --dry-run --reps 5 capsule
 #
 # This automates sections 4 and 5 of RUNBOOK.md: provision a cluster, pin it to
 # the benchmark cores, run the fairness assessment N times, check each result,
@@ -44,7 +44,19 @@ SUPPORTED="capsule capsule-proxy vcluster kubevirt native kamaji"
 
 usage() {
     cat <<'EOF'
-Usage: run-campaign.sh [options] <solution> [solution...]
+Usage: run-fairness-campaign.sh [options] <solution> [solution...]
+
+A solution is a control-plane name, optionally with data-plane technologies
+appended after '+' — the same names run-isolation-matrix.sh takes, so the two
+campaigns produce rows that join on the label:
+
+  capsule                 the control-plane solution alone
+  native+gvisor           gVisor, on no control-plane isolation at all
+  native+kata             Kata Containers, each pod in its own VM
+  capsule+calico          both, to see whether they compose
+
+Sandbox rows pass --runtime-class automatically, so the workloads are measured
+under the sandbox rather than quietly on runc.
 
 Options:
   -r, --reps N          Repetitions per solution (default 5; 5 is the minimum
@@ -64,9 +76,9 @@ Options:
   -h, --help
 
 Examples:
-  run-campaign.sh --reps 5 capsule capsule-proxy vcluster kubevirt
-  run-campaign.sh --reps 3 --volume emptydir capsule
-  run-campaign.sh --reps 5 capsule -- --wl-noise mixed
+  run-fairness-campaign.sh --reps 5 capsule capsule-proxy vcluster kubevirt
+  run-fairness-campaign.sh --reps 3 --volume emptydir capsule
+  run-fairness-campaign.sh --reps 5 capsule -- --wl-noise mixed
 EOF
 }
 
@@ -168,15 +180,64 @@ if ! command -v python3 >/dev/null 2>&1; then
     CHECK_RESULTS=false
 fi
 
-# The governor lock does not survive a reboot, so its absence is worth saying
-# out loud every time rather than assuming a previous session applied it.
-if [[ -f $HOST_PREP_STATE ]]; then
-    ok "host prepared (state at $HOST_PREP_STATE)"
+# The host must be *measured*, not trusted.
+#
+# This used to check only for the state file host-prep.sh leaves behind, and to
+# warn rather than stop. Both were wrong. A reboot undoes every setting while
+# leaving the file in place, and a warning in a long scrollback is a warning
+# nobody reads — so a campaign ran on `ondemand` with turbo on and C6 enabled,
+# cores idling at 797 MHz, and produced degradation factors below 1.0 across
+# every solution.
+#
+# That number is not noise, it is the machine: during the baseline the box is
+# comparatively idle, so cores sit at their lowest frequency and drop into C6
+# (290us exit latency). The interference phase then wakes them up, and the
+# victim's latency *improves* under attack — in the median as well as the tail.
+# The measurement inverts.
+#
+# So each setting is read back from sysfs, and a campaign that would produce
+# uninterpretable numbers does not start.
+host_locked=true
+
+governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)
+if [[ $governor == performance ]]; then
+    ok "CPU governor: performance"
 else
-    warn "host-prep.sh has not been applied — CPU frequency may scale between"
-    info "  the baseline and stress phases, which is what produced a degradation"
-    info "  factor below 1.0 in the first submission. Run:"
-    info "    sudo experiments/host-prep.sh | tee experiments/host-state-\$(date +%F).txt"
+    fail "CPU governor is '$governor', not 'performance'"
+    host_locked=false
+fi
+
+if [[ -r /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+    if [[ $(cat /sys/devices/system/cpu/intel_pstate/no_turbo) == 1 ]]; then
+        ok "turbo: disabled"
+    else
+        fail "turbo is enabled — clocks vary with load, which is the load being measured"
+        host_locked=false
+    fi
+fi
+
+# Anything deeper than C1 costs hundreds of microseconds to leave, which is the
+# same order as the latencies being measured.
+deep_enabled=0
+for state in /sys/devices/system/cpu/cpu0/cpuidle/state[2-9]*/disable; do
+    [[ -r $state ]] || continue
+    [[ $(cat "$state") == 0 ]] && deep_enabled=$((deep_enabled + 1))
+done
+if [[ $deep_enabled -gt 0 ]]; then
+    fail "$deep_enabled deep C-state(s) still enabled on cpu0"
+    host_locked=false
+else
+    ok "idle states: nothing deeper than C1"
+fi
+
+if [[ $host_locked != true ]]; then
+    fail "the host is not locked, so a degradation factor from this run would"
+    fail "  describe CPU power management rather than the solution. Run:"
+    fail "    sudo experiments/host-prep.sh | tee experiments/host-state-\$(date +%F).txt"
+    preflight_failed=1
+elif [[ ! -f $HOST_PREP_STATE ]]; then
+    # Locked, but with no record of what it was before — the restore path.
+    warn "host is locked but $HOST_PREP_STATE is missing; host-prep.sh cannot restore"
 fi
 
 if [[ -z $BENCH_CPUS ]]; then
@@ -204,7 +265,9 @@ if git -C "$REPO_ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
 fi
 
 for solution in "${SOLUTIONS[@]}"; do
-    if [[ " $SUPPORTED " != *" $solution "* ]]; then
+    # Only the control-plane half is a `setup --type`; the rest are
+    # `--data-plane` technologies, which this list does not enumerate.
+    if [[ " $SUPPORTED " != *" ${solution%%+*} "* ]]; then
         warn "'$solution' is not provisioned by \`kumuteva setup\`"
         info "  (KubeZoo in particular must be brought up by hand; use --skip-setup)"
     fi
@@ -292,13 +355,44 @@ campaign_started=$(date +%s)
 declare -a SUMMARY=()
 
 for solution in "${SOLUTIONS[@]}"; do
-    cluster="${CLUSTER_PREFIX}-${solution}"
+    # A solution name is `<control-plane>[+<data-plane>[+...]]`, the same shape
+    # run-isolation-matrix.sh takes and the same label `kumuteva setup` records
+    # — so a row is named identically in both campaigns and the isolation and
+    # fairness tables can be joined on it.
+    control_plane="${solution%%+*}"
+    data_plane_args=()
+    if [[ $solution == *+* ]]; then
+        # Commas rather than repeated flags: `--data-plane` takes a list.
+        data_plane_args=(--data-plane "$(printf '%s' "${solution#*+}" | tr '+' ',')")
+    fi
+
+    # A sandbox is opt-in per pod, so the fairness workloads have to name it
+    # too. Measuring Kata's or gVisor's overhead against workloads that quietly
+    # ran on runc would be worse than not measuring it.
+    fairness_runtime_args=()
+    [[ $solution == *gvisor* ]] && fairness_runtime_args=(--runtime-class gvisor)
+    [[ $solution == *kata* ]] && fairness_runtime_args=(--runtime-class kata)
+
+    cluster="${CLUSTER_PREFIX}-${solution//+/-}"
     out_dir="$OUTPUT_ROOT/$solution"
     t1="$KUBECONFIG_DIR/tenant1-${cluster}.kubeconfig"
     t2="$KUBECONFIG_DIR/tenant2-${cluster}.kubeconfig"
 
     banner "$solution"
     run mkdir -p "$out_dir" "$KUBECONFIG_DIR"
+
+    # KubeVirt's VM sizing is deliberately left alone.
+    #
+    # A guard used to sit here refusing to run KubeVirt unless the pinned CPU
+    # budget covered every tenant vCPU, on the theory that 4 VMs of 8 cores
+    # inside a 16-CPU cpuset starved the guests. That reasoning confused
+    # allocation with demand: the guests only consume what their workload asks
+    # for, and the workload's real cost was the measurement client, not the VMs.
+    #
+    # With a load generator that no longer spends ~50ms of its own overhead per
+    # packet, the same 16 CPUs and the same 8-core VMs carry the full 10x
+    # escalation: the intruder reaches 187,502 pkt/s where it previously managed
+    # 24,224, and the regular tenant keeps 100% of its throughput.
 
     # --- provision ---
     if [[ $SKIP_SETUP == true ]]; then
@@ -307,7 +401,8 @@ for solution in "${SOLUTIONS[@]}"; do
         info "creating cluster $cluster"
         if ! run "$KUMUTEVA_BIN" setup \
             --cluster-name "$cluster" \
-            --type "$solution" \
+            --type "$control_plane" \
+            "${data_plane_args[@]}" \
             --provider kind \
             --output "$KUBECONFIG_DIR"; then
             fail "setup failed for $solution — skipping"
@@ -364,7 +459,8 @@ for solution in "${SOLUTIONS[@]}"; do
             run "$KUMUTEVA_BIN" fairness "$t1" "$t2" \
                 --config "$CONFIG" --solution-label "$solution" \
                 --export-csv --output-dir "$out_dir" \
-                --st-volume "$VOLUME" --verbose "${EXTRA_ARGS[@]}"
+                --st-volume "$VOLUME" --verbose \
+                "${fairness_runtime_args[@]}" "${EXTRA_ARGS[@]}"
             continue
         fi
 
@@ -373,7 +469,8 @@ for solution in "${SOLUTIONS[@]}"; do
             --solution-label "$solution" \
             --export-csv --output-dir "$out_dir" \
             --st-volume "$VOLUME" \
-            --verbose "${EXTRA_ARGS[@]}" 2>&1 | tee "$log"; then
+            --verbose \
+            "${fairness_runtime_args[@]}" "${EXTRA_ARGS[@]}" 2>&1 | tee "$log"; then
             fail "run $rep exited non-zero (log: $log)"
             flagged_runs=$((flagged_runs + 1))
             continue

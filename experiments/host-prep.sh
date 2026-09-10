@@ -24,7 +24,7 @@ set -uo pipefail
 STATE_FILE=/var/lib/kumuteva-host-prep.state
 
 # Services that will fight the performance governor if left running.
-COMPETING_SERVICES=(ondemand tuned power-profiles-daemon thermald)
+COMPETING_SERVICES=(ondemand tuned power-profiles-daemon thermald cpufrequtils)
 
 failures=0
 
@@ -181,23 +181,40 @@ if [[ -n ${previous_governor} ]]; then
     save "governor=${previous_governor}"
 fi
 
+# Applied, then read back, and the read-back is what decides.
+#
+# `cpupower frequency-set` was previously trusted on its exit status, and the
+# sysfs loop below ran only when cpupower was *missing*. On a host where
+# cpupower exists, returns 0 and changes nothing — intel_pstate in passive mode
+# here — this printed "set to performance" over 96 CPUs still on `ondemand`.
+# A whole campaign then ran unpinned, and every degradation factor came out
+# below 1.0 because the interference phase woke the cores up.
+not_performance() {
+    cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null \
+        | grep -cv '^performance$'
+}
+
 if command -v cpupower >/dev/null 2>&1; then
-    if cpupower frequency-set -g performance >/dev/null 2>&1; then
-        note "set to performance"
+    cpupower frequency-set -g performance >/dev/null 2>&1 || true
+    if [[ $(not_performance) -eq 0 ]]; then
+        note "set to performance via cpupower"
     else
-        warn "cpupower could not set the governor"
+        note "cpupower did not apply it; falling back to sysfs"
     fi
-else
+fi
+
+if [[ $(not_performance) -gt 0 ]]; then
     applied=0
     for governor in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         [[ -w ${governor} ]] || continue
         echo performance > "${governor}" 2>/dev/null && applied=$((applied + 1))
     done
-    if [[ ${applied} -gt 0 ]]; then
-        note "set to performance on ${applied} CPUs via sysfs"
-    else
-        warn "no writable scaling_governor found; frequency is NOT pinned"
-    fi
+    note "wrote performance to ${applied} CPUs via sysfs"
+fi
+
+remaining=$(not_performance)
+if [[ ${remaining} -gt 0 ]]; then
+    warn "${remaining} CPU(s) are NOT on the performance governor; frequency is not pinned"
 fi
 note "after: $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u | tr '\n' ' ')"
 
