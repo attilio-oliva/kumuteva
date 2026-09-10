@@ -376,6 +376,16 @@ pub(super) fn create_minimal_object(
             });
         }
 
+        // A Node object with no kubelet behind it never reports Ready, so the
+        // scheduler would ignore it anyway. `unschedulable` says so outright
+        // rather than relying on that: this node exists for a few seconds to be
+        // created and deleted, and a tenant workload landing on a machine that
+        // does not exist would be a bad way to discover the assumption was
+        // wrong.
+        KubernetesObject::Node => {
+            base_object["spec"] = serde_json::json!({ "unschedulable": true });
+        }
+
         // Add more specific cases as needed
         _ => {
             // For other resources, the base object should be sufficient

@@ -23,9 +23,24 @@
 //! experiment did not run and the report says the platform is secure. Here that
 //! case is `Unknown`, once, for every experiment.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use k8s_openapi::api::core::v1::{Pod, Service};
+use tokio::time::sleep;
 use tracing::info;
+
+/// How long to wait for a pod's IP to appear in its status after it reports
+/// Running, in one-second attempts.
+const ADDRESS_ATTEMPTS: u32 = 30;
+
+/// How long to wait for the target's secret to appear in its logs after it
+/// reports Ready, in one-second attempts.
+///
+/// Generous because the cost of being wrong is asymmetric: waiting too long
+/// slows a run, while giving up too early throws the experiment away as
+/// `Unknown` and looks like a property that could not be measured.
+const SECRET_ATTEMPTS: u32 = 60;
 
 use crate::assessment::{
     admission_refusal, CrossTenantResult, IsolationLevel, TenantClusterConfig,
@@ -100,6 +115,12 @@ pub enum Secret {
     /// The target prints nothing, so readiness is the only confirmation
     /// available.
     ///
+    /// Currently unused, and that is the healthy state: every experiment now
+    /// has its target publish something checkable. Kept because it names the
+    /// weakest control available, and a future experiment reaching for it
+    /// should have to see what it is settling for.
+    #[allow(dead_code)]
+    ///
     /// Weaker, and the weakness is real: a pod can be `Ready` while its
     /// workload has not done what the experiment needs. Used only where the
     /// target is a bare long-running process with nothing to report.
@@ -149,6 +170,17 @@ pub struct PlantedSecret {
 enum Observation {
     /// The platform would not let the intruder run at all.
     Refused(String),
+    /// The intruder had to share the victim's node, and that node is not one
+    /// this tenant can place a pod on.
+    TargetNodeUnreachable(String),
+    /// Admission accepted it and the runtime then would not start it.
+    CouldNotRun {
+        reason: String,
+        /// Whether the pod that was turned away had asked for privilege or a
+        /// host namespace, which is what separates a sandbox declining a
+        /// dangerous request from a probe that is simply broken.
+        asked_for_host_privilege: bool,
+    },
     /// It ran; this is what it printed.
     Saw(String),
 }
@@ -177,6 +209,15 @@ pub async fn run_breach_experiment(
         // 3 — the intruder can only be built now that placement is known.
         match observe(exp, intruder_tenant, &planted).await? {
             Observation::Refused(why) => Ok(platform_refused(exp, &why)),
+            Observation::TargetNodeUnreachable(why) => Ok(target_node_unreachable(exp, &why)),
+            Observation::CouldNotRun {
+                reason,
+                asked_for_host_privilege,
+            } => Ok(runtime_would_not_run(
+                exp,
+                asked_for_host_privilege,
+                &reason,
+            )),
             // 4
             Observation::Saw(output) => Ok(judge(exp, &planted.secret, &output)),
         }
@@ -216,16 +257,38 @@ async fn plant_secret(
         .as_ref()
         .and_then(|spec| spec.node_name.clone())
         .unwrap_or_default();
-    let address = pod
+    // The address the intruder will aim at. Retried, because a pod can report
+    // Running a moment before its IP appears in status — Kube-OVN is slower to
+    // populate it than the CNIs this was written against.
+    //
+    // `unwrap_or_default()` here used to hand the intruder an empty string. It
+    // then connected to nothing, observed no secret, and the run recorded Hard
+    // isolation for a cluster enforcing none — the intruder had never been
+    // pointed anywhere. Verified by hand on Kube-OVN: pod-to-pod curl succeeds
+    // while the probe reported the tenants isolated.
+    let mut address = pod
         .status
         .as_ref()
         .and_then(|status| status.pod_ip.clone())
         .unwrap_or_default();
 
+    for _ in 0..ADDRESS_ATTEMPTS {
+        if !address.is_empty() {
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+        address = victim
+            .cluster
+            .get_pod_in_namespace(&name, &victim.namespace)
+            .await
+            .ok()
+            .and_then(|pod| pod.status.and_then(|status| status.pod_ip))
+            .unwrap_or_default();
+    }
+
     // A Service, where the experiment declares one. Created after the target so
     // it has a pod to select, and its ClusterIP supersedes the pod IP as the
     // address the intruder aims at.
-    let mut address = address;
     if let Some(service) = &exp.target_service {
         victim
             .cluster
@@ -244,12 +307,41 @@ async fn plant_secret(
             .unwrap_or(address);
     }
 
-    let logs = victim
-        .cluster
-        .get_pod_logs(&name, &victim.namespace)
-        .await
-        .unwrap_or_default();
-    let secret = recover_secret(&exp.secret, &logs);
+    // Aiming an intruder at nowhere produces silence, and silence is what this
+    // executor reads as isolation — so refuse to run rather than report it.
+    if address.is_empty() && matches!(exp.intruder, Intruder::AtTargetAddress(_)) {
+        info!(
+            "{}: the target never reported an address, so the intruder has nothing to aim at",
+            exp.what
+        );
+        return Ok(None);
+    }
+
+    // Readiness means the pod is Running, not that its script has finished
+    // printing. Reading the logs once, right here, is a race the harness lost
+    // intermittently: under gVisor the same `ipc-target` planted its
+    // fingerprint on three runs out of four, and the fourth reported that the
+    // target "never planted its secret" — a slower runtime, not a difference
+    // in isolation. Verified by hand afterwards: all three `ipcmk` calls
+    // succeed under `runsc`, so nothing was ever wrong but the timing.
+    //
+    // Polling keeps the control honest rather than weakening it: a target that
+    // truly plants nothing still reports nothing, it just takes the full
+    // window to say so.
+    let mut logs = String::new();
+    let mut secret = String::new();
+    for _ in 0..SECRET_ATTEMPTS {
+        logs = victim
+            .cluster
+            .get_pod_logs(&name, &victim.namespace)
+            .await
+            .unwrap_or_default();
+        secret = recover_secret(&exp.secret, &logs);
+        if !secret.is_empty() {
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
 
     if secret.is_empty() {
         info!(
@@ -291,6 +383,52 @@ async fn observe(
 
     wait_for_completion(intruder_tenant, &name).await;
 
+    // Before reading logs, ask whether there was ever a process to write them.
+    let landed = intruder_tenant
+        .cluster
+        .get_pod_in_namespace(&name, &intruder_tenant.namespace)
+        .await
+        .ok();
+    // Pinned to a node this cluster does not have.
+    //
+    // Host namespaces are per-node, so these intruders name the victim's node
+    // directly. Where the tenants are separate clusters — KubeVirt gives each
+    // its own VMs — that name means nothing on the intruder's side: the pod is
+    // never scheduled, never runs, and writes no logs. Read as output, the
+    // silence says "the intruder looked and saw nothing", and the marker-based
+    // experiments scored it as isolation. The property was never tested.
+    if let Some(reason) = landed.as_ref().and_then(never_placed) {
+        // Confirm it rather than infer it: ask this tenant which nodes it has.
+        // A pinned pod that never ran for some *other* reason must not be
+        // reported as an absent node.
+        let pinned = intruder.spec.as_ref().and_then(|spec| spec.node_name.clone());
+        let absent = match (&pinned, intruder_tenant.cluster.list_nodes().await) {
+            (Some(node), Ok(nodes)) => !nodes
+                .iter()
+                .any(|known| known.metadata.name.as_deref() == Some(node.as_str())),
+            // No node list to check against — the tenant may not read nodes at
+            // all. The pod being pinned and never claimed is the evidence left.
+            (Some(_), Err(_)) => true,
+            (None, _) => false,
+        };
+
+        if absent {
+            return Ok(Observation::TargetNodeUnreachable(reason));
+        }
+
+        return Ok(Observation::CouldNotRun {
+            reason,
+            asked_for_host_privilege: asks_for_host_privilege(&intruder),
+        });
+    }
+
+    if let Some(reason) = landed.as_ref().and_then(never_started) {
+        return Ok(Observation::CouldNotRun {
+            reason,
+            asked_for_host_privilege: asks_for_host_privilege(&intruder),
+        });
+    }
+
     Ok(Observation::Saw(
         intruder_tenant
             .cluster
@@ -298,6 +436,142 @@ async fn observe(
             .await
             .unwrap_or_default(),
     ))
+}
+
+/// Why this pod never got onto a node, if it never did.
+///
+/// Two shapes, and the second is the one that matters here.
+///
+/// A pod the *scheduler* rejected carries `PodScheduled=False` with a message.
+/// But these intruders are pinned with `spec.nodeName`, which bypasses the
+/// scheduler completely — nothing ever evaluates them, so no condition is
+/// written at all. Naming a node that does not exist simply leaves the pod
+/// Pending forever, with no conditions, no events and no container statuses.
+///
+/// Reading only the first shape missed every one of them, which is how a probe
+/// that never ran kept reaching the verdict stage with empty logs.
+fn never_placed(pod: &Pod) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    if status.phase.as_deref() != Some("Pending") {
+        return None;
+    }
+
+    if let Some(condition) = status.conditions.as_ref().and_then(|conditions| {
+        conditions
+            .iter()
+            .find(|condition| condition.type_ == "PodScheduled" && condition.status == "False")
+    }) {
+        return Some(
+            condition
+                .message
+                .clone()
+                .unwrap_or_else(|| condition.reason.clone().unwrap_or_default()),
+        );
+    }
+
+    // Pinned, and no kubelet ever claimed it. A pod on a real node reports
+    // container statuses well before this point — the executor has already
+    // waited for it to finish.
+    let pinned = pod.spec.as_ref()?.node_name.as_deref()?;
+    let never_ran = status
+        .container_statuses
+        .as_ref()
+        .is_none_or(|statuses| statuses.is_empty());
+    never_ran.then(|| format!("pinned to node {pinned}, which never accepted it"))
+}
+
+/// The intruder had to stand on the victim's node and cannot.
+///
+/// `Hard`, and it is earned rather than assumed: the tenant asked the platform
+/// to place a pod on that node and was told there is no such node here. Host
+/// namespaces are per-node, so a node the intruder cannot reach carries no
+/// namespace it could share — which is exactly what a lone tenant sees, its own
+/// nodes and no others.
+///
+/// Distinct from silence. The pod never ran, so nothing it failed to print is
+/// evidence of anything, and reading those empty logs as "looked and saw
+/// nothing" is what scored this as isolation without testing it.
+fn target_node_unreachable(exp: &BreachExperiment, why: &str) -> CrossTenantResult {
+    CrossTenantResult {
+        isolation: IsolationLevel::Hard,
+        autonomy: true,
+        details: format!(
+            "{}: the victim's node is not one this tenant can place a pod on, so they \
+             share no node and no per-node namespace — {why}",
+            exp.what
+        ),
+    }
+}
+
+/// Why the pod's containers never started, if they never did.
+///
+/// A container that fails to start still answers a log request — containerd
+/// puts *its own* error there, and that error quotes the container's argv. A
+/// probe's argv carries the very markers `judge` searches for, so reading
+/// those logs as probe output reports a breach for a probe that never ran.
+///
+/// Seen under gVisor, which refuses privileged containers: the log of the
+/// refused `spy-process` pod is `starting container: ... [sh -c ... grep -i
+/// 'TENANT2_UNIQUE_MARKER' ...]`, and the marker in that echoed command line
+/// was enough to score the property as breached.
+fn never_started(pod: &Pod) -> Option<String> {
+    let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
+
+    statuses.iter().find_map(|status| {
+        let state = status.state.as_ref()?;
+        // Terminated with nothing ever having run: the runtime rejected the
+        // container rather than the container exiting.
+        if let Some(terminated) = &state.terminated {
+            if terminated.reason.as_deref() == Some("StartError") {
+                return Some(
+                    terminated
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "StartError".to_string()),
+                );
+            }
+        }
+        // Still waiting, in one of the states kubelet uses for "the runtime
+        // would not take this container".
+        let waiting = state.waiting.as_ref()?;
+        let reason = waiting.reason.as_deref()?;
+        matches!(
+            reason,
+            "CreateContainerError" | "RunContainerError" | "CreateContainerConfigError"
+        )
+        .then(|| match &waiting.message {
+            Some(message) => format!("{reason}: {message}"),
+            None => reason.to_string(),
+        })
+    })
+}
+
+/// Did this pod ask for privilege or for one of the node's namespaces?
+///
+/// The discriminator for a start failure. A sandbox turning away a request
+/// like this is the isolation mechanism working; anything else failing to
+/// start is the harness at fault, and the two must not report the same thing.
+fn asks_for_host_privilege(pod: &Pod) -> bool {
+    let Some(spec) = &pod.spec else {
+        return false;
+    };
+
+    let host_namespace = [
+        spec.host_pid,
+        spec.host_ipc,
+        spec.host_network,
+        spec.host_users,
+    ]
+    .contains(&Some(true));
+
+    host_namespace
+        || spec.containers.iter().any(|container| {
+            container
+                .security_context
+                .as_ref()
+                .and_then(|context| context.privileged)
+                == Some(true)
+        })
 }
 
 fn build_intruder(intruder: &Intruder, planted: &PlantedSecret) -> Pod {
@@ -457,6 +731,56 @@ fn platform_refused(exp: &BreachExperiment, why: &str) -> CrossTenantResult {
     }
 }
 
+/// Admission let the intruder through and the runtime would not start it.
+///
+/// The same verdict as [`platform_refused`], reached one stage later. What
+/// decides soft or hard is not *where* the request died but what the tenant
+/// can infer from its dying: an intruder turned away because the thing it
+/// asked for is not permitted learns that a restriction exists, and that is
+/// soft. Hard is reserved for the case where the operation runs and returns
+/// what a lone tenant would have got anyway.
+///
+/// So a sandbox refusing a privileged pod is soft, not hard. It never reaches
+/// the point of trying to observe the other tenant; the request itself is
+/// what was stopped. Autonomy is false for the same reason — the operation,
+/// taken on its own, was not allowed.
+///
+/// Kept separate from `platform_refused` only so the details line can say
+/// which stage refused, which is the difference between a policy webhook and
+/// a runtime that cannot honour the request.
+fn runtime_would_not_run(
+    exp: &BreachExperiment,
+    asked_for_host_privilege: bool,
+    why: &str,
+) -> CrossTenantResult {
+    // Nothing unusual was asked for, so nothing explains the refusal: this is
+    // the "random error in the middle" case, and it is not a measurement.
+    // Calling it isolation would be the reassuring answer to a broken probe.
+    if !asked_for_host_privilege {
+        return CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: true,
+            details: format!(
+                "{}: the intruder never started, and it had asked for no \
+                 privilege that would explain a runtime refusing it — {why}",
+                exp.what
+            ),
+        };
+    }
+
+    CrossTenantResult {
+        isolation: IsolationLevel::Soft(format!(
+            "Runtime would not start a container asking for host privilege: {why}"
+        )),
+        autonomy: false,
+        details: format!(
+            "{}: the request for host privilege was refused by the runtime, so \
+             the intruder never got to attempt the cross-tenant operation — {why}",
+            exp.what
+        ),
+    }
+}
+
 /// The target planted nothing, so nothing was measured.
 fn nothing_was_planted(exp: &BreachExperiment, victim: &TenantClusterConfig) -> CrossTenantResult {
     CrossTenantResult {
@@ -480,7 +804,7 @@ mod tests {
     use super::*;
     use crate::assessment::probe::ProbePod;
 
-    fn experiment(breach: BreachCondition) -> BreachExperiment {
+    pub(super) fn experiment(breach: BreachCondition) -> BreachExperiment {
         BreachExperiment {
             what: "test",
             target: ProbePod::new("target").build(),
@@ -594,6 +918,248 @@ mod tests {
         let built = build_intruder(&at_address, &planted);
         let command = built.spec.unwrap().containers[0].command.clone().unwrap();
         assert!(command[2].contains("10.0.0.9"));
+    }
+}
+
+/// A container that never started must not be read as one that ran.
+///
+/// The failure these pin down was silent and inverted: under gVisor a
+/// privileged probe is refused by the runtime, `kubectl logs` answers with
+/// containerd's own error, and that error quotes the container's command line
+/// — which for these probes contains the breach markers themselves. The
+/// property scored as breached by a probe that had never executed.
+#[cfg(test)]
+mod a_probe_that_never_ran {
+    use super::*;
+    use crate::assessment::probe::{HostAccess, ProbePod};
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, PodStatus,
+    };
+
+    fn pod_whose_container(state: ContainerState) -> Pod {
+        Pod {
+            status: Some(PodStatus {
+                container_statuses: Some(vec![ContainerStatus {
+                    state: Some(state),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_start_error_is_recognised_as_never_having_run() {
+        let pod = pod_whose_container(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                reason: Some("StartError".to_string()),
+                message: Some("starting container: sub-container refused".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            never_started(&pod).as_deref(),
+            Some("starting container: sub-container refused")
+        );
+    }
+
+    /// A pod pinned to a node this cluster does not have never runs, and its
+    /// silence is not a measurement.
+    ///
+    /// Host namespaces are per-node, so these intruders name the victim's node.
+    /// Under KubeVirt each tenant is its own cluster with its own VMs, so that
+    /// name resolves to nothing on the intruder's side: the pod stays Pending,
+    /// writes no logs, and the marker-based experiments read "no marker" as
+    /// isolation — a passing verdict from a probe that never executed.
+    #[test]
+    fn a_pod_pinned_to_a_node_that_does_not_exist_is_recognised() {
+        let pod = Pod {
+            status: Some(PodStatus {
+                phase: Some("Pending".to_string()),
+                conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                    type_: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: Some("Unschedulable".to_string()),
+                    message: Some(
+                        "0/1 nodes are available: 1 node(s) didn't match Pod's node affinity"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(never_placed(&pod).is_some_and(|why| why.contains("didn't match")));
+    }
+
+    /// A pod waiting on its image is not unschedulable.
+    #[test]
+    fn a_pending_pod_that_was_scheduled_is_not_reported_as_unschedulable() {
+        let pod = Pod {
+            status: Some(PodStatus {
+                phase: Some("Pending".to_string()),
+                conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                    type_: "PodScheduled".to_string(),
+                    status: "True".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(never_placed(&pod), None);
+    }
+
+    /// The shape that actually occurs: `spec.nodeName` bypasses the scheduler,
+    /// so a node that does not exist leaves the pod Pending with **no**
+    /// conditions at all — nothing ever evaluated it. Requiring a
+    /// `PodScheduled=False` condition missed every one of these.
+    #[test]
+    fn a_pod_pinned_by_node_name_that_no_kubelet_claimed_is_recognised() {
+        let pod = Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                node_name: Some("tenant1-kv-control-plane-abcde".to_string()),
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some("Pending".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(never_placed(&pod)
+            .is_some_and(|why| why.contains("tenant1-kv-control-plane-abcde")));
+    }
+
+    /// A pinned pod that did land and is starting up is not "never placed".
+    #[test]
+    fn a_pinned_pod_whose_container_is_starting_is_not_reported() {
+        let pod = Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                node_name: Some("node-1".to_string()),
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some("Pending".to_string()),
+                container_statuses: Some(vec![ContainerStatus {
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some("ContainerCreating".to_string()),
+                            message: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(never_placed(&pod), None);
+    }
+
+    #[test]
+    fn a_container_that_ran_and_exited_is_not_confused_with_one_that_never_started() {
+        let pod = pod_whose_container(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                reason: Some("Completed".to_string()),
+                exit_code: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(never_started(&pod), None);
+    }
+
+    #[test]
+    fn the_runtime_refusing_to_create_the_container_counts_too() {
+        let pod = pod_whose_container(ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("CreateContainerError".to_string()),
+                message: Some("no such runtime".to_string()),
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            never_started(&pod).as_deref(),
+            Some("CreateContainerError: no such runtime")
+        );
+    }
+
+    #[test]
+    fn a_pod_still_pulling_its_image_has_not_failed_to_start() {
+        let pod = pod_whose_container(ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("ContainerCreating".to_string()),
+                message: None,
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(never_started(&pod), None);
+    }
+
+    #[test]
+    fn privilege_and_host_namespaces_are_both_recognised_as_dangerous_requests() {
+        for pod in [
+            ProbePod::new("p").requests(HostAccess::Privileged).build(),
+            ProbePod::new("p").requests(HostAccess::Pid).build(),
+            ProbePod::new("p").requests(HostAccess::Ipc).build(),
+            ProbePod::new("p").requests(HostAccess::Network).build(),
+            ProbePod::new("p").requests(HostAccess::Users).build(),
+        ] {
+            assert!(asks_for_host_privilege(&pod));
+        }
+
+        assert!(!asks_for_host_privilege(&ProbePod::new("p").build()));
+    }
+
+    /// A refused request is soft however late the refusal comes.
+    ///
+    /// Hard means the cross-tenant operation ran and returned what a lone
+    /// tenant would have got. An intruder stopped before it could attempt
+    /// anything has instead learnt that a restriction exists, which is the
+    /// definition of soft — and it is soft whether a webhook said no at
+    /// admission or the runtime said no at start.
+    #[test]
+    fn a_sandbox_turning_away_a_privileged_probe_is_soft_isolation_at_a_cost() {
+        let result = runtime_would_not_run(
+            &super::tests::experiment(BreachCondition::IntruderReports("MARKER")),
+            true,
+            "StartSubcontainer failed",
+        );
+
+        assert!(
+            matches!(result.isolation, IsolationLevel::Soft(_)),
+            "the intruder never attempted the cross-tenant operation, so this \
+             cannot be hard: {:?}",
+            result.isolation
+        );
+        assert!(!result.autonomy, "the operation itself was not allowed");
+    }
+
+    /// Guards the reassuring answer. An ordinary pod failing to start is the
+    /// harness breaking, and reporting that as isolation is how a dead probe
+    /// turns into a perfect score.
+    #[test]
+    fn an_ordinary_probe_failing_to_start_is_not_isolation() {
+        let result = runtime_would_not_run(
+            &super::tests::experiment(BreachCondition::IntruderReports("MARKER")),
+            false,
+            "image pull failed",
+        );
+
+        assert_eq!(result.isolation, IsolationLevel::Unknown);
     }
 }
 

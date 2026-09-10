@@ -27,6 +27,40 @@ pub struct PortMapping {
     pub host_port: u16,
 }
 
+/// Node-level requirements a data-plane technology imposes on the cluster.
+///
+/// These travel with cluster *creation* rather than with the isolation
+/// technologies applied afterwards, because none of them can be applied after
+/// the fact:
+///
+/// - A CNI is chosen before the cluster exists. A cluster created with the
+///   default CNI already has it running, and installing a second one on top is
+///   not a supported configuration.
+/// - A container runtime handler has to be registered in containerd's
+///   configuration at node boot, which is what `containerd_config_patches` is
+///   for. A `RuntimeClass` naming a handler containerd does not know produces
+///   pods stuck in `ContainerCreating`, not an error at admission.
+///
+/// The default is what every solution measured so far used, so a profile left
+/// empty must produce exactly the cluster the tool produced before this type
+/// existed.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterProfile {
+    /// Skip the provider's built-in CNI because another one will be installed.
+    ///
+    /// The cluster stays `NotReady` until that happens, so whatever sets this
+    /// is responsible for installing a CNI before anything waits on readiness.
+    pub disable_default_cni: bool,
+    /// Pod CIDR the replacement CNI expects, when it differs from the
+    /// provider's default.
+    pub pod_subnet: Option<String>,
+    /// TOML fragments merged into the node's containerd configuration — how a
+    /// sandboxed runtime handler such as `runsc` or `kata` is registered.
+    pub containerd_config_patches: Vec<String>,
+    /// Host paths to expose inside the node, as `(host, node)` pairs.
+    pub extra_mounts: Vec<(String, String)>,
+}
+
 // Generic cluster that works with any provider implementation
 #[derive(Debug, Clone)]
 pub struct HostCluster<T: ClusterProvider> {
@@ -78,6 +112,7 @@ pub trait ClusterProvider {
         name: &str,
         kubeconfig_path: &Path,
         tenants_port_mapping: TenantsPortMapping,
+        profile: &ClusterProfile,
     ) -> anyhow::Result<()>;
 
     async fn exists(name: &str) -> anyhow::Result<bool>;
@@ -92,10 +127,16 @@ impl<T: ClusterProvider> HostCluster<T> {
         name: &str,
         kubeconfig_path: PathBuf,
         tenants_port_mapping: TenantsPortMapping,
+        profile: &ClusterProfile,
     ) -> anyhow::Result<Self> {
-        T::create(name, &kubeconfig_path, tenants_port_mapping.clone())
-            .await
-            .context("Failed to create cluster")?;
+        T::create(
+            name,
+            &kubeconfig_path,
+            tenants_port_mapping.clone(),
+            profile,
+        )
+        .await
+        .context("Failed to create cluster")?;
         Ok(Self {
             name: name.to_string(),
             kubeconfig_path,

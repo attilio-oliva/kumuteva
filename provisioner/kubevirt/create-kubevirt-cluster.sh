@@ -84,6 +84,35 @@ export CONTAINER_LOG_MAX_FILES=${CONTAINER_LOG_MAX_FILES:-5}
 export KUBERNETES_VERSION="v1.32.1"
 export CRI_PATH="/run/containerd/containerd.sock"
 
+# The name of every tenant's control-plane Machine, and so of its node.
+#
+# Host-namespace probes are per-node, so the intruder must run on the node named
+# by the victim. Where each tenant is its own cluster the victim's node name
+# means nothing on the intruder's side: the pod pins to a node that does not
+# exist, is never scheduled, never runs, and writes no logs — and "no marker in
+# empty output" reads as isolation. The property is reported without being
+# tested.
+#
+# Giving both tenants' nodes the same name makes that pin resolve to the
+# intruder's *own* node, so the probe actually executes: it joins its own host
+# namespace, looks for the other tenant's secret, and does not find it. Same
+# verdict, reached by a measurement.
+#
+# Applied through `machineNamingStrategy` rather than kubelet's
+# `nodeRegistration.name`: the node inherits the Machine's name either way, but
+# only the former keeps the Machine -> Node link intact. See the comment on the
+# KubeadmControlPlane in tenant-cluster.yaml.
+export TENANT_NODE_NAME=${TENANT_NODE_NAME:-kumuteva-tenant-node}
+
+# The worker's name, likewise identical across tenants but distinct from the
+# control plane's. Both nodes sharing one name collides within a cluster: the
+# worker's registration is refused and its machine sits Pending forever, which
+# is what happened when a single name was used for both roles.
+#
+# One name per role, so WORKER_MACHINE_COUNT must stay 1 — a second worker would
+# collide with the first.
+export TENANT_WORKER_NODE_NAME=${TENANT_WORKER_NODE_NAME:-kumuteva-tenant-worker}
+
 kc() { kubectl --kubeconfig "$KUBECONFIG_PATH" "$@"; }
 tenant_kc() { kubectl --kubeconfig "$OUTPUT_PATH" "$@"; }
 
@@ -140,8 +169,39 @@ kc create namespace "$NAMESPACE" 2>/dev/null || true
 
 envsubst < "$THIS_DIR"/tenant-cluster.yaml > "$CLUSTER_NAME"-applied.yaml
 
-if ! envsubst < "$THIS_DIR"/tenant-cluster.yaml | kc apply -f -; then
-    echo "ERROR: failed to apply the tenant cluster manifests"
+# Retried, because waiting cannot make this reliable.
+#
+# Every webhook Service is checked for endpoints before we get here, and that
+# check passes — yet the apply still loses to the *conversion* webhook for
+# KubeadmControlPlane:
+#
+#   conversion webhook for controlplane.cluster.x-k8s.io/v1beta1,
+#   Kind=KubeadmControlPlane failed: dial tcp ...:443: connect: connection refused
+#
+# An Endpoints entry means the pod passed its readiness probe, which is not the
+# same instant as its TLS listener accepting connections; kube-proxy rejects in
+# the gap. The window is short and it closes on its own, so the fix is to try
+# again rather than to wait for yet another precondition.
+#
+# `apply` is idempotent, so the objects created by a partial first pass are
+# simply re-applied — which matters, because the failing apply does create some
+# of them before it dies.
+apply_manifests() {
+    envsubst < "$THIS_DIR"/tenant-cluster.yaml | kc apply -f -
+}
+
+applied=false
+for attempt in 1 2 3 4 5; do
+    if apply_manifests; then
+        applied=true
+        break
+    fi
+    echo "  apply attempt ${attempt}/5 failed; retrying in 15s (webhooks may still be starting)"
+    sleep 15
+done
+
+if [ "$applied" != true ]; then
+    echo "ERROR: failed to apply the tenant cluster manifests after 5 attempts"
     exit 1
 fi
 

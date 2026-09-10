@@ -10,7 +10,11 @@ use anyhow::{anyhow, Context};
 use assessment::TenantClusterConfig;
 use clap::{Parser, Subcommand, ValueEnum};
 use cluster::TenantsPortMapping;
-use cluster::{ControlPlaneIsolation, KindCluster, KubernetesClient, KubernetesClusterBuilder};
+use cluster::{
+    ClusterProfile, CniPlugin, ControlPlaneIsolation, DataPlaneIsolation, KindCluster,
+    KubernetesClient, KubernetesClusterBuilder, NetworkIsolationStrategy, SandboxRuntime,
+    StorageIsolationStrategy,
+};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
 use serde::Deserialize;
@@ -103,6 +107,311 @@ impl ClusterEnvironmentType {
             ClusterEnvironmentType::KubeVirt => "kubevirt",
             ClusterEnvironmentType::Kamaji => "kamaji",
         }
+    }
+}
+
+/// A data-plane isolation technology, applied on top of a control-plane
+/// solution rather than instead of one.
+///
+/// The two planes are orthogonal — every control-plane solution measured so far
+/// breaches the data plane — so these compose with `--type` instead of
+/// replacing it, and the results table reads `native+network-policy`.
+///
+/// Variants are added as their provisioning lands. A technology that cannot be
+/// provisioned has no business being selectable: the failure mode would be a
+/// cluster that quietly lacks the isolation the label claims, which reads as
+/// the technology not working.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum DataPlaneTechnology {
+    /// A deny-all NetworkPolicy between tenant namespaces.
+    ///
+    /// Enforced, because the host cluster's CNI is [`CniPlugin::DEFAULT`] in
+    /// every run and it implements NetworkPolicy. That was not always so: on
+    /// kind's `kindnet` a policy is accepted, stored, and enforced by nobody,
+    /// so this row measured the policy being *written* rather than obeyed, and
+    /// a separate `calico` variant existed to pair the two. With a
+    /// policy-enforcing CNI underneath everything, the pair collapsed into this
+    /// one row.
+    ///
+    /// The consequence worth knowing: there is no longer a way to ask for a
+    /// policy that nothing enforces, which used to be available as a control.
+    #[clap(name = "network-policy", alias = "netpol")]
+    NetworkPolicy,
+
+    /// Kube-OVN as the cluster CNI, with the deny-all NetworkPolicy.
+    ///
+    /// The baseline for the Kube-OVN rows: the CNI and nothing more. Its own
+    /// isolation features — per-tenant Subnets, custom VPCs — are separate
+    /// technologies layered on this, and measuring it plain is what shows they
+    /// are doing the work rather than the CNI swap.
+    #[clap(name = "kubeovn")]
+    KubeOvn,
+
+    /// Kube-OVN with a private Subnet per tenant, and no NetworkPolicy.
+    ///
+    /// The policy is deliberately absent. Isolation here comes from OVN
+    /// refusing to route between subnets, and leaving the policy out is what
+    /// makes the comparison against `kubeovn` attribute the difference to the
+    /// subnet rather than to the two of them together.
+    #[clap(name = "kubeovn-subnet")]
+    KubeOvnSubnet,
+
+    /// Kube-OVN with a VPC of its own per tenant, and no NetworkPolicy.
+    ///
+    /// One VPC is one logical router, so the tenants have no route between
+    /// them — isolation by absence of a path rather than by a rule dropping
+    /// packets on a shared one. The only configuration here that can earn
+    /// `hard`, and the one that pays for it: a custom VPC gives up NodePort,
+    /// node access and cluster DNS, which is what the autonomy columns are for.
+    #[clap(name = "kubeovn-vpc")]
+    KubeOvnVpc,
+
+    /// A DNS server per tenant, answering only for that tenant's namespace.
+    ///
+    /// Cluster DNS resolves every Service for every client, so one tenant can
+    /// enumerate another's by name whether or not it can reach them. This gives
+    /// each tenant a CoreDNS scoped with the `namespaces` directive, so the
+    /// other tenant's names return NXDOMAIN.
+    ///
+    /// Independent of any CNI and of any control-plane solution — ordinary pods
+    /// on ordinary cluster networking — so it composes with anything else under
+    /// test: `--data-plane calico,scoped-dns` or `--type capsule --data-plane
+    /// scoped-dns` are both meaningful.
+    #[clap(name = "scoped-dns")]
+    ScopedDns,
+
+    /// gVisor as a sandboxed runtime, with probes running under it.
+    ///
+    /// Syscalls are serviced by a user-space kernel rather than the host's,
+    /// which is what the privileged-syscall and host-namespace properties are
+    /// asking about. Opt-in per pod through a RuntimeClass, so this measures
+    /// what a sandboxed tenant gets rather than what the platform compels.
+    #[clap(name = "gvisor")]
+    GVisor,
+
+    /// Kata Containers as a sandboxed runtime, with probes running under it.
+    ///
+    /// Each pod becomes a lightweight VM with its own kernel. Where gVisor
+    /// refuses a privileged container outright, Kata runs it inside the guest,
+    /// so the properties gVisor can only forbid are ones Kata may be able to
+    /// permit and still isolate.
+    #[clap(name = "kata")]
+    Kata,
+
+    /// A StorageClass per tenant, with `reclaimPolicy: Retain`.
+    ///
+    /// Not an isolation mechanism, and does not claim to be. It supplies the
+    /// documented route to a Retain volume, so that `Create And Mount Volume
+    /// with Retain Reclaim Policy` measures reclaim policy rather than the
+    /// hostPath PersistentVolume a tenant otherwise has to build by hand.
+    ///
+    /// Encryption — the one data-plane answer to volume rebinding — is not
+    /// here: it needs a CSI that resolves a per-namespace key, and every such
+    /// driver is iSCSI-backed, which cannot attach on a kind node at all.
+    #[clap(name = "storage-classes")]
+    StorageClasses,
+}
+
+impl DataPlaneTechnology {
+    fn as_str(&self) -> &str {
+        match self {
+            DataPlaneTechnology::NetworkPolicy => "network-policy",
+            DataPlaneTechnology::KubeOvn => "kubeovn",
+            DataPlaneTechnology::KubeOvnSubnet => "kubeovn-subnet",
+            DataPlaneTechnology::KubeOvnVpc => "kubeovn-vpc",
+            DataPlaneTechnology::ScopedDns => "scoped-dns",
+            DataPlaneTechnology::GVisor => "gvisor",
+            DataPlaneTechnology::Kata => "kata",
+            DataPlaneTechnology::StorageClasses => "storage-classes",
+        }
+    }
+
+    /// The CNI this technology needs, when it needs one other than the default.
+    ///
+    /// Only Kube-OVN does: its isolation features are the CNI's own. Everything
+    /// else runs on [`CniPlugin::DEFAULT`].
+    fn cni(&self) -> Option<CniPlugin> {
+        match self {
+            DataPlaneTechnology::NetworkPolicy => None,
+            DataPlaneTechnology::KubeOvn
+            | DataPlaneTechnology::KubeOvnSubnet
+            | DataPlaneTechnology::KubeOvnVpc => Some(CniPlugin::KubeOvn),
+            // Need no particular CNI.
+            DataPlaneTechnology::ScopedDns
+            | DataPlaneTechnology::GVisor
+            | DataPlaneTechnology::Kata
+            | DataPlaneTechnology::StorageClasses => None,
+        }
+    }
+
+    /// Whether this technology writes the cross-tenant NetworkPolicy.
+    ///
+    /// `KubeOvnSubnet` deliberately does not: its isolation is the subnet, and
+    /// adding a policy on top would make the two indistinguishable.
+    fn writes_network_policy(&self) -> bool {
+        matches!(
+            self,
+            DataPlaneTechnology::NetworkPolicy | DataPlaneTechnology::KubeOvn
+        )
+    }
+
+    /// Whether this technology gives each tenant its own private OVN Subnet.
+    fn uses_private_subnet(&self) -> bool {
+        matches!(self, DataPlaneTechnology::KubeOvnSubnet)
+    }
+
+    /// Whether this technology gives each tenant its own OVN VPC.
+    fn uses_tenant_vpc(&self) -> bool {
+        matches!(self, DataPlaneTechnology::KubeOvnVpc)
+    }
+
+    /// Whether this technology gives each tenant a namespace-scoped resolver.
+    fn uses_scoped_dns(&self) -> bool {
+        matches!(self, DataPlaneTechnology::ScopedDns)
+    }
+
+    /// Whether this technology gives each tenant a StorageClass of its own.
+    fn uses_tenant_storage_class(&self) -> bool {
+        matches!(self, DataPlaneTechnology::StorageClasses)
+    }
+
+    /// The sandboxed runtime this technology installs, if it is one.
+    fn sandbox_runtime(&self) -> Option<SandboxRuntime> {
+        match self {
+            DataPlaneTechnology::GVisor => Some(SandboxRuntime::GVisor),
+            DataPlaneTechnology::Kata => Some(SandboxRuntime::Kata),
+            _ => None,
+        }
+    }
+
+    /// What this technology needs decided before the cluster exists.
+    ///
+    /// See [`ClusterProfile`]. Most technologies need nothing here and are
+    /// applied to a running cluster; a CNI or a sandboxed runtime cannot be.
+    fn cluster_profile(&self) -> ClusterProfile {
+        // The CNI is not decided here any more. Every cluster gets one — see
+        // `SolutionUnderTest::cluster_profile` — so a technology that needs a
+        // particular one says so through `cni()` and this only carries what is
+        // left: the containerd patches and mounts a sandboxed runtime needs
+        // before the node boots.
+        let mut profile = ClusterProfile::default();
+        if let Some(runtime) = self.sandbox_runtime() {
+            profile
+                .containerd_config_patches
+                .push(runtime.containerd_patch());
+            // Kata needs the host's /dev/kvm inside the node; gVisor asks for
+            // nothing. Both go through the profile because a mount, like the
+            // containerd patch, has to be decided before the node boots.
+            profile.extra_mounts.extend(runtime.extra_mounts());
+        }
+        profile
+    }
+}
+
+/// What is being measured: a control-plane solution, plus whatever data-plane
+/// technologies are layered on it.
+///
+/// The two travel together because neither describes the measurement alone —
+/// `capsule` and `capsule+network-policy` are different clusters producing
+/// different results — and because everything derived from the choice, the
+/// cluster profile and the label a result file records, needs both.
+#[derive(Debug, Clone)]
+pub struct SolutionUnderTest {
+    pub control_plane: ClusterEnvironmentType,
+    pub data_plane: Vec<DataPlaneTechnology>,
+}
+
+impl SolutionUnderTest {
+    /// The name a result file records, e.g. `capsule+network-policy`.
+    ///
+    /// The data-plane technologies are part of it because they change what was
+    /// measured: a report labelled `native` that was taken with a CNI swapped
+    /// underneath it would be indistinguishable from one that was not.
+    pub fn label(&self) -> String {
+        std::iter::once(self.control_plane.as_str())
+            .chain(self.data_plane.iter().map(DataPlaneTechnology::as_str))
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
+    /// The CNI to install on the host cluster.
+    ///
+    /// Always one, never none: every cluster this harness builds gets an
+    /// explicit CNI, and unless a technology names its own that is
+    /// [`CniPlugin::DEFAULT`].
+    ///
+    /// kind's own `kindnet` is deliberately not among the options. It ignores
+    /// NetworkPolicy, so a policy row on it measures the policy being *written*
+    /// rather than obeyed — and, less obviously, it addresses pods `/24`, which
+    /// a KubeVirt guest inherits through its `bridge` binding. Two tenants' VMs
+    /// on one node then believe they are on-link, ARP for each other, and are
+    /// never answered, because kindnet routes pods rather than bridging them.
+    /// Cross-tenant traffic died at address resolution and the harness reported
+    /// isolation the platform was not providing. A `/32` CNI has no on-link
+    /// subnet to get wrong.
+    ///
+    /// At most one may be named: a cluster has a single CNI, and two would
+    /// fight over the same node configuration rather than compose.
+    fn cni(&self) -> anyhow::Result<CniPlugin> {
+        let mut chosen: Vec<CniPlugin> = self.data_plane.iter().filter_map(|t| t.cni()).collect();
+        // Several Kube-OVN technologies compose, and they all name Kube-OVN.
+        // Asking for the same CNI twice is agreement, not a conflict.
+        chosen.dedup_by(|a, b| a == b);
+        match chosen.as_slice() {
+            [] => Ok(CniPlugin::DEFAULT),
+            [one] => Ok(*one),
+            many => Err(anyhow!(
+                "{} CNIs selected ({:?}) — a cluster has one, and they are \
+                 alternatives to compare in separate runs, not layers to stack",
+                many.len(),
+                many
+            )),
+        }
+    }
+
+    /// The sandboxed runtime to install, if any. At most one.
+    fn sandbox_runtime(&self) -> anyhow::Result<Option<SandboxRuntime>> {
+        let chosen: Vec<SandboxRuntime> = self
+            .data_plane
+            .iter()
+            .filter_map(DataPlaneTechnology::sandbox_runtime)
+            .collect();
+        match chosen.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(*one)),
+            many => Err(anyhow!(
+                "{} sandboxed runtimes selected ({:?}) — they are alternatives to \
+                 compare in separate runs, not layers to stack",
+                many.len(),
+                many
+            )),
+        }
+    }
+
+    /// Everything the selected technologies need decided before the cluster
+    /// exists, merged into one profile.
+    fn cluster_profile(&self) -> ClusterProfile {
+        // The CNI leads: kind's default is always off and the pod subnet is the
+        // chosen CNI's, so the cluster is created for the network it will
+        // actually have rather than coming up on kindnet and being adopted
+        // afterwards.
+        let cni = self.cni().unwrap_or(CniPlugin::DEFAULT);
+        let mut combined = ClusterProfile {
+            disable_default_cni: true,
+            pod_subnet: Some(cni.pod_subnet().to_string()),
+            ..Default::default()
+        };
+        for profile in self
+            .data_plane
+            .iter()
+            .map(DataPlaneTechnology::cluster_profile)
+        {
+            combined
+                .containerd_config_patches
+                .extend(profile.containerd_config_patches);
+            combined.extra_mounts.extend(profile.extra_mounts);
+        }
+        combined
     }
 }
 
@@ -274,13 +583,19 @@ pub struct FairnessConfig {
     // Subsystem configs
     pub cp_rate: f64,
     pub cp_requesters: usize,
+    pub cp_load_multiplier: f64,
+    pub cp_pod_multiplier: f64,
 
     pub net_rate: f64,
+    pub net_load_multiplier: f64,
+    pub net_pod_multiplier: f64,
     pub net_pod_pairs: u32,
     pub net_streams: u32,
     pub net_packet_size: u32,
 
     pub st_rate: f64,
+    pub st_load_multiplier: f64,
+    pub st_pod_multiplier: f64,
     pub st_pods: u32,
     pub st_block_size: u32,
     pub st_file_size: u32,
@@ -290,6 +605,8 @@ pub struct FairnessConfig {
     pub st_storage_class: Option<String>,
 
     pub wl_rate: f64,
+    pub wl_load_multiplier: f64,
+    pub wl_pod_multiplier: f64,
     pub wl_pods: u32,
     pub wl_threads: u32,
     pub wl_max_prime: u32,
@@ -305,8 +622,20 @@ pub struct FairnessConfig {
 
 /// Layer 1: YAML Configuration
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+// Unknown keys are an error, not a shrug. A campaign file written for a
+// newer binary — or with a typo — used to be read silently, the unknown
+// setting dropped, and the run would proceed at whatever the default was:
+// `podMultiplier` under `network:` was ignored by an older binary and the
+// campaign escalated 10x while the file said 30x, with nothing to show for
+// it but numbers that looked plausible.
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FairnessYamlLayer {
+    /// Declared by the campaign file and not otherwise used. Modelled so the
+    /// file validates: with `deny_unknown_fields` an unmodelled key is an
+    /// error, and silently accepting this one would defeat the check.
+    #[serde(default)]
+    #[allow(dead_code)]
+    api_version: Option<String>,
     #[serde(default)]
     global: GlobalConfigYaml,
     #[serde(default)]
@@ -322,7 +651,13 @@ struct FairnessYamlLayer {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+// Unknown keys are an error, not a shrug. A campaign file written for a
+// newer binary — or with a typo — used to be read silently, the unknown
+// setting dropped, and the run would proceed at whatever the default was:
+// `podMultiplier` under `network:` was ignored by an older binary and the
+// campaign escalated 10x while the file said 30x, with nothing to show for
+// it but numbers that looked plausible.
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GlobalConfigYaml {
     probe_qos: Option<String>,
     intruder_qos: Option<String>,
@@ -336,23 +671,89 @@ struct GlobalConfigYaml {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+// Unknown keys are an error, not a shrug. A campaign file written for a
+// newer binary — or with a typo — used to be read silently, the unknown
+// setting dropped, and the run would proceed at whatever the default was:
+// `podMultiplier` under `network:` was ignored by an older binary and the
+// campaign escalated 10x while the file said 30x, with nothing to show for
+// it but numbers that looked plausible.
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ControlPlaneConfigYaml {
     enabled: Option<bool>,
     rate: Option<f64>,
     requesters: Option<usize>,
+    /// Escalation for this subsystem alone, overriding the global
+    /// `podMultiplier`. A subsystem saturates at its own load: on a 16-core
+    /// node the network path needs ~30x before the victim degrades at all,
+    /// while 10x is already past what the control plane can absorb.
+    pod_multiplier: Option<f64>,
+
+    /// The other half of the same escalation, overriding the global
+    /// `loadMultiplier` for this subsystem alone.
+    ///
+    /// The two are not interchangeable. `podMultiplier` adds pods and raises
+    /// the offered rate together, so per-pod demand stays flat; this raises
+    /// the rate on the pods already there. For the network that is the
+    /// difference that matters: pods are the expensive axis — each pair is two
+    /// Python processes on the same node as the victim's own generator — so
+    /// reaching a saturating packet rate by pod count alone spends the node's
+    /// CPU on load generation and starves the instrument doing the measuring.
+    /// Pushing harder per pod reaches the same wire rate for far fewer
+    /// processes.
+    ///
+    /// It has its own ceiling: a stream blocked on a response cannot exceed
+    /// 1/latency, so past some point the rate is simply not delivered. Check
+    /// the achieved escalation the run prints under `Malicious:` rather than
+    /// assuming the configured figure was met.
+    load_multiplier: Option<f64>,
 }
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+// Unknown keys are an error, not a shrug. A campaign file written for a
+// newer binary — or with a typo — used to be read silently, the unknown
+// setting dropped, and the run would proceed at whatever the default was:
+// `podMultiplier` under `network:` was ignored by an older binary and the
+// campaign escalated 10x while the file said 30x, with nothing to show for
+// it but numbers that looked plausible.
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NetworkConfigYaml {
     enabled: Option<bool>,
     rate: Option<f64>,
     pod_pairs: Option<u32>,
     streams: Option<u32>,
     packet_size_bytes: Option<u32>,
+    /// Escalation for this subsystem alone, overriding the global
+    /// `podMultiplier`. A subsystem saturates at its own load: on a 16-core
+    /// node the network path needs ~30x before the victim degrades at all,
+    /// while 10x is already past what the control plane can absorb.
+    pod_multiplier: Option<f64>,
+
+    /// The other half of the same escalation, overriding the global
+    /// `loadMultiplier` for this subsystem alone.
+    ///
+    /// The two are not interchangeable. `podMultiplier` adds pods and raises
+    /// the offered rate together, so per-pod demand stays flat; this raises
+    /// the rate on the pods already there. For the network that is the
+    /// difference that matters: pods are the expensive axis — each pair is two
+    /// Python processes on the same node as the victim's own generator — so
+    /// reaching a saturating packet rate by pod count alone spends the node's
+    /// CPU on load generation and starves the instrument doing the measuring.
+    /// Pushing harder per pod reaches the same wire rate for far fewer
+    /// processes.
+    ///
+    /// It has its own ceiling: a stream blocked on a response cannot exceed
+    /// 1/latency, so past some point the rate is simply not delivered. Check
+    /// the achieved escalation the run prints under `Malicious:` rather than
+    /// assuming the configured figure was met.
+    load_multiplier: Option<f64>,
 }
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+// Unknown keys are an error, not a shrug. A campaign file written for a
+// newer binary — or with a typo — used to be read silently, the unknown
+// setting dropped, and the run would proceed at whatever the default was:
+// `podMultiplier` under `network:` was ignored by an older binary and the
+// campaign escalated 10x while the file said 30x, with nothing to show for
+// it but numbers that looked plausible.
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StorageConfigYaml {
     enabled: Option<bool>,
     rate: Option<f64>,
@@ -363,9 +764,39 @@ struct StorageConfigYaml {
     iodepth: Option<u32>,
     volume: Option<String>,
     storage_class_name: Option<String>,
+    /// Escalation for this subsystem alone, overriding the global
+    /// `podMultiplier`. A subsystem saturates at its own load: on a 16-core
+    /// node the network path needs ~30x before the victim degrades at all,
+    /// while 10x is already past what the control plane can absorb.
+    pod_multiplier: Option<f64>,
+
+    /// The other half of the same escalation, overriding the global
+    /// `loadMultiplier` for this subsystem alone.
+    ///
+    /// The two are not interchangeable. `podMultiplier` adds pods and raises
+    /// the offered rate together, so per-pod demand stays flat; this raises
+    /// the rate on the pods already there. For the network that is the
+    /// difference that matters: pods are the expensive axis — each pair is two
+    /// Python processes on the same node as the victim's own generator — so
+    /// reaching a saturating packet rate by pod count alone spends the node's
+    /// CPU on load generation and starves the instrument doing the measuring.
+    /// Pushing harder per pod reaches the same wire rate for far fewer
+    /// processes.
+    ///
+    /// It has its own ceiling: a stream blocked on a response cannot exceed
+    /// 1/latency, so past some point the rate is simply not delivered. Check
+    /// the achieved escalation the run prints under `Malicious:` rather than
+    /// assuming the configured figure was met.
+    load_multiplier: Option<f64>,
 }
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+// Unknown keys are an error, not a shrug. A campaign file written for a
+// newer binary — or with a typo — used to be read silently, the unknown
+// setting dropped, and the run would proceed at whatever the default was:
+// `podMultiplier` under `network:` was ignored by an older binary and the
+// campaign escalated 10x while the file said 30x, with nothing to show for
+// it but numbers that looked plausible.
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkloadConfigYaml {
     enabled: Option<bool>,
     rate: Option<f64>,
@@ -373,9 +804,39 @@ struct WorkloadConfigYaml {
     threads: Option<u32>,
     max_prime: Option<u32>,
     noise: Option<String>,
+    /// Escalation for this subsystem alone, overriding the global
+    /// `podMultiplier`. A subsystem saturates at its own load: on a 16-core
+    /// node the network path needs ~30x before the victim degrades at all,
+    /// while 10x is already past what the control plane can absorb.
+    pod_multiplier: Option<f64>,
+
+    /// The other half of the same escalation, overriding the global
+    /// `loadMultiplier` for this subsystem alone.
+    ///
+    /// The two are not interchangeable. `podMultiplier` adds pods and raises
+    /// the offered rate together, so per-pod demand stays flat; this raises
+    /// the rate on the pods already there. For the network that is the
+    /// difference that matters: pods are the expensive axis — each pair is two
+    /// Python processes on the same node as the victim's own generator — so
+    /// reaching a saturating packet rate by pod count alone spends the node's
+    /// CPU on load generation and starves the instrument doing the measuring.
+    /// Pushing harder per pod reaches the same wire rate for far fewer
+    /// processes.
+    ///
+    /// It has its own ceiling: a stream blocked on a response cannot exceed
+    /// 1/latency, so past some point the rate is simply not delivered. Check
+    /// the achieved escalation the run prints under `Malicious:` rather than
+    /// assuming the configured figure was met.
+    load_multiplier: Option<f64>,
 }
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+// Unknown keys are an error, not a shrug. A campaign file written for a
+// newer binary — or with a typo — used to be read silently, the unknown
+// setting dropped, and the run would proceed at whatever the default was:
+// `podMultiplier` under `network:` was ignored by an older binary and the
+// campaign escalated 10x while the file said 30x, with nothing to show for
+// it but numbers that looked plausible.
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExportConfigYaml {
     csv: Option<bool>,
     output_dir: Option<String>,
@@ -419,6 +880,25 @@ pub struct VerifyArgs {
     #[clap(long = "solution-label", value_name = "NAME")]
     solution_label: Option<String>,
 
+    /// Run every probe under this RuntimeClass, e.g. `gvisor` or `kata`.
+    ///
+    /// A RuntimeClass is opt-in per pod, so this measures what a sandboxed
+    /// tenant gets rather than what the platform compels. Naming a handler the
+    /// node's containerd does not know leaves probes in `ContainerCreating`
+    /// instead of failing outright, so check the sandbox is real before
+    /// believing a verdict taken under it.
+    #[clap(long = "runtime-class", value_name = "NAME")]
+    runtime_class: Option<String>,
+
+    /// Point every probe at this DNS server instead of the cluster's own.
+    ///
+    /// Needed where the cluster resolver is unreachable from the tenant — a
+    /// Kube-OVN custom VPC has no route to it, and nothing injects a
+    /// replacement. Without this the DNS experiment measures the missing route
+    /// rather than whether one tenant can resolve another's names.
+    #[clap(long = "dns-nameserver", value_name = "IP")]
+    dns_nameserver: Option<String>,
+
     /// Assess control plane isolation (exclusive if any system is specified)
     #[clap(long = "control-plane", alias = "cp")]
     control_plane: bool,
@@ -455,6 +935,15 @@ pub struct SetupArgs {
     /// Multitenancy solution for handling tenant clusters
     #[clap(long = "type", short = 't', default_value = "vcluster")]
     kind: ClusterEnvironmentType,
+
+    /// Data-plane isolation technologies to apply on top of `--type`.
+    ///
+    /// Additive and orthogonal to the control-plane solution: `--type native
+    /// --data-plane network-policy` measures the technology on its own, and
+    /// `--type capsule --data-plane network-policy` measures the combination.
+    /// Repeat the flag or comma-separate to apply several.
+    #[clap(long = "data-plane", value_enum, value_delimiter = ',')]
+    data_plane: Vec<DataPlaneTechnology>,
 
     /// Host cluster provider to use for the underlying cluster
     #[clap(long = "provider", short = 'p', default_value = "kind")]
@@ -803,8 +1292,15 @@ impl FairnessConfigBuilder {
                 .cp_requesters
                 .or(yaml.control_plane.requesters)
                 .unwrap_or(defaults::CP_REQUESTERS),
+            cp_load_multiplier: yaml
+                .control_plane
+                .load_multiplier
+                .unwrap_or(load_multiplier),
+            cp_pod_multiplier: yaml.control_plane.pod_multiplier.unwrap_or(pod_multiplier),
 
             net_rate: cli.net_rate.or(yaml.network.rate).unwrap_or(rate_limit),
+            net_load_multiplier: yaml.network.load_multiplier.unwrap_or(load_multiplier),
+            net_pod_multiplier: yaml.network.pod_multiplier.unwrap_or(pod_multiplier),
             net_pod_pairs: cli
                 .net_pod_pairs
                 .or(yaml.network.pod_pairs)
@@ -819,6 +1315,8 @@ impl FairnessConfigBuilder {
                 .unwrap_or(defaults::NET_PACKET_SIZE),
 
             st_rate: cli.st_rate.or(yaml.storage.rate).unwrap_or(rate_limit),
+            st_load_multiplier: yaml.storage.load_multiplier.unwrap_or(load_multiplier),
+            st_pod_multiplier: yaml.storage.pod_multiplier.unwrap_or(pod_multiplier),
             st_pods: cli
                 .st_pods
                 .or(yaml.storage.pods)
@@ -840,6 +1338,8 @@ impl FairnessConfigBuilder {
             st_storage_class,
 
             wl_rate: cli.wl_rate.or(yaml.workload.rate).unwrap_or(rate_limit),
+            wl_load_multiplier: yaml.workload.load_multiplier.unwrap_or(load_multiplier),
+            wl_pod_multiplier: yaml.workload.pod_multiplier.unwrap_or(pod_multiplier),
             wl_pods: cli
                 .wl_pods
                 .or(yaml.workload.pods)
@@ -957,7 +1457,7 @@ async fn get_or_create_tenant_cluster(
     host_cluster: &HostClusterType,
     tenant: &str,
     kubeconfig_path: PathBuf,
-    env_type: ClusterEnvironmentType,
+    solution: &SolutionUnderTest,
 ) -> anyhow::Result<KubernetesClient> {
     if let Ok(existing_cluster) = KubernetesClient::load_with_retry(&kubeconfig_path, 3).await {
         println!("Tenant {} cluster already exists", tenant);
@@ -974,69 +1474,80 @@ async fn get_or_create_tenant_cluster(
     }
 
     println!("Creating {} cluster", tenant);
-    let builder =
-        KubernetesClusterBuilder::new(host_cluster.clone()).with_kubeconfig_path(kubeconfig_path);
 
-    let tenant_cluster = match env_type {
-        ClusterEnvironmentType::Capsule => {
-            builder
-                .with_isolation_technology(ControlPlaneIsolation::Capsule(tenant.to_string()))
-                .build()
-                .await?
-        }
+    // Each solution differs only in which `ControlPlaneIsolation` it names, so
+    // it is chosen first and the builder is driven once. The seven arms used to
+    // repeat `.with_isolation_technology(...).build().await?` verbatim, which
+    // left nowhere to add the data-plane technologies without doing it seven
+    // times.
+    let control_plane = match solution.control_plane {
+        ClusterEnvironmentType::Capsule => ControlPlaneIsolation::Capsule(tenant.to_string()),
         ClusterEnvironmentType::CapsuleHardened => {
-            builder
-                .with_isolation_technology(ControlPlaneIsolation::CapsuleHardened(
-                    tenant.to_string(),
-                ))
-                .build()
-                .await?
+            ControlPlaneIsolation::CapsuleHardened(tenant.to_string())
         }
         ClusterEnvironmentType::CapsuleProxy => {
-            builder
-                .with_isolation_technology(ControlPlaneIsolation::CapsuleProxy(tenant.to_string()))
-                .build()
-                .await?
+            ControlPlaneIsolation::CapsuleProxy(tenant.to_string())
         }
-        ClusterEnvironmentType::VCluster => {
-            builder
-                .with_isolation_technology(ControlPlaneIsolation::VCluster(tenant.to_string()))
-                .build()
-                .await?
-        }
-        ClusterEnvironmentType::KubeVirt => {
-            builder
-                .with_isolation_technology(ControlPlaneIsolation::KubeVirt(tenant.to_string()))
-                .build()
-                .await?
-        }
-        ClusterEnvironmentType::Kamaji => {
-            builder
-                .with_isolation_technology(ControlPlaneIsolation::Kamaji(tenant.to_string()))
-                .build()
-                .await?
-        }
-        ClusterEnvironmentType::Native => {
-            builder
-                .with_isolation_technology(ControlPlaneIsolation::None(tenant.to_string()))
-                .build()
-                .await?
-        }
+        ClusterEnvironmentType::VCluster => ControlPlaneIsolation::VCluster(tenant.to_string()),
+        ClusterEnvironmentType::KubeVirt => ControlPlaneIsolation::KubeVirt(tenant.to_string()),
+        ClusterEnvironmentType::Kamaji => ControlPlaneIsolation::Kamaji(tenant.to_string()),
+        ClusterEnvironmentType::Native => ControlPlaneIsolation::None(tenant.to_string()),
         _ => return Err(anyhow!("Unsupported cluster environment type")),
     };
 
-    Ok(tenant_cluster)
+    let mut builder = KubernetesClusterBuilder::new(host_cluster.clone())
+        .with_kubeconfig_path(kubeconfig_path)
+        .with_isolation_technology(control_plane);
+
+    // Applied after the control plane, which is also the order `build` runs
+    // them in: a tenant namespace has to exist before a policy can be written
+    // into it.
+    // The CNI is not applied here — it belongs to the host cluster and was
+    // installed once, before any tenant existed.
+    for technology in &solution.data_plane {
+        if technology.writes_network_policy() {
+            builder = builder.with_isolation_technology(NetworkIsolationStrategy::NetworkPolicy(
+                tenant.to_string(),
+            ));
+        }
+        if technology.uses_private_subnet() {
+            builder = builder.with_isolation_technology(
+                NetworkIsolationStrategy::KubeOvnPrivateSubnet(tenant.to_string()),
+            );
+        }
+        if technology.uses_tenant_vpc() {
+            builder = builder.with_isolation_technology(
+                NetworkIsolationStrategy::KubeOvnTenantVpc(tenant.to_string()),
+            );
+        }
+        if technology.uses_scoped_dns() {
+            builder = builder.with_isolation_technology(NetworkIsolationStrategy::ScopedTenantDns(
+                tenant.to_string(),
+            ));
+        }
+        if technology.uses_tenant_storage_class() {
+            builder = builder.with_isolation_technology(DataPlaneIsolation::Storage(
+                StorageIsolationStrategy::PerTenantStorageClass(tenant.to_string()),
+            ));
+        }
+    }
+
+    builder.build().await
 }
 
 pub async fn setup_test_environment(
     existing_cluster_kubeconfig: Option<PathBuf>,
     output_dir: Option<PathBuf>,
     cluster_name: &str,
-    env: ClusterEnvironmentType,
+    solution: &SolutionUnderTest,
     provider: ChosenClusterProvider,
     tenant1: Tenant1SetupConfig,
     tenant2: Tenant2SetupConfig,
 ) -> anyhow::Result<()> {
+    // Resolved before the cluster is created, because that is when the parts of
+    // it that cannot be changed later are decided.
+    let profile = solution.cluster_profile();
+
     let (tenant1_ns, tenant1_mapping) = resolve_tenant_config(
         &tenant1.tenant1_short,
         &tenant1.tenant1_ns,
@@ -1084,8 +1595,13 @@ pub async fn setup_test_environment(
             } else {
                 println!("Creating new kind cluster '{}'", cluster_name);
                 HostClusterType::Kind(
-                    KindCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
-                        .await?,
+                    KindCluster::create(
+                        cluster_name,
+                        cluster_kubeconfig.clone(),
+                        port_mappings,
+                        &profile,
+                    )
+                    .await?,
                 )
             }
         }
@@ -1098,8 +1614,13 @@ pub async fn setup_test_environment(
             } else {
                 println!("Creating new k3s cluster '{}'", cluster_name);
                 HostClusterType::K3s(
-                    K3sCluster::create(cluster_name, cluster_kubeconfig.clone(), port_mappings)
-                        .await?,
+                    K3sCluster::create(
+                        cluster_name,
+                        cluster_kubeconfig.clone(),
+                        port_mappings,
+                        &profile,
+                    )
+                    .await?,
                 )
             }
         }
@@ -1116,6 +1637,7 @@ pub async fn setup_test_environment(
                         cluster_name,
                         cluster_kubeconfig.clone(),
                         port_mappings,
+                        &profile,
                     )
                     .await?,
                 )
@@ -1123,13 +1645,24 @@ pub async fn setup_test_environment(
         }
     };
 
+    // Before any tenant, because a cluster created with `disableDefaultCNI` has
+    // no pod networking until this runs — and the control-plane solution's own
+    // operator is a pod.
+    KubernetesClusterBuilder::install_cni(&base_cluster, solution.cni()?).await?;
+
+    // After the CNI, because publishing the RuntimeClass needs a working API
+    // path and the node has no pod network until the CNI is up.
+    if let Some(runtime) = solution.sandbox_runtime()? {
+        KubernetesClusterBuilder::install_sandbox_runtime(&base_cluster, runtime).await?;
+    }
+
     let t1_cfg = output_dir.join(format!("tenant1-{}.kubeconfig", cluster_name));
     let t2_cfg = output_dir.join(format!("tenant2-{}.kubeconfig", cluster_name));
 
     let t1_cluster =
-        get_or_create_tenant_cluster(&base_cluster, "tenant1", t1_cfg.clone(), env).await?;
+        get_or_create_tenant_cluster(&base_cluster, "tenant1", t1_cfg.clone(), solution).await?;
     let t2_cluster =
-        get_or_create_tenant_cluster(&base_cluster, "tenant2", t2_cfg.clone(), env).await?;
+        get_or_create_tenant_cluster(&base_cluster, "tenant2", t2_cfg.clone(), solution).await?;
 
     t1_cluster.ensure_cluster_is_ready().await?;
     t2_cluster.ensure_cluster_is_ready().await?;
@@ -1213,11 +1746,64 @@ mod campaign_config_tests {
     /// can be compared between them. The published campaign stressed the control
     /// plane 300x harder than the data plane, which is why Table I's rows are not
     /// comparable as presented.
+    /// Escalation is per subsystem, and deliberately unequal.
+    ///
+    /// It was uniform at 10x, which is tidier to describe but measured the
+    /// wrong thing in two of the four. A subsystem saturates at its own load:
+    /// on the 16-core benchmark set the network path needs ~30x before the
+    /// victim degrades at all — below that the kernel serves more traffic
+    /// *faster* and the tenant appears to benefit from being attacked — while
+    /// the control plane needs 20x before capsule and vcluster separate.
     #[test]
-    fn every_subsystem_is_escalated_equally() {
+    fn each_subsystem_is_escalated_enough_to_contend() {
         let config = campaign();
-        let factor = config.load_multiplier * config.pod_multiplier;
-        assert_eq!(factor, 10.0);
+
+        // Every subsystem escalates by pod count, never by asking one worker
+        // for more. A blocked worker cannot exceed 1/latency, and a load
+        // generator asked for an impossible rate collapses to near zero rather
+        // than degrading to its maximum — measured at loadMultiplier 10, where
+        // the network intruder produced 0.1% of target.
+        assert_eq!(config.load_multiplier, 1.0);
+
+        // The total is what has to clear a subsystem's contention threshold;
+        // how it splits between rate and pods decides what it costs to get
+        // there. Assert both, because the split is load-bearing for the
+        // network and invisible in the product.
+        let escalation = |load: f64, pods: f64| load * pods;
+
+        assert_eq!(config.cp_load_multiplier, 1.0);
+        assert_eq!(config.cp_pod_multiplier, 20.0);
+        // 10x, which contends or does not depending on the host, so this
+        // figure cannot be validated here. Below the host's packet-rate ceiling
+        // the kernel path gets *more* efficient with load (NAPI polling) and
+        // the victim's latency falls, reporting a degradation under 1.0 — not
+        // fairness, but the harness failing to contend. On the 16-core pinned
+        // benchmark set the ceiling is ~450k pkt/s and 10x (137.5k one-way,
+        // 275k on the wire once the echo is counted) sits under it: measured
+        // 0.76x, which is why that host needs 30x. An unpinned developer host
+        // saturates far earlier and reports 21.8x at this same 10x.
+        //
+        // So: check the reported degradation is above 1.0 before trusting a
+        // network row, and raise `network.podMultiplier` on any host where it
+        // is not.
+        // Network: 10x by pods alone. The split is available per subsystem
+        // (`loadMultiplier` beside `podMultiplier`) and is the thing to reach
+        // for if this row misbehaves: a pod pair is two Python processes
+        // sharing the node with the victim's own generator, so past some pod
+        // count the victim's latency measures its own CPU starvation rather
+        // than network contention. Raising the rate per pod reaches the same
+        // wire rate with fewer processes, at the cost of asking more of a
+        // single asyncio event loop.
+        assert_eq!(config.net_load_multiplier, 1.0);
+        assert_eq!(config.net_pod_multiplier, 10.0);
+        assert_eq!(
+            escalation(config.net_load_multiplier, config.net_pod_multiplier),
+            10.0
+        );
+        assert_eq!(config.st_load_multiplier, 1.0);
+        assert_eq!(config.st_pod_multiplier, 10.0);
+        assert_eq!(config.wl_load_multiplier, 1.0);
+        assert_eq!(config.wl_pod_multiplier, 10.0);
 
         // Unlimited would make every rate below a no-op.
         assert!(!matches!(
@@ -1226,20 +1812,27 @@ mod campaign_config_tests {
         ));
     }
 
+    /// 2000 rather than 1500, because 1500 does not separate the solutions.
+    ///
+    /// Measured back to back on the same clusters, intruder achieving 100% of
+    /// target in every cell: at 1500 capsule scored 2.07 and vcluster 1.51, a
+    /// separation of 1.37x; at 2000, 3.86 and 1.91 — 2.02x. Capsule shares the
+    /// host API server so a heavier neighbour lands on it, while vcluster's
+    /// tenant has its own; below 2000 neither is stressed enough to show it.
     #[test]
-    fn control_plane_targets_150_to_1500_requests_per_second() {
+    fn control_plane_targets_100_to_2000_requests_per_second() {
         let config = campaign();
-        assert_eq!(config.cp_rate, 150.0);
+        assert_eq!(config.cp_rate, 100.0);
 
-        let intruder = config.cp_rate * config.load_multiplier * config.pod_multiplier;
-        assert_eq!(intruder, 1500.0);
+        let intruder = config.cp_rate * config.cp_load_multiplier * config.cp_pod_multiplier;
+        assert_eq!(intruder, 2000.0);
 
         // Concurrency must be ample: a worker blocks on each request, so its
         // ceiling is 1/latency. At 20 req/s per worker there is a wide margin
         // even when contention pushes latency into the tens of milliseconds.
-        let workers = config.cp_requesters as f64 * config.pod_multiplier;
-        assert_eq!(workers, 50.0);
-        assert_eq!(intruder / workers, 30.0);
+        let workers = config.cp_requesters as f64 * config.cp_pod_multiplier;
+        assert_eq!(workers, 100.0);
+        assert_eq!(intruder / workers, 20.0);
     }
 
     #[test]
@@ -1266,21 +1859,46 @@ mod campaign_config_tests {
     #[test]
     fn data_plane_targets_the_published_rates() {
         let config = campaign();
-        let escalate = |per_unit: f64| per_unit * config.load_multiplier * config.pod_multiplier;
+        // Each subsystem escalates by its own multiplier. Using the global one
+        // here made this assert a figure the campaign no longer offers: it
+        // still passed while claiming the network reached 1.25 Gbps, which it
+        // has not done since the network moved to 30x.
+        // Both halves are per subsystem now. Using the global load multiplier
+        // here would have this assert pass while describing a rate the network
+        // has not offered since it moved to 4x.
+        let escalate = |per_unit: f64, load: f64, pods: f64| per_unit * load * pods;
 
         // Storage: 10 -> 100 kreq/s, rate being per pod.
         assert_eq!(config.st_rate, 10_000.0);
-        assert_eq!(escalate(10_000.0), 100_000.0);
+        assert_eq!(
+            escalate(
+                10_000.0,
+                config.st_load_multiplier,
+                config.st_pod_multiplier
+            ),
+            100_000.0
+        );
 
-        // Network: 125 Mbps -> 1.25 Gbps one-way at a 1000-byte payload.
+        // Network: 150 Mbps -> 1.5 Gbps one-way at a 1000-byte payload. The
+        // probe is an echo, so the wire carries twice each figure.
         assert_eq!(config.net_packet_size, 1000);
         let one_way_mbps = |packets: f64| packets * config.net_packet_size as f64 * 8.0 / 1e6;
-        assert_eq!(one_way_mbps(config.net_rate), 125.0);
-        assert_eq!(one_way_mbps(escalate(config.net_rate)), 1250.0);
+        assert_eq!(one_way_mbps(config.net_rate), 150.0);
+        assert_eq!(
+            one_way_mbps(escalate(
+                config.net_rate,
+                config.net_load_multiplier,
+                config.net_pod_multiplier
+            )),
+            1500.0
+        );
 
         // Workload: 5 -> 50 req/s.
         assert_eq!(config.wl_rate, 5.0);
-        assert_eq!(escalate(5.0), 50.0);
+        assert_eq!(
+            escalate(5.0, config.wl_load_multiplier, config.wl_pod_multiplier),
+            50.0
+        );
 
         // There was an assertion here requiring `wl_max_prime <= 50_000`, on
         // the reasoning that a sysbench event at maxPrime 500000 takes ~1.9 s
@@ -1301,6 +1919,70 @@ mod campaign_config_tests {
     fn campaign_phases_are_the_published_durations() {
         let config = campaign();
         assert_eq!(config.baseline_duration, Duration::from_secs(30));
-        assert_eq!(config.test_duration, Duration::from_secs(60));
+        // 30s, halved from 60s to bring a 10-rep 4-solution campaign down from
+        // ~7.5h. It halves the samples behind each run's latency figure.
+        assert_eq!(config.test_duration, Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod cluster_profile_tests {
+    use super::*;
+
+    fn solution(data_plane: Vec<DataPlaneTechnology>) -> SolutionUnderTest {
+        SolutionUnderTest {
+            control_plane: ClusterEnvironmentType::Native,
+            data_plane,
+        }
+    }
+
+    /// Every cluster is built for a real CNI, never kind's default.
+    ///
+    /// kindnet fails silently in two unrelated ways: it ignores NetworkPolicy,
+    /// so a policy row on it measures a policy nobody enforces; and it
+    /// addresses pods `/24`, a netmask a KubeVirt guest inherits through its
+    /// `bridge` binding, which left two tenants' VMs on one node ARPing for
+    /// each other and never answered. Neither announces itself in a result, so
+    /// the default is pinned here rather than left to whichever technology
+    /// happens to ask for something.
+    #[test]
+    fn the_default_profile_disables_kindnet_and_takes_the_cni_subnet() {
+        let profile = solution(vec![]).cluster_profile();
+
+        assert!(profile.disable_default_cni, "kindnet must never be the CNI");
+        assert_eq!(
+            profile.pod_subnet.as_deref(),
+            Some(CniPlugin::DEFAULT.pod_subnet())
+        );
+    }
+
+    /// A technology that names its own CNI still gets it.
+    #[test]
+    fn a_technology_that_needs_its_own_cni_overrides_the_default() {
+        let solution = solution(vec![DataPlaneTechnology::KubeOvnVpc]);
+
+        assert_eq!(solution.cni().unwrap(), CniPlugin::KubeOvn);
+        assert_eq!(
+            solution.cluster_profile().pod_subnet.as_deref(),
+            Some(CniPlugin::KubeOvn.pod_subnet()),
+            "the cluster must be created with the subnet its CNI expects"
+        );
+    }
+
+    /// Technologies that compose all name the same CNI, and that is agreement.
+    ///
+    /// `kubeovn`, `kubeovn-subnet` and `kubeovn-vpc` are layers on one CNI, so
+    /// selecting them together must not read as two CNIs fighting.
+    #[test]
+    fn technologies_sharing_one_cni_compose() {
+        assert_eq!(
+            solution(vec![
+                DataPlaneTechnology::KubeOvn,
+                DataPlaneTechnology::KubeOvnVpc,
+            ])
+            .cni()
+            .unwrap(),
+            CniPlugin::KubeOvn
+        );
     }
 }

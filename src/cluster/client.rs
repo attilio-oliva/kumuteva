@@ -1006,19 +1006,44 @@ impl KubernetesClient {
             ..Default::default()
         };
 
-        let watch_stream = watcher(api, wc).applied_objects().default_backoff();
+        // The deadline has to be enforced out here, around the whole loop.
+        //
+        // `watcher::Config.timeout` bounds a single watch *request*, and
+        // `default_backoff()` reconnects when one ends — which is what makes
+        // the watcher robust and also means the stream never finishes on its
+        // own. Relying on it read like a 290-second timeout and was in fact an
+        // unbounded wait: a probe that could never be scheduled held a campaign
+        // for as long as anyone let it run, with no error and no output.
+        //
+        // A pod that becomes Running inside the deadline is unaffected, so no
+        // measurement changes — only runs that would otherwise never end.
+        let deadline = Duration::from_secs(u64::from(timeout_seconds));
+        let wait = async {
+            let watch_stream = watcher(api, wc).applied_objects().default_backoff();
+            let mut stream = pin!(watch_stream);
 
-        let mut stream = pin!(watch_stream);
+            while let Some(pod) = stream.try_next().await? {
+                let status = pod.status.ok_or(Error::msg("Pod status not found"))?;
+                if status.phase == Some("Running".to_string()) {
+                    return Ok(());
+                }
+            }
+            Err(Error::msg("Pod watch ended before the pod was Running"))
+        };
 
-        while let Some(pod) = stream.try_next().await? {
-            let status = pod.status.ok_or(Error::msg("Pod status not found"))?;
-            if status.phase == Some("Running".to_string()) {
-                return Ok(());
+        match tokio::time::timeout(deadline, wait).await {
+            Ok(result) => result,
+            Err(_) => {
+                // Worth naming the usual cause: a pod that never leaves Pending
+                // is normally unschedulable, not slow.
+                println!(
+                    "Pod {}/{} was not Running after {}s — check whether it can \
+                     be scheduled at all (`kubectl describe pod`)",
+                    namespace, pod_name, timeout_seconds
+                );
+                Err(Error::msg("Pod did not become ready in time"))
             }
         }
-
-        println!("Pod did not become ready in time");
-        Err(Error::msg("Pod did not become ready in time"))
     }
 
     pub async fn wait_for_pod_to_be_ready(&self, pod_name: &str, namespace: &str) -> Result<()> {
@@ -1077,6 +1102,41 @@ impl KubernetesClient {
     pub async fn wait_for_pod_deletion(&self, pod_name: &str, namespace: &str) -> Result<()> {
         self.wait_for_pod_deletion_timeout(pod_name, namespace, 120)
             .await
+    }
+
+    /// Whether a CRD's schema for `version` declares `spec.<field>`.
+    ///
+    /// Used to ask an installed operator what it can actually express, rather
+    /// than assuming the version this tool's bindings were generated from.
+    ///
+    /// The failure this prevents is silent. Kubernetes prunes fields a
+    /// structural schema does not declare, so sending `spec.rules` to a CRD
+    /// that predates it yields a *successfully created* object with the policy
+    /// quietly missing — a tenant that looks hardened, enforces less, and
+    /// reports it as the solution being weaker.
+    pub async fn crd_spec_has_field(
+        &self,
+        crd_name: &str,
+        version: &str,
+        field: &str,
+    ) -> Result<bool> {
+        let crds: Api<CustomResourceDefinition> = Api::all(self.client.clone());
+        let crd = crds
+            .get(crd_name)
+            .await
+            .with_context(|| format!("Failed to read CRD {crd_name}"))?;
+
+        Ok(crd
+            .spec
+            .versions
+            .iter()
+            .find(|v| v.name == version)
+            .and_then(|v| v.schema.as_ref())
+            .and_then(|schema| schema.open_api_v3_schema.as_ref())
+            .and_then(|root| root.properties.as_ref())
+            .and_then(|props| props.get("spec"))
+            .and_then(|spec| spec.properties.as_ref())
+            .is_some_and(|props| props.contains_key(field)))
     }
 
     pub async fn publish_crd<C>(&self) -> Result<()>
@@ -1512,7 +1572,13 @@ mod tests {
 
     async fn setup_kind_cluster(name: &str) -> anyhow::Result<KindCluster> {
         let kubeconfig_path = temp_kubeconfig_path(name);
-        KindCluster::create(name, kubeconfig_path, Default::default()).await
+        KindCluster::create(
+            name,
+            kubeconfig_path,
+            Default::default(),
+            &Default::default(),
+        )
+        .await
     }
 
     async fn teardown_kind_cluster(cluster: KindCluster) -> anyhow::Result<()> {

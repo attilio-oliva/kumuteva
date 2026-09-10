@@ -2,8 +2,8 @@
 mod breach;
 mod control_plane;
 mod network;
-mod probe;
-mod storage;
+pub mod probe;
+pub mod storage;
 mod workload;
 
 pub mod fairness_assessor;
@@ -130,6 +130,78 @@ pub fn admission_refusal(error: &anyhow::Error) -> Option<String> {
             }
             _ => None,
         })
+}
+
+/// What an authorization probe established about an operation on its own,
+/// before any cross-tenant question is asked.
+///
+/// Replaces a `bool`, and the missing third case is why. The probes attempt
+/// the operation and used to report `result.is_ok()`, which makes a policy
+/// saying no indistinguishable from a name collision, a timeout, or an API
+/// hiccup. Both read as "not authorized", and the runner scored that as `Hard`
+/// — so a flaky create produced the most reassuring verdict in the table.
+///
+/// Observed: `native+gvisor` reported `Use Privileged Syscalls` as authorized
+/// on one run and not on the next, with no configuration change between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Authorization {
+    /// The tenant may perform the operation in its own namespace.
+    Allowed,
+    /// A policy refused it. The tenant learns a restriction exists.
+    Forbidden(String),
+    /// The API accepted the operation and it had no effect: nothing was
+    /// refused, and nothing happened either.
+    ///
+    /// A virtual cluster does this with the kinds it synthesises. vCluster
+    /// admits a `Node` create — the tenant is admin of its own API server, so
+    /// RBAC has no objection — and its syncer then discards the object, which
+    /// never appears. The tenant has no autonomy over the kind, yet it was told
+    /// no restriction: what it observes afterwards is a cluster in which the
+    /// object simply does not exist, which is what a lone tenant observes too.
+    /// So autonomy is false and isolation is `Hard`.
+    ///
+    /// Distinct from [`Authorization::Forbidden`], which is `Soft` precisely
+    /// because a refusal discloses that a restriction exists. Nothing is
+    /// disclosed here.
+    Ineffective(String),
+    /// The probe failed for a reason that is not a policy decision, so
+    /// nothing was established either way.
+    Undetermined(String),
+}
+
+impl Authorization {
+    /// Classify the outcome of a probe attempted purely to see whether the
+    /// tenant is allowed to do something.
+    pub fn from_attempt<T>(outcome: anyhow::Result<T>) -> Self {
+        match outcome {
+            Ok(_) => Authorization::Allowed,
+            Err(error) => match admission_refusal(&error) {
+                Some(message) => Authorization::Forbidden(message),
+                None => Authorization::Undetermined(error.to_string()),
+            },
+        }
+    }
+
+    /// Both halves must be allowed for the whole to be.
+    ///
+    /// A policy refusal is decisive and outranks an undetermined half: the
+    /// operation is forbidden whatever the other probe did. An ineffective half
+    /// ranks below a refusal — a refusal that did happen is the stronger
+    /// finding — and above an undetermined one, which established nothing.
+    pub fn and(self, other: Authorization) -> Self {
+        match (self, other) {
+            (Authorization::Forbidden(why), _) | (_, Authorization::Forbidden(why)) => {
+                Authorization::Forbidden(why)
+            }
+            (Authorization::Ineffective(why), _) | (_, Authorization::Ineffective(why)) => {
+                Authorization::Ineffective(why)
+            }
+            (Authorization::Undetermined(why), _) | (_, Authorization::Undetermined(why)) => {
+                Authorization::Undetermined(why)
+            }
+            (Authorization::Allowed, Authorization::Allowed) => Authorization::Allowed,
+        }
+    }
 }
 
 /// Isolation level for cross-tenant operations
@@ -317,15 +389,18 @@ pub trait MultitenancyAssessor: Send + Sync {
 
     fn name(&self) -> &'static str;
 
-    /// Check if the tenant has basic authorization to perform the operation.
-    /// This is used only to determine if there's ZERO autonomy.
-    /// Returns true if the operation is permitted at all.
+    /// Check whether the tenant may perform the operation in its own
+    /// namespace, before any cross-tenant question is asked.
+    ///
+    /// Three outcomes, not two: see [`Authorization`]. A probe that fails for
+    /// a reason other than policy must say so rather than reporting the
+    /// operation forbidden.
     async fn is_authorized(
         &self,
         tenant: &TenantClusterConfig,
         resource: &Self::Resource,
         operation: &<Self::Resource as AssessableResource>::Operation,
-    ) -> anyhow::Result<bool>;
+    ) -> anyhow::Result<Authorization>;
 
     /// Perform the cross-tenant effect check by actually attempting the operation.
     /// This returns both isolation AND autonomy levels based on the actual results.
@@ -370,24 +445,63 @@ pub async fn run_assessment<A: MultitenancyAssessor>(
                 .is_authorized(tenant1, &resource, &operation)
                 .await?;
 
-            let assessment = if !authorized {
-                // Zero autonomy - operation not permitted at all
-                OperationAssessment {
+            let assessment = match authorized {
+                // A policy refused the operation outright. That is soft, not
+                // hard: the tenant is told it may not do this, which is
+                // exactly the "forbidden error you can infer a policy from"
+                // case. Hard is reserved for an operation that *runs* and
+                // returns what a lone tenant would have got anyway — and this
+                // one never ran, so it cannot have earned that.
+                //
+                // This read `Hard` with the comment "if not authorized, it's
+                // safe by definition", which contradicted `IsolationLevel`'s
+                // own documentation and scored every prohibition as the
+                // strongest possible isolation.
+                Authorization::Forbidden(why) => OperationAssessment {
                     autonomy: false,
-                    isolation: IsolationLevel::Hard, // If not authorized, it's safe by definition
-                    details: Some("Operation not authorized".to_string()),
-                }
-            } else {
-                // Authorized - proceed with cross-tenant effect check
-                // This will determine both isolation AND autonomy
-                let result = assessor
-                    .check_cross_tenant_effect(tenant1, tenant2, &resource, &operation)
-                    .await?;
+                    isolation: IsolationLevel::Soft(format!("Operation forbidden: {why}")),
+                    details: Some(format!("Operation not authorized — {why}")),
+                },
+                // Accepted and inert. No autonomy, because the tenant cannot
+                // make the operation do anything; `Hard` isolation, because
+                // what it is left looking at is a cluster where the object does
+                // not exist — indistinguishable from single tenancy, and
+                // nothing about another tenant leaked to produce it.
+                //
+                // This is the verdict `test_cross_tenant_create` already
+                // reaches for the same situation; routing it through the
+                // authorization gate keeps DELETE from calling it a refusal.
+                Authorization::Ineffective(why) => OperationAssessment {
+                    autonomy: false,
+                    isolation: IsolationLevel::Hard,
+                    details: Some(format!(
+                        "Operation accepted but ineffective — {why}, so the tenant \
+                         is left with the view a single tenant would have"
+                    )),
+                },
+                // Neither allowed nor refused: the probe itself did not work,
+                // so there is nothing to report but that.
+                Authorization::Undetermined(why) => OperationAssessment {
+                    autonomy: true,
+                    isolation: IsolationLevel::Unknown,
+                    details: Some(format!(
+                        "The authorization probe failed for a reason that is not a \
+                         policy decision, so neither autonomy nor isolation was \
+                         measured — {why}"
+                    )),
+                },
+                // Permitted, so the cross-tenant question is worth asking.
+                // That check determines both isolation and autonomy.
+                Authorization::Allowed => {
+                    let result = assessor
+                        .check_cross_tenant_effect(tenant1, tenant2, &resource, &operation)
+                        .await?;
 
-                OperationAssessment {
-                    autonomy: result.autonomy,
-                    isolation: result.isolation,
-                    details: Some(result.details),
+                    OperationAssessment {
+                        autonomy: result.autonomy,
+                        isolation: result.isolation,
+                        details: Some(result.details),
+                    }
                 }
             };
 
@@ -1061,11 +1175,109 @@ impl Display for MultitenancyReport {
     }
 }
 
+/// A policy refusing an operation and a probe simply failing are different
+/// facts and must not collapse into one.
+///
+/// The `bool` these replace made them the same, and the runner then scored
+/// "not authorized" as `Hard` — the strongest isolation in the vocabulary —
+/// so an intermittent API error produced the most reassuring possible result.
+#[cfg(test)]
+mod authorization_tests {
+    use super::{admission_refusal_tests::api_error, Authorization};
+
+    #[test]
+    fn a_successful_attempt_means_the_tenant_may_do_it() {
+        assert_eq!(
+            Authorization::from_attempt(Ok::<_, anyhow::Error>(())),
+            Authorization::Allowed
+        );
+    }
+
+    #[test]
+    fn a_policy_refusal_is_recognised_as_a_policy_refusal() {
+        let outcome: anyhow::Result<()> = Err(api_error(403, "violates PodSecurity"));
+        assert!(matches!(
+            Authorization::from_attempt(outcome),
+            Authorization::Forbidden(why) if why.contains("PodSecurity")
+        ));
+    }
+
+    /// The case that made `native+gvisor` report `Use Privileged Syscalls`
+    /// authorized on one run and forbidden on the next, with no configuration
+    /// change in between.
+    #[test]
+    fn a_transient_failure_is_not_a_policy_refusal() {
+        let outcome: anyhow::Result<()> = Err(api_error(409, "object is being deleted"));
+        assert!(matches!(
+            Authorization::from_attempt(outcome),
+            Authorization::Undetermined(_)
+        ));
+    }
+
+    #[test]
+    fn a_refusal_of_either_half_forbids_the_whole() {
+        let forbidden = Authorization::Forbidden("no PersistentVolumes for you".to_string());
+        assert!(matches!(
+            forbidden.clone().and(Authorization::Allowed),
+            Authorization::Forbidden(_)
+        ));
+        assert!(matches!(
+            Authorization::Allowed.and(forbidden.clone()),
+            Authorization::Forbidden(_)
+        ));
+        // Decisive over a half that established nothing.
+        assert!(matches!(
+            Authorization::Undetermined("timed out".to_string()).and(forbidden),
+            Authorization::Forbidden(_)
+        ));
+    }
+
+    /// An operation that was accepted and did nothing is not one that was
+    /// refused.
+    ///
+    /// vCluster admits a `Node` create — the tenant owns its own API server —
+    /// and its syncer discards the object. The DELETE probe then found nothing
+    /// to delete, and "could not perform the operation" scored that as a policy
+    /// refusal, which is `Soft`: `v1/Node` came out at soft isolation for a
+    /// virtual cluster whose node view is entirely its own, where nothing was
+    /// refused and nothing was disclosed.
+    #[test]
+    fn an_ineffective_operation_outranks_an_undetermined_one_but_not_a_refusal() {
+        let ineffective = Authorization::Ineffective("the Node never appeared".to_string());
+
+        assert!(matches!(
+            ineffective.clone().and(Authorization::Allowed),
+            Authorization::Ineffective(_)
+        ));
+        assert!(matches!(
+            Authorization::Undetermined("timed out".to_string()).and(ineffective.clone()),
+            Authorization::Ineffective(_)
+        ));
+        // A refusal that actually happened is the stronger finding.
+        assert!(matches!(
+            ineffective.and(Authorization::Forbidden("no".to_string())),
+            Authorization::Forbidden(_)
+        ));
+    }
+
+    #[test]
+    fn both_halves_must_be_allowed_for_the_whole_to_be() {
+        assert_eq!(
+            Authorization::Allowed.and(Authorization::Allowed),
+            Authorization::Allowed
+        );
+        assert!(matches!(
+            Authorization::Allowed.and(Authorization::Undetermined("timed out".to_string())),
+            Authorization::Undetermined(_)
+        ));
+    }
+}
+
 #[cfg(test)]
 mod admission_refusal_tests {
     use super::admission_refusal;
 
-    fn api_error(code: u16, message: &str) -> anyhow::Error {
+    pub(super) fn api_error(code: u16, message: &str) -> anyhow::Error {
         anyhow::Error::new(kube::Error::Api(kube::error::ErrorResponse {
             status: "Failure".to_string(),
             message: message.to_string(),

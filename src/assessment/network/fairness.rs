@@ -304,43 +304,66 @@ fn tcp_ping_client_pod(
         .map(|r| format!("{} pkt/s total", r))
         .unwrap_or_else(|| "unlimited".to_string());
 
-    // Python asyncio TCP ping client with pipelining - sends and receives in parallel
-    // This allows achieving high packet rates regardless of RTT
+    // Python asyncio TCP ping client, pipelined across `streams` connections.
+    //
+    // Written for cost per packet, because that cost is a hard constraint on
+    // what can be measured. At 18,750 pkt/s the previous version burned 1.25
+    // CPU per client pod — 67us per round trip — so ten intruder pods needed
+    // ~14 CPUs of real work. On a 16-core budget that fits only if the tenants
+    // are containers; inside KubeVirt VMs it did not, the generators were
+    // starved, and the intruder delivered 24k of its 187.5k pkt/s target while
+    // its own latency blew out to 1.9s. The degradation factor then described a
+    // load generator that could not run.
+    //
+    // Four things were paid per packet and none of them had to be:
+    //
+    //   * a fresh `b'X' * 985` payload built for every send;
+    //   * `asyncio.wait_for` around every `readline`, which allocates a Task
+    //     and arms a timer each time;
+    //   * a full decode of the 1000-byte response to recover a sequence number;
+    //   * an f-string per sample.
+    //
+    // The sequence number is what forced the last two, and it is unnecessary: a
+    // TCP connection to an echo server returns responses in the order they were
+    // sent, so the Nth reply belongs to the Nth send. Matching by order means
+    // one constant packet buffer, no parsing, and a deque instead of a dict.
+    // Samples are kept as raw floats and formatted once at the end.
+    //
+    // Everything the previous version reported is still reported: a latency for
+    // every individual packet rather than an average over a window, independent
+    // streams, and the same `RESULTS:` line.
     let python_script = format!(
         r#"
 import asyncio
 import time
 import sys
+import gc
+from array import array
 from collections import deque
+
+# The cyclic collector is off for the whole run.
+#
+# This client keeps a sample per packet, and CPython's generational GC scans
+# *all* tracked objects on a gen-2 pass — inside the event loop, so the loop
+# stops and every request in flight completes late together. It showed up as
+# bursts of thousands of consecutive samples over 10ms while p50 stayed at
+# 0.7ms, and those bursts decided p95. Refcounting frees everything here; the
+# collector only exists for reference cycles, which floats in an array do not
+# make.
+gc.disable()
+gc.freeze()
 
 SERVER = "{server_ip}"
 PORT = {port}
 DURATION = {duration}
 STREAMS = {streams}
 RATE_PER_STREAM = {rate_str}  # packets per second per stream, None = unlimited
-PACKET_SIZE = {packet_size}  # payload size in bytes
-MAX_IN_FLIGHT = 1000  # Maximum packets waiting for response per stream
+PACKET_SIZE = {packet_size}   # payload size in bytes
+MAX_IN_FLIGHT = 1000          # per stream
 
-# Pre-generate padding for packet payload (message format: "S<stream>P<seq><padding>\n")
-def make_packet(stream_id, seq):
-    prefix = f"S{{stream_id}}P{{seq}}".encode()
-    # Total size = PACKET_SIZE, last byte is newline
-    padding_len = max(0, PACKET_SIZE - len(prefix) - 1)
-    return prefix + (b'X' * padding_len) + b'\n'
-
-def parse_seq(data):
-    # Parse "S<stream>P<seq>..." format
-    try:
-        s = data.decode('utf-8', errors='ignore')
-        if s.startswith('S') and 'P' in s:
-            p_idx = s.index('P')
-            seq_end = p_idx + 1
-            while seq_end < len(s) and s[seq_end].isdigit():
-                seq_end += 1
-            return int(s[p_idx+1:seq_end])
-    except:
-        pass
-    return None
+# One packet, built once. Its contents carry no meaning: replies are matched to
+# sends by order, not by anything written in them.
+PKT = b'X' * max(1, PACKET_SIZE - 1) + b'\n'
 
 print("=== TCP Ping Client Configuration ===", flush=True)
 print(f"Server: {{SERVER}}:{{PORT}}", flush=True)
@@ -352,184 +375,122 @@ print(f"Rate limit: {total_rate}", flush=True)
 print(f"Pipelining: enabled (max {{MAX_IN_FLIGHT}} in-flight)", flush=True)
 print("======================================", flush=True)
 
-async def sender(stream_id, writer, send_times, stop_event, start_time, end_time):
-    """Send packets at the target rate using token bucket for accurate rate control"""
+async def sender(writer, sent_at, start, end):
+    """Pace packets to the target rate, sending whatever is due in one batch."""
+    clock = time.perf_counter
+    write = writer.write
+    drain = writer.drain
     seq = 0
-    
-    try:
-        while time.perf_counter() < end_time and not stop_event.is_set():
-            now = time.perf_counter()
-            
-            # Calculate how many packets should have been sent by now (token bucket)
-            if RATE_PER_STREAM:
-                elapsed = now - start_time
-                target_packets = int(elapsed * RATE_PER_STREAM)
-            else:
-                target_packets = seq + 100  # Unlimited: always send more
-            
-            # Send packets to catch up to target
-            packets_to_send = target_packets - seq
-            
-            if packets_to_send > 0:
-                for _ in range(packets_to_send):
-                    # Check if too many in flight
-                    if len(send_times) >= MAX_IN_FLIGHT:
-                        break
-                    if time.perf_counter() >= end_time:
-                        break
-                    
-                    # Send packet
-                    msg = make_packet(stream_id, seq)
-                    send_time = time.perf_counter()
-                    send_times[seq] = send_time
-                    writer.write(msg)
-                    seq += 1
-                
-                # Flush all writes at once (more efficient)
-                await writer.drain()
-            else:
-                # We're ahead of schedule, wait a bit
-                if RATE_PER_STREAM:
-                    next_packet_time = start_time + (seq + 1) / RATE_PER_STREAM
-                    sleep_time = next_packet_time - now
-                    if sleep_time > 0:
-                        await asyncio.sleep(min(sleep_time, 0.01))  # Cap at 10ms
-                    else:
-                        await asyncio.sleep(0.0001)  # Minimal yield
-                else:
-                    await asyncio.sleep(0.0001)  # Minimal yield for unlimited
-                    
-    except Exception as e:
-        print(f"[Stream {{stream_id}}] Sender error: {{e}}", file=sys.stderr, flush=True)
-    
+    while True:
+        now = clock()
+        if now >= end:
+            break
+        if len(sent_at) >= MAX_IN_FLIGHT:
+            await asyncio.sleep(0.0005)
+            continue
+        if RATE_PER_STREAM:
+            due = int((now - start) * RATE_PER_STREAM) - seq
+            if due <= 0:
+                # Ahead of schedule: wait for the next packet to fall due.
+                ahead = (seq + 1) / RATE_PER_STREAM - (now - start)
+                await asyncio.sleep(min(max(ahead, 0.0002), 0.005))
+                continue
+        else:
+            due = 256
+        for _ in range(due):
+            sent_at.append(clock())
+            write(PKT)
+            seq += 1
+        await drain()
     return seq
 
-async def receiver(stream_id, reader, send_times, results, stop_event, start_time, end_time):
-    """Receive responses and match them to sent packets for RTT calculation"""
-    received = 0
-    errors = 0
-    
-    try:
-        # Keep receiving until stopped and all in-flight packets are accounted for
-        while not stop_event.is_set() or len(send_times) > 0:
-            try:
-                response = await asyncio.wait_for(reader.readline(), timeout=0.5)
-                recv_time = time.perf_counter()
-                
-                if not response:
-                    break
-                
-                seq = parse_seq(response)
-                if seq is not None and seq in send_times:
-                    send_time = send_times.pop(seq)
-                    rtt_ms = (recv_time - send_time) * 1000
-                    rel_ts = send_time - start_time
-                    results.append(f"{{rel_ts:.3f}}:{{rtt_ms:.3f}}:0")
-                    received += 1
-                else:
-                    # Couldn't match response to a send time
-                    rel_ts = recv_time - start_time
-                    results.append(f"{{rel_ts:.3f}}:0.0:1")
-                    errors += 1
-                    
-            except asyncio.TimeoutError:
-                # Check if we should stop
-                if stop_event.is_set() and len(send_times) == 0:
-                    break
-                # Mark oldest in-flight packet as lost if we've been waiting too long
-                if send_times:
-                    oldest_seq = min(send_times.keys())
-                    oldest_time = send_times[oldest_seq]
-                    if time.perf_counter() - oldest_time > 2.0:  # 2 second timeout
-                        send_times.pop(oldest_seq)
-                        rel_ts = oldest_time - start_time
-                        results.append(f"{{rel_ts:.3f}}:2000.0:1")  # Mark as timeout
-                        errors += 1
-                continue
-    except Exception as e:
-        print(f"[Stream {{stream_id}}] Receiver error: {{e}}", file=sys.stderr, flush=True)
-    
-    # Mark remaining in-flight packets as lost
-    for seq, send_time in send_times.items():
-        rel_ts = send_time - start_time
-        results.append(f"{{rel_ts:.3f}}:2000.0:1")
-        errors += 1
-    send_times.clear()
-    
-    return received, errors
+async def receiver(reader, sent_at, ts, rtt, start, stop):
+    """One reply per send, in order, so matching is a popleft."""
+    clock = time.perf_counter
+    readline = reader.readline
+    while True:
+        # One await per packet, deliberately.
+        #
+        # Reading larger chunks and counting newlines is cheaper — but only by
+        # about 3%, and it changes what is measured: every packet in a chunk
+        # then shares the instant the application saw them, which drops the
+        # reported latency roughly tenfold because the client's own
+        # serialisation backlog stops being counted. Cheaper numbers that mean
+        # something else are not a saving.
+        line = await readline()
+        if not line:
+            break
+        now = clock()
+        if not sent_at:
+            continue
+        sent = sent_at.popleft()
+        ts.append(sent - start)
+        rtt.append((now - sent) * 1000.0)
+        if stop.is_set() and not sent_at:
+            break
+    return len(rtt)
 
-async def run_stream(stream_id: int, all_results: list):
+async def run_stream(stream_id, all_results):
     try:
         reader, writer = await asyncio.open_connection(SERVER, PORT)
-        print(f"[Stream {{stream_id}}] Connected", file=sys.stderr, flush=True)
     except Exception as e:
         print(f"[Stream {{stream_id}}] Connection failed: {{e}}", file=sys.stderr, flush=True)
         return
-    
-    start_time = time.perf_counter()
-    end_time = start_time + DURATION
-    send_times = {{}}  # seq -> send_time
-    results = []
-    stop_event = asyncio.Event()
-    
+
+    start = time.perf_counter()
+    end = start + DURATION
+    sent_at = deque()
+    ts = array('d')
+    rtt = array('d')
+    stop = asyncio.Event()
+    sent = 0
+    received = 0
+
     try:
-        # Run sender and receiver concurrently
-        sender_task = asyncio.create_task(
-            sender(stream_id, writer, send_times, stop_event, start_time, end_time)
-        )
-        receiver_task = asyncio.create_task(
-            receiver(stream_id, reader, send_times, results, stop_event, start_time, end_time)
-        )
-        
-        # Wait for sender to finish (duration elapsed)
-        sent = await sender_task
-        
-        # Signal receiver to stop after draining
-        stop_event.set()
-        
-        # Wait for receiver to finish (with timeout)
+        send_task = asyncio.create_task(sender(writer, sent_at, start, end))
+        recv_task = asyncio.create_task(receiver(reader, sent_at, ts, rtt, start, stop))
+        sent = await send_task
+        stop.set()
         try:
-            received, errors = await asyncio.wait_for(receiver_task, timeout=5.0)
+            # One timer for the whole stream rather than one per packet.
+            received = await asyncio.wait_for(recv_task, timeout=5.0)
         except asyncio.TimeoutError:
-            print(f"[Stream {{stream_id}}] Receiver timeout, stopping", file=sys.stderr, flush=True)
-            receiver_task.cancel()
-            received, errors = 0, 0
-        
-        print(f"[Stream {{stream_id}}] Sent {{sent}}, received {{received}}, errors {{errors}}", file=sys.stderr, flush=True)
-        
+            recv_task.cancel()
     except Exception as e:
         print(f"[Stream {{stream_id}}] Error: {{e}}", file=sys.stderr, flush=True)
     finally:
         writer.close()
         try:
             await writer.wait_closed()
-        except:
+        except Exception:
             pass
-    
-    all_results.extend(results)
+
+    # Formatted once, at the end, rather than per packet.
+    append = all_results.append
+    for i in range(len(rtt)):
+        append("%.3f:%.3f:0" % (ts[i], rtt[i]))
+    # Anything still outstanding never came back.
+    for sent_time in sent_at:
+        append("%.3f:2000.0:1" % (sent_time - start))
+    print(
+        f"[Stream {{stream_id}}] Sent {{sent}}, received {{received}}, lost {{len(sent_at)}}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 async def main():
     print(f"Launching {{STREAMS}} pipelined streams...", flush=True)
-    
     all_results = []
-    tasks = [run_stream(i, all_results) for i in range(STREAMS)]
-    
-    print("Waiting for streams to complete...", flush=True)
-    await asyncio.gather(*tasks)
+    await asyncio.gather(*[run_stream(i, all_results) for i in range(STREAMS)])
     print("All streams completed.", flush=True)
-    
-    # Output results
-    total_packets = len(all_results)
+
     total_errors = sum(1 for r in all_results if r.endswith(":1"))
-    
     print(f"=== Summary ===", file=sys.stderr, flush=True)
-    print(f"Total packets: {{total_packets}}", file=sys.stderr, flush=True)
+    print(f"Total packets: {{len(all_results)}}", file=sys.stderr, flush=True)
     print(f"Total errors: {{total_errors}}", file=sys.stderr, flush=True)
     print(f"===============", file=sys.stderr, flush=True)
-    
-    # Print results in expected format
-    results_str = ",".join(all_results)
-    print(f"RESULTS:{{results_str}},", flush=True)
+
+    print("RESULTS:" + ",".join(all_results) + ",", flush=True)
 
 asyncio.run(main())
 "#,
@@ -707,8 +668,10 @@ async fn collect_results(tenant: &TenantClusterConfig, pairs: u32) -> Result<Vec
                         let is_error = parts.get(2).map(|e| *e == "1").unwrap_or(false);
                         points.push(MetricPoint {
                             // Pacing happens inside the pod, so there is no dispatch schedule to
-                            // measure against: the recorded latency is already the service time.
+                            // measure against: the recorded latency is already the service time,
+                            // and `ts` is already the pod's own dispatch clock.
                             scheduled_latency_ms: None,
+                            slot_timestamp_secs: None,
                             timestamp_secs: ts,
                             latency_ms: rtt,
                             is_error,

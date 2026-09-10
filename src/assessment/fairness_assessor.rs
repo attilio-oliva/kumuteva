@@ -762,19 +762,48 @@ impl Display for FairnessResult {
             self.unbalanced.tenant2.achieved_ops_per_sec(),
             self.unbalanced.tenant2.error_rate
         )?;
+        // How hard the intruder actually pushed, in every subsystem. The
+        // configured escalation is a request, not an outcome: a pod multiplier
+        // silently dropped from the campaign file and a generator that could
+        // not keep up both show here as an escalation below the configured
+        // one, and neither is visible from the latency figures alone.
+        let baseline_load = self.baseline.tenant2.achieved_ops_per_sec();
+        let unbalanced_load = self.unbalanced.tenant2.achieved_ops_per_sec();
+        if baseline_load > 0.0 {
+            writeln!(
+                f,
+                "    ↳ {:.1}x the baseline load ({:.1} → {:.1} ops/s)",
+                unbalanced_load / baseline_load,
+                baseline_load,
+                unbalanced_load
+            )?;
+        }
 
+        // Only the network generator knows its payload size, so the other
+        // subsystems leave this None and print no bandwidth at all.
         if let (Some(b), Some(u)) = (
             self.baseline.tenant1.achieved_bytes_per_sec,
             self.unbalanced.tenant1.achieved_bytes_per_sec,
         ) {
             let mbps = |bytes_per_sec: f64| bytes_per_sec * 8.0 / 1.0e6;
-            writeln!(f, "\n{}", "Regular-tenant bandwidth (on the wire):".bold())?;
+            writeln!(f, "\n{}", "Bandwidth (on the wire):".bold())?;
             writeln!(
                 f,
-                "  baseline {:>9.1} Mbps   unbalanced {:>9.1} Mbps",
+                "  regular    baseline {:>9.1} Mbps   unbalanced {:>9.1} Mbps",
                 mbps(b),
                 mbps(u)
             )?;
+            if let (Some(b2), Some(u2)) = (
+                self.baseline.tenant2.achieved_bytes_per_sec,
+                self.unbalanced.tenant2.achieved_bytes_per_sec,
+            ) {
+                writeln!(
+                    f,
+                    "  malicious  baseline {:>9.1} Mbps   unbalanced {:>9.1} Mbps",
+                    mbps(b2),
+                    mbps(u2)
+                )?;
+            }
         }
 
         writeln!(f, "\n{}", "Result:".bold())?;

@@ -18,6 +18,42 @@ use crate::assessment::{
 };
 
 /// Run a fairness assessment from parsed CLI arguments.
+/// Print a subsystem's escalation when it differs from the global one.
+///
+/// Escalation is per subsystem, so the header's "Pod multiplier: 10x" is only
+/// the default. A run that escalated the control plane 20x and the network 30x
+/// printed 10x for both and said nothing about the override — so a campaign
+/// file whose keys were silently dropped looked identical to one that applied,
+/// and the only way to tell was to read the manifest afterwards.
+fn print_pod_multiplier(subsystem: f64, global: f64) {
+    if subsystem != global {
+        println!("  Pod multiplier: {subsystem}x (custom, global is {global}x)");
+    }
+}
+
+/// The rate half of the escalation, on the same terms.
+fn print_load_multiplier(subsystem: f64, global: f64) {
+    if subsystem != global {
+        println!("  Rate multiplier: {subsystem}x (custom, global is {global}x)");
+    }
+}
+
+/// What the intruder was actually asked for, once both halves are applied.
+///
+/// Neither multiplier means anything on its own — 3x pods at 10x rate and 30x
+/// pods at 1x rate are the same offered load by very different routes — and
+/// the total is the number that has to clear the subsystem's contention
+/// threshold. Printing it removes the mental arithmetic at the point where a
+/// misconfigured campaign is still cheap to catch.
+fn print_escalation(rate: f64, load_multiplier: f64, pod_multiplier: f64, unit: &str) {
+    let factor = load_multiplier * pod_multiplier;
+    println!(
+        "  Intruder target: {:.0} {unit} ({factor}x the owner\'s {:.0})",
+        rate * factor,
+        rate
+    );
+}
+
 pub async fn run(cli_args: FairnessCliLayer) -> Result<()> {
     setup_logging(cli_args.verbose)?;
     println!("Running fairness assessment...\n");
@@ -70,14 +106,19 @@ pub async fn run(cli_args: FairnessCliLayer) -> Result<()> {
     let mut failed_subsystems: Vec<&str> = Vec::new();
 
     // Helper to build a runner for a specific subsystem
-    let create_runner = |rate: f64| {
+    // Escalation is per subsystem, not global: each saturates at its own load.
+    // On a 16-core node the network path needs ~30x before the victim degrades
+    // at all — below that the kernel serves more traffic *faster*, and the
+    // measurement reports the tenant improving under attack — while 10x is
+    // already past what the control plane absorbs.
+    let create_runner = |rate: f64, load_multiplier: f64, pod_multiplier: f64| {
         let mut builder = FairnessRunnerBuilder::new()
             .baseline_duration(config.baseline_duration)
             .test_duration(config.test_duration)
             .rate(rate)
             .strategy(config.rate_strategy.into())
-            .malicious_multiplier(config.load_multiplier)
-            .pod_multiplier(config.pod_multiplier);
+            .malicious_multiplier(load_multiplier)
+            .pod_multiplier(pod_multiplier);
 
         if config.export_csv {
             builder = builder.export_csv(&config.output_dir);
@@ -95,12 +136,24 @@ pub async fn run(cli_args: FairnessCliLayer) -> Result<()> {
         if config.cp_rate != config.rate_limit {
             println!("  Rate limit: {} req/s (custom)", config.cp_rate);
         }
+        print_load_multiplier(config.cp_load_multiplier, config.load_multiplier);
+        print_pod_multiplier(config.cp_pod_multiplier, config.pod_multiplier);
+        print_escalation(
+            config.cp_rate,
+            config.cp_load_multiplier,
+            config.cp_pod_multiplier,
+            "req/s",
+        );
         println!("═══════════════════════════════════════════════════════════");
 
         let cp_assessor = FairnessControlPlaneAssessor::new(FairnessControlPlaneConfig {
             max_workers: config.cp_requesters,
         });
-        let runner = create_runner(config.cp_rate);
+        let runner = create_runner(
+            config.cp_rate,
+            config.cp_load_multiplier,
+            config.cp_pod_multiplier,
+        );
         match runner
             .run(&cp_assessor, tenant1_config.clone(), tenant2_config.clone())
             .await
@@ -129,6 +182,14 @@ pub async fn run(cli_args: FairnessCliLayer) -> Result<()> {
         if config.net_rate != config.rate_limit {
             println!("  Rate limit: {} req/s (custom)", config.net_rate);
         }
+        print_load_multiplier(config.net_load_multiplier, config.load_multiplier);
+        print_pod_multiplier(config.net_pod_multiplier, config.pod_multiplier);
+        print_escalation(
+            config.net_rate,
+            config.net_load_multiplier,
+            config.net_pod_multiplier,
+            "pkt/s",
+        );
         println!("═══════════════════════════════════════════════════════════");
 
         let net_assessor = FairnessNetworkAssessor::new(FairnessNetworkConfig {
@@ -136,7 +197,11 @@ pub async fn run(cli_args: FairnessCliLayer) -> Result<()> {
             streams: config.net_streams,
             packet_size: config.net_packet_size,
         });
-        let runner = create_runner(config.net_rate);
+        let runner = create_runner(
+            config.net_rate,
+            config.net_load_multiplier,
+            config.net_pod_multiplier,
+        );
         match runner
             .run(
                 &net_assessor,
@@ -184,6 +249,14 @@ pub async fn run(cli_args: FairnessCliLayer) -> Result<()> {
         if config.st_rate != config.rate_limit {
             println!("  Rate limit: {} req/s (custom)", config.st_rate);
         }
+        print_load_multiplier(config.st_load_multiplier, config.load_multiplier);
+        print_pod_multiplier(config.st_pod_multiplier, config.pod_multiplier);
+        print_escalation(
+            config.st_rate,
+            config.st_load_multiplier,
+            config.st_pod_multiplier,
+            "IOPS",
+        );
         println!("═══════════════════════════════════════════════════════════");
 
         let st_assessor = FairnessStorageAssessor::new(FairnessStorageConfig {
@@ -197,7 +270,11 @@ pub async fn run(cli_args: FairnessCliLayer) -> Result<()> {
             qos_class: config.probe_qos.into(),
             runtime_class_name: config.runtime_class.clone(),
         });
-        let runner = create_runner(config.st_rate);
+        let runner = create_runner(
+            config.st_rate,
+            config.st_load_multiplier,
+            config.st_pod_multiplier,
+        );
         match runner
             .run(&st_assessor, tenant1_config.clone(), tenant2_config.clone())
             .await
@@ -226,6 +303,14 @@ pub async fn run(cli_args: FairnessCliLayer) -> Result<()> {
         if config.wl_rate != config.rate_limit {
             println!("  Rate limit: {} req/s (custom)", config.wl_rate);
         }
+        print_load_multiplier(config.wl_load_multiplier, config.load_multiplier);
+        print_pod_multiplier(config.wl_pod_multiplier, config.pod_multiplier);
+        print_escalation(
+            config.wl_rate,
+            config.wl_load_multiplier,
+            config.wl_pod_multiplier,
+            "req/s",
+        );
         println!("═══════════════════════════════════════════════════════════");
 
         let wl_assessor = FairnessWorkloadAssessor::new(FairnessWorkloadConfig {
@@ -237,7 +322,11 @@ pub async fn run(cli_args: FairnessCliLayer) -> Result<()> {
             intruder_qos: config.intruder_qos.into(),
             runtime_class_name: config.runtime_class.clone(),
         });
-        let runner = create_runner(config.wl_rate);
+        let runner = create_runner(
+            config.wl_rate,
+            config.wl_load_multiplier,
+            config.wl_pod_multiplier,
+        );
         match runner
             .run(&wl_assessor, tenant1_config.clone(), tenant2_config.clone())
             .await

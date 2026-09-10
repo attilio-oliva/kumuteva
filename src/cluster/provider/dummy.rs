@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::cluster::KubernetesClient;
 
-use super::{ClusterProvider, HostCluster, TenantsPortMapping};
+use super::{ClusterProfile, ClusterProvider, HostCluster, TenantsPortMapping};
 
 pub type PreExistingCluster = HostCluster<DummyProvider>;
 
@@ -18,6 +18,10 @@ impl ClusterProvider for DummyProvider {
         _name: &str,
         kubeconfig_path: &Path,
         _tenants_port_mapping: TenantsPortMapping,
+        // A pre-existing cluster was built by someone else; its CNI and
+        // containerd configuration are facts to be measured, not settings to
+        // apply. Whether it matches the profile is the operator's business.
+        _profile: &ClusterProfile,
     ) -> Result<()> {
         // For dummy provider, we verify the cluster is accessible
         println!("Verifying existing Kubernetes cluster accessibility...");
@@ -126,8 +130,13 @@ mod tests {
         let non_existent_path = PathBuf::from("/tmp/non-existent-kubeconfig-dummy.yaml");
         let port_mappings = TenantsPortMapping::default();
 
-        let result =
-            PreExistingCluster::create("test-dummy", non_existent_path, port_mappings).await;
+        let result = PreExistingCluster::create(
+            "test-dummy",
+            non_existent_path,
+            port_mappings,
+            &Default::default(),
+        )
+        .await;
         assert!(result.is_err(), "Should fail when kubeconfig doesn't exist");
     }
 
@@ -152,7 +161,8 @@ mod tests {
 
         // Even if creation fails due to no real cluster, delete should work
         if let Ok(cluster) =
-            PreExistingCluster::create("test", kubeconfig_path, port_mappings).await
+            PreExistingCluster::create("test", kubeconfig_path, port_mappings, &Default::default())
+                .await
         {
             assert!(
                 cluster.delete().await.is_ok(),

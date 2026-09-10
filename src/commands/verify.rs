@@ -16,6 +16,8 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
     let output_json = args.output_json;
     let list_properties = args.list_properties;
     let solution_label = args.solution_label;
+    let runtime_class = args.runtime_class;
+    let dns_nameserver = args.dns_nameserver;
     let control_plane = args.control_plane;
     let storage = args.storage;
     let network = args.network;
@@ -37,6 +39,18 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
         );
         return Ok(());
     }
+
+    // Set before any probe is constructed. Every probe reads it at build time,
+    // so a later call would produce a run where some pods were sandboxed and
+    // some were not.
+    if let Some(name) = &runtime_class {
+        println!("Probes will run under RuntimeClass '{name}'");
+    }
+    assessment::probe::set_runtime_class(runtime_class);
+    if let Some(server) = &dns_nameserver {
+        println!("Probes will resolve names through {server}");
+    }
+    assessment::probe::set_dns_nameserver(dns_nameserver);
 
     println!("Verifying cluster isolation...");
     // Taken before the assessment so the timestamp reflects when the run

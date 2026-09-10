@@ -49,7 +49,46 @@ spec:
         spec:
           runStrategy: Always
           template:
+            metadata:
+              labels:
+                # Carried onto the virt-launcher pod by KubeVirt, which is what
+                # the anti-affinity below selects on.
+                kumuteva.io/tenant-vm: "true"
             spec:
+              # Keep the tenants' VMs on different nodes.
+              #
+              # Not a capacity decision. A KubeVirt tenant is a VM bound to the
+              # pod network with `bridge`, so the guest takes the pod IP *and*
+              # the CNI's netmask. Two VMs on one node share that node's /24,
+              # the guest treats its neighbour as on-link and ARPs for it, and
+              # kindnet routes pods rather than bridging them — it answers ARP
+              # only for the gateway. Every cross-tenant packet then dies at
+              # address resolution, in both directions, and the assessment
+              # reports an isolation the platform is not providing.
+              #
+              # On separate nodes each VM is off-link to the other and routes
+              # via its gateway. Verified by hand on the testbed: with the two
+              # VMs made mutually off-link, an ordinary pod in one tenant read
+              # the other's NodePort marker.
+              #
+              # `required` rather than `preferred` because a run where they
+              # co-schedule measures the wrong topology silently, which is worse
+              # than a run that will not start. It needs one node per tenant —
+              # see `ClusterEnvironmentType::worker_nodes_required`.
+              affinity:
+                podAntiAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    - labelSelector:
+                        matchLabels:
+                          kumuteva.io/tenant-vm: "true"
+                      # Each tenant's VM lives in its own namespace, and a bare
+                      # labelSelector only considers pods in the scheduling
+                      # pod's *own* namespace — so without this the rule matches
+                      # nothing and both VMs land on the same node, which is the
+                      # topology that hides the cross-tenant path. An empty
+                      # namespaceSelector means every namespace.
+                      namespaceSelector: {}
+                      topologyKey: kubernetes.io/hostname
               domain:
                 cpu:
                   cores: ${CONTROL_PLANE_VM_CORES}
@@ -88,12 +127,36 @@ spec:
         serviceSubnet: 10.95.0.0/16
     initConfiguration:
       nodeRegistration:
+        # Identical across tenants on purpose.
+        #
+        # Host-namespace probes pin the intruder to the node named by the
+        # victim. Where each tenant is its own cluster that name exists nowhere
+        # on the intruder's side, so the pod is never scheduled, never runs, and
+        # writes no logs — and "no marker in empty output" was being read as
+        # isolation. A shared name makes the pin resolve to the intruder's own
+        # node, so the probe executes and answers from evidence.
+        #
+        # Done here rather than through `machineNamingStrategy`, which cannot
+        # express it: its webhook rejects any template without `{{ .random }}`,
+        # so Machine names always carry a per-tenant suffix.
+        #
+        # The cost, accepted deliberately: the KubeVirt provider stamps a node's
+        # providerID after finding it *by the Machine's name*, and CAPI resolves
+        # `status.nodeRef` from that providerID. With the node renamed the lookup
+        # misses, so `NODE NAME` stays empty and Machines never report Ready.
+        # The clusters themselves are fine — nodes Ready, API up, workloads
+        # schedulable — but CAPI's own readiness reporting is not to be trusted
+        # on these tenants.
+        name: "${TENANT_NODE_NAME}"
         criSocket: "${CRI_PATH}"
         kubeletExtraArgs:
           container-log-max-size: "${CONTAINER_LOG_MAX_SIZE}"
           container-log-max-files: "${CONTAINER_LOG_MAX_FILES}"
     joinConfiguration:
       nodeRegistration:
+        # No fixed name here: this governs *additional* control-plane replicas,
+        # and any fixed name would collide with the first one. Only the single
+        # control plane (initConfiguration) and the single worker are pinned.
         criSocket: "${CRI_PATH}"
         kubeletExtraArgs:
           container-log-max-size: "${CONTAINER_LOG_MAX_SIZE}"
@@ -116,7 +179,46 @@ spec:
         spec:
           runStrategy: Always
           template:
+            metadata:
+              labels:
+                # Carried onto the virt-launcher pod by KubeVirt, which is what
+                # the anti-affinity below selects on.
+                kumuteva.io/tenant-vm: "true"
             spec:
+              # Keep the tenants' VMs on different nodes.
+              #
+              # Not a capacity decision. A KubeVirt tenant is a VM bound to the
+              # pod network with `bridge`, so the guest takes the pod IP *and*
+              # the CNI's netmask. Two VMs on one node share that node's /24,
+              # the guest treats its neighbour as on-link and ARPs for it, and
+              # kindnet routes pods rather than bridging them — it answers ARP
+              # only for the gateway. Every cross-tenant packet then dies at
+              # address resolution, in both directions, and the assessment
+              # reports an isolation the platform is not providing.
+              #
+              # On separate nodes each VM is off-link to the other and routes
+              # via its gateway. Verified by hand on the testbed: with the two
+              # VMs made mutually off-link, an ordinary pod in one tenant read
+              # the other's NodePort marker.
+              #
+              # `required` rather than `preferred` because a run where they
+              # co-schedule measures the wrong topology silently, which is worse
+              # than a run that will not start. It needs one node per tenant —
+              # see `ClusterEnvironmentType::worker_nodes_required`.
+              affinity:
+                podAntiAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    - labelSelector:
+                        matchLabels:
+                          kumuteva.io/tenant-vm: "true"
+                      # Each tenant's VM lives in its own namespace, and a bare
+                      # labelSelector only considers pods in the scheduling
+                      # pod's *own* namespace — so without this the rule matches
+                      # nothing and both VMs land on the same node, which is the
+                      # topology that hides the cross-tenant path. An empty
+                      # namespaceSelector means every namespace.
+                      namespaceSelector: {}
+                      topologyKey: kubernetes.io/hostname
               domain:
                 cpu:
                   cores: ${WORKER_VM_CORES}
@@ -144,6 +246,10 @@ spec:
     spec:
       joinConfiguration:
         nodeRegistration:
+          # Identical across tenants, distinct from the control plane's: two
+          # nodes sharing one name collide inside a cluster and the second never
+          # registers, which left every `md-0` machine Pending.
+          name: "${TENANT_WORKER_NODE_NAME}"
           # The storage assessor ships fio's per-I/O latency log through the pod's
           # stdout, which is the only retrieval path that works across every
           # solution. At 10k IOPS for 60s that is ~600k lines, well past the

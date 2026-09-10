@@ -145,11 +145,9 @@ pub(super) async fn test_cross_tenant_update(
     tenant2: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> anyhow::Result<CrossTenantResult> {
-    // Special handling for resources that can't be created
-    if requires_existing_object(object_kind) {
-        return test_cross_tenant_update_for_existing_resource(tenant1, tenant2, object_kind).await;
-    }
-
+    // Our own object first, for the same reason as DELETE below: the
+    // existing-object path patches a *real* node and leaves the attacker's
+    // label on it, which outlives the run.
     let test_name = format!(
         "update-test-{}",
         uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
@@ -173,6 +171,13 @@ pub(super) async fn test_cross_tenant_update(
         .await;
 
     if create_result.is_err() {
+        // Only the kinds with no other route fall back to mutating a real
+        // object — today just `Node`.
+        if requires_existing_object(object_kind) {
+            return test_cross_tenant_update_for_existing_resource(tenant1, tenant2, object_kind)
+                .await;
+        }
+
         return Ok(CrossTenantResult {
             autonomy: false,
             isolation: IsolationLevel::Unknown,
@@ -851,11 +856,21 @@ pub(super) async fn test_cross_tenant_delete(
     tenant2: &TenantClusterConfig,
     object_kind: &KubernetesObject,
 ) -> anyhow::Result<CrossTenantResult> {
-    // Special handling for resources that can't be created
-    if requires_existing_object(object_kind) {
-        return test_cross_tenant_delete_for_existing_resource(tenant1, tenant2, object_kind).await;
-    }
-
+    // Always try to make our own object to attack first, even for the kinds
+    // that used to go straight to an existing one.
+    //
+    // The old order sent `Node` directly to the existing-object path, where the
+    // probe deletes a real node. On a solution that grants the tenant
+    // cluster-admin — `native`, which exists precisely to be that control —
+    // this succeeded and removed the cluster's only node. Nothing failed
+    // loudly: the API server stayed up, the assessment carried on, and every
+    // pod after that point sat Pending with `no nodes available to schedule
+    // pods`, so the run destroyed the cluster it was measuring and reported
+    // nothing about it.
+    //
+    // Creating a disposable node and deleting *that* answers the same question
+    // — can the other tenant delete an object it does not own — without
+    // touching anything the cluster needs.
     let test_name = format!(
         "delete-test-{}",
         uuid::Uuid::new_v4().to_string()[0..8].to_lowercase()
@@ -875,6 +890,16 @@ pub(super) async fn test_cross_tenant_delete(
         .await;
 
     if create_result.is_err() {
+        // Falling back to a real object is the destructive path, so it is
+        // reserved for the kinds that have no other route — today only `Node`.
+        // Broadening it would mean that any tenant forbidden from *creating* a
+        // ClusterRole gets a probe that deletes an existing one instead, which
+        // trades a measurement for cluster damage.
+        if requires_existing_object(object_kind) {
+            return test_cross_tenant_delete_for_existing_resource(tenant1, tenant2, object_kind)
+                .await;
+        }
+
         return Ok(CrossTenantResult {
             autonomy: false,
             isolation: IsolationLevel::Soft(format!(

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use super::{ClusterProvider, HostCluster, TenantsPortMapping};
+use super::{ClusterProfile, ClusterProvider, HostCluster, TenantsPortMapping};
 use anyhow::Context;
 
 // Type alias for backward compatibility
@@ -20,7 +20,23 @@ impl ClusterProvider for K3sProvider {
         name: &str,
         kubeconfig_path: &Path,
         tenants_port_mapping: TenantsPortMapping,
+        profile: &ClusterProfile,
     ) -> anyhow::Result<()> {
+        // k3s brings its own CNI (flannel) and its own containerd, neither
+        // configured the way the profile describes. Rather than silently build
+        // a cluster that does not match what was asked for, say so: the
+        // data-plane rows are kind-only until someone implements this.
+        if profile.disable_default_cni
+            || profile.pod_subnet.is_some()
+            || !profile.containerd_config_patches.is_empty()
+            || !profile.extra_mounts.is_empty()
+        {
+            return Err(anyhow::anyhow!(
+                "the k3s provider does not implement cluster profiles \
+                 (CNI replacement, containerd patches, extra mounts) — use --provider kind"
+            ));
+        }
+
         let (_tenant1_mapping, _tenant2_mapping) =
             (&tenants_port_mapping.tenant1, &tenants_port_mapping.tenant2);
 

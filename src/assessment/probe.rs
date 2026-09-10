@@ -32,11 +32,67 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, HostPathVolumeSource, Pod, PodSecurityContext, PodSpec,
-    ResourceRequirements, SeccompProfile, SecurityContext, Volume, VolumeMount,
+    Capabilities, Container, ContainerPort, HostPathVolumeSource, Pod, PodDNSConfig,
+    PodSecurityContext, PodSpec, ResourceRequirements, SeccompProfile, SecurityContext, Volume,
+    VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
+
+/// The RuntimeClass every probe runs under, when one was requested.
+///
+/// A process-wide setting rather than a parameter because it is one: `verify`
+/// assesses a single cluster, whose sandboxed runtime is a property of that
+/// cluster and not of any individual probe. Threading it through every
+/// construction site would put the same value in forty places and invite one of
+/// them to be missed — and a probe that quietly ran outside the sandbox would
+/// report `Hard`, the reassuring answer.
+///
+/// Set once from the CLI before any assessment runs, never mutated after.
+static RUNTIME_CLASS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Run every probe under this RuntimeClass. Call once, before assessing.
+///
+/// A RuntimeClass naming a handler containerd does not know leaves pods in
+/// `ContainerCreating` rather than failing at admission, so a wrong value here
+/// surfaces as probes that never produce evidence.
+pub fn set_runtime_class(runtime_class: Option<String>) {
+    let _ = RUNTIME_CLASS.set(runtime_class);
+}
+
+fn runtime_class() -> Option<String> {
+    RUNTIME_CLASS.get().cloned().flatten()
+}
+
+/// The RuntimeClass, for the one probe still built from a JSON literal.
+///
+/// [`ProbePod`] stamps this automatically; a hand-written manifest does not,
+/// and the omission is invisible — the pod runs, on the default runtime, and
+/// reports whatever an unsandboxed container would. Measured: the kernel-module
+/// escape probe ran outside gVisor and reported a breach that said nothing
+/// about the sandbox at all.
+pub fn runtime_class_for_manifest() -> Option<String> {
+    runtime_class()
+}
+
+/// The DNS server every probe should ask, when the cluster's own is not
+/// reachable from where the probes run.
+///
+/// A Kube-OVN custom VPC has no route to cluster DNS, and upstream does not
+/// inject a replacement into pods — so a probe left on the default resolver can
+/// resolve nothing, and a DNS experiment then measures the missing route rather
+/// than the tenancy. Set once from the CLI, for the same reasons as
+/// [`RUNTIME_CLASS`].
+static DNS_NAMESERVER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Point every probe at this resolver. Call once, before assessing.
+pub fn set_dns_nameserver(nameserver: Option<String>) {
+    let _ = DNS_NAMESERVER.set(nameserver);
+}
+
+fn dns_nameserver() -> Option<String> {
+    DNS_NAMESERVER.get().cloned().flatten()
+}
 
 /// Default probe image. Small, and carries a shell.
 const DEFAULT_IMAGE: &str = "alpine:latest";
@@ -109,6 +165,9 @@ pub struct ProbePod {
     name: String,
     container_name: String,
     image: String,
+    /// Memory limit, overridable for probes whose *tooling* needs more than
+    /// the default — never for anything a measurement depends on.
+    memory_limit: String,
     command: Vec<String>,
     args: Option<Vec<String>>,
     labels: BTreeMap<String, String>,
@@ -128,6 +187,7 @@ impl ProbePod {
             name: name.into(),
             container_name: "probe".to_string(),
             image: DEFAULT_IMAGE.to_string(),
+            memory_limit: LIMIT_MEMORY.to_string(),
             command: DEFAULT_COMMAND.iter().map(|s| s.to_string()).collect(),
             args: None,
             labels: BTreeMap::new(),
@@ -174,6 +234,21 @@ impl ProbePod {
         self
     }
 
+    /// Raise this probe's memory limit.
+    ///
+    /// For tooling, not for measurement. The default 128Mi is deliberately
+    /// small and every probe shares it, but a probe that installs a package
+    /// needs more than that inside a VM: under Kata `apk add` is OOM-killed at
+    /// 128Mi, so the tool it needed was missing and the property reported
+    /// `Unknown` — a fact about the limit, not about the runtime.
+    pub fn memory_limit(mut self, limit: &str) -> Self {
+        self.memory_limit = limit.to_string();
+        self
+    }
+
+    /// Kept for probes whose entrypoint is not a shell script; every
+    /// current probe uses `shell`.
+    #[allow(dead_code)]
     pub fn command<I, S>(mut self, command: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -305,7 +380,7 @@ impl ProbePod {
             // claims to measure.
             resources: Some(ResourceRequirements {
                 requests: Some(quantities(REQUEST_CPU, REQUEST_MEMORY)),
-                limits: Some(quantities(LIMIT_CPU, LIMIT_MEMORY)),
+                limits: Some(quantities(LIMIT_CPU, &self.memory_limit)),
                 ..Default::default()
             }),
             volume_mounts: host_path.as_ref().map(|(_, mount)| {
@@ -346,6 +421,20 @@ impl ProbePod {
                 // overwrite the evidence.
                 restart_policy: self.restart_policy,
                 node_name: self.node_name,
+                // Absent unless a sandbox was asked for, so an unsandboxed run
+                // produces the same manifest it always did.
+                runtime_class_name: runtime_class(),
+                // Likewise: untouched unless a resolver was named, so the
+                // default remains the cluster's own.
+                dns_policy: dns_nameserver().as_ref().map(|_| "None".to_string()),
+                dns_config: dns_nameserver().map(|server| PodDNSConfig {
+                    nameservers: Some(vec![server]),
+                    searches: Some(vec![
+                        "svc.cluster.local".to_string(),
+                        "cluster.local".to_string(),
+                    ]),
+                    ..Default::default()
+                }),
                 host_pid: asks_for(&HostAccess::Pid).then_some(true),
                 host_ipc: asks_for(&HostAccess::Ipc).then_some(true),
                 host_network: asks_for(&HostAccess::Network).then_some(true),
@@ -394,6 +483,19 @@ mod tests {
 
     fn spec(pod: &Pod) -> &PodSpec {
         pod.spec.as_ref().expect("a probe always has a spec")
+    }
+
+    /// Unset means absent, so an unsandboxed run builds the manifest it always
+    /// did.
+    ///
+    /// Only the default is unit-tested. `RUNTIME_CLASS` is process-wide, and a
+    /// test that set it would leak into every other test in this binary — the
+    /// set path is verified live instead, by the sandbox control that reads
+    /// `/proc/version` from inside a probe.
+    #[test]
+    fn no_runtime_class_unless_one_was_asked_for() {
+        let pod = ProbePod::new("p").build();
+        assert!(spec(&pod).runtime_class_name.is_none());
     }
 
     #[test]

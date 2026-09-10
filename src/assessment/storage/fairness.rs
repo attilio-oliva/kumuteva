@@ -406,14 +406,18 @@ fn fio_claim_name(index: u32) -> String {
 /// through separate claims contend at the backend, which is the interference the
 /// storage subsystem is supposed to be tested for. A single shared claim would
 /// additionally serialise them at the volume and confound the two effects.
-fn fio_claim(index: u32, config: &FairnessStorageConfig) -> PersistentVolumeClaim {
+fn fio_claim(
+    index: u32,
+    config: &FairnessStorageConfig,
+    storage_class: Option<&str>,
+) -> PersistentVolumeClaim {
     let mut spec = serde_json::json!({
         "accessModes": ["ReadWriteOnce"],
         "resources": {
             "requests": { "storage": format!("{}Mi", (config.file_size_mb * 2).max(64)) }
         }
     });
-    if let Some(class) = &config.storage_class_name {
+    if let Some(class) = storage_class {
         spec["storageClassName"] = serde_json::json!(class);
     }
 
@@ -442,8 +446,27 @@ async fn create_fio_pods(
     // timestamps start when fio starts, so bind latency cannot leak into the
     // reported numbers.
     if config.volume == FairnessStorageVolume::Pvc {
+        // Which class this tenant may claim through, asked once per tenant.
+        //
+        // A cluster can confine a namespace to StorageClasses of its own, and
+        // the two tenants are then confined to *different* ones — so a single
+        // `--st-storage-class` cannot name both, and a claim naming neither is
+        // refused outright:
+        //
+        //   persistentvolumeclaims "storage-fairness-claim-0" is forbidden:
+        //   ValidatingAdmissionPolicy 'kumuteva-tenant-storage-classes' ...
+        //
+        // Discovering it per tenant is the only form that works for both at
+        // once. An explicit `--st-storage-class` still wins, and a cluster with
+        // no per-tenant class yields `None`, leaving the claim to the default
+        // exactly as before.
+        let storage_class = match &config.storage_class_name {
+            Some(explicit) => Some(explicit.clone()),
+            None => super::tenant_storage_class(tenant, "Delete").await,
+        };
+
         for i in 0..pods {
-            let claim = fio_claim(i, config);
+            let claim = fio_claim(i, config, storage_class.as_deref());
             tenant
                 .cluster
                 .create_namespaced_resource(&claim, &tenant.namespace)
@@ -836,19 +859,31 @@ LATLOG_END";
         );
         assert!(volume.empty_dir.is_none());
 
-        let claim = fio_claim(2, &pvc_config);
+        let claim = fio_claim(2, &pvc_config, Some("fast-ssd"));
         assert_eq!(
             claim.spec.as_ref().unwrap().storage_class_name.as_deref(),
             Some("fast-ssd")
         );
 
-        // Without an explicit class the cluster default must apply, so the field
-        // has to be absent rather than set to an empty string.
-        let default_class = FairnessStorageConfig {
+        // A discovered per-tenant class reaches the claim the same way an
+        // explicit one does; the caller resolves which, this only renders it.
+        let no_explicit_class = FairnessStorageConfig {
             volume: FairnessStorageVolume::Pvc,
             ..Default::default()
         };
-        assert!(fio_claim(0, &default_class)
+        assert_eq!(
+            fio_claim(0, &no_explicit_class, Some("kumuteva-tenant1"))
+                .spec
+                .as_ref()
+                .unwrap()
+                .storage_class_name
+                .as_deref(),
+            Some("kumuteva-tenant1")
+        );
+
+        // With no class at all the cluster default must apply, so the field has
+        // to be absent rather than set to an empty string.
+        assert!(fio_claim(0, &no_explicit_class, None)
             .spec
             .as_ref()
             .unwrap()

@@ -3,9 +3,10 @@ use tracing::info;
 
 use crate::assessment::control_plane::{
     cleanup_test_resource, create_dynamic_object, create_minimal_object,
-    get_existing_object_for_testing, get_namespace_param, is_valid_get_result,
-    requires_existing_object, KubernetesObject, TenantClusterConfig,
+    get_existing_object_for_testing, get_namespace_param, is_authorization_error,
+    is_valid_get_result, requires_existing_object, KubernetesObject, TenantClusterConfig,
 };
+use crate::assessment::Authorization;
 
 /// Test if tenant can actually CREATE a resource by attempting the operation
 pub(super) async fn test_autonomy_create(
@@ -278,15 +279,28 @@ pub(super) async fn test_autonomy_update(
 }
 
 /// Test if tenant can actually DELETE a resource by attempting the operation
+///
+/// Answers with an [`Authorization`] rather than a bool, because the failures
+/// this probe can hit are not one thing. It has to create its own victim first
+/// — deleting an existing object would destroy the environment being measured —
+/// and that setup step fails in ways that say nothing about DELETE:
+///
+/// - the create was refused, so DELETE was never exercised;
+/// - the create was *accepted and discarded*, so there was nothing to delete
+///   and the DELETE that followed answered `404`.
+///
+/// The second is what vCluster does with `Node`: the tenant is admin of its own
+/// API server, the create is admitted, the syncer drops the object, and the
+/// delete then reports NotFound. Collapsed to `false` that became "the tenant
+/// could not perform the operation" — a refusal, scored `Soft` — which put
+/// `v1/Node` at soft isolation for a virtual cluster whose node view is its own
+/// and where nothing was refused and nothing disclosed. It is
+/// [`Authorization::Ineffective`], the verdict `test_cross_tenant_create`
+/// already reaches for the identical situation one operation over.
 pub(super) async fn test_autonomy_delete(
     tenant: &TenantClusterConfig,
     object_kind: &KubernetesObject,
-) -> anyhow::Result<bool> {
-    // Special handling for resources that can't be created
-    // if requires_existing_object(object_kind) {
-
-    // }
-
+) -> anyhow::Result<Authorization> {
     // For DELETE, we MUST create a resource to delete - we can't delete existing resources
     // as that would be destructive to the user's environment
     let test_name = format!(
@@ -306,10 +320,21 @@ pub(super) async fn test_autonomy_delete(
         )
         .await;
 
-    if create_result.is_err() {
-        // Can't create a resource to test DELETE with
-        // If we can't create, we likely can't delete either
-        return Ok(false);
+    if let Err(error) = create_result {
+        // No victim, so DELETE was never attempted. Whether that is a policy
+        // decision is decided by the create's own error, not assumed.
+        let why = error.to_string();
+        return Ok(if is_authorization_error(&why) {
+            Authorization::Forbidden(format!(
+                "the tenant may not create a {} to delete: {why}",
+                object_kind.kind()
+            ))
+        } else {
+            Authorization::Undetermined(format!(
+                "no {} could be created to delete: {why}",
+                object_kind.kind()
+            ))
+        });
     }
 
     // Wait a moment for the resource to be ready
@@ -318,11 +343,26 @@ pub(super) async fn test_autonomy_delete(
         .wait_for_dyn_resource_creation(object_kind, &test_name, namespace)
         .await;
 
-    // Try to DELETE the resource
-    let delete_result = tenant
+    // Did the accepted create actually produce anything? Asking before the
+    // delete is what separates "DELETE was refused" from "DELETE had nothing to
+    // act on"; without it the 404 that follows a discarded create reads as a
+    // refusal.
+    let victim_exists = tenant
         .cluster
-        .delete_resource_dyn(object_kind, &test_name, namespace)
-        .await;
+        .dyn_object_exists(object_kind, &test_name, namespace)
+        .await
+        .unwrap_or(false);
+
+    let delete_result = if victim_exists {
+        Some(
+            tenant
+                .cluster
+                .delete_resource_dyn(object_kind, &test_name, namespace)
+                .await,
+        )
+    } else {
+        None
+    };
 
     // For StatefulSets, also clean up the PVC (even if delete failed, PVC might exist)
     if *object_kind == KubernetesObject::StatefulSet {
@@ -335,5 +375,19 @@ pub(super) async fn test_autonomy_delete(
         }
     }
 
-    Ok(delete_result.is_ok())
+    Ok(match delete_result {
+        Some(Ok(_)) => Authorization::Allowed,
+        Some(Err(error)) => {
+            let why = error.to_string();
+            if is_authorization_error(&why) {
+                Authorization::Forbidden(why)
+            } else {
+                Authorization::Undetermined(why)
+            }
+        }
+        None => Authorization::Ineffective(format!(
+            "the {} was created without error and never appeared",
+            object_kind.kind()
+        )),
+    })
 }

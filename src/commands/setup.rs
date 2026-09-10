@@ -9,6 +9,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     let output_dir = args.output_dir;
     let cluster_name = args.cluster_name;
     let kind = args.kind;
+    let data_plane = args.data_plane;
     let provider = args.provider;
     let tenant1 = args.tenant1;
     let tenant2 = args.tenant2;
@@ -21,12 +22,20 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     // `bench-capsule`, and every later command that needs the real name
     // — `kind delete cluster`, `docker update --cpuset-cpus`, reading
     // back the kubeconfig — had to know about the rewrite to find it.
-    let solution = kind.as_str().to_string();
+    //
+    // The label does carry the data-plane technologies, because they change
+    // what was measured and a result file that did not name them would be
+    // indistinguishable from one taken without them.
+    let solution_under_test = SolutionUnderTest {
+        control_plane: kind,
+        data_plane,
+    };
+    let solution = solution_under_test.label();
     setup_test_environment(
         existing_cluster_kubeconfig,
         output_dir,
         &cluster_name,
-        kind,
+        &solution_under_test,
         provider,
         tenant1,
         tenant2,

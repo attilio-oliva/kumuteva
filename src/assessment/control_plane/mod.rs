@@ -21,6 +21,7 @@ use kube::Api;
 use tokio::time::sleep;
 
 use crate::assessment::control_plane::utils::create_minimal_object;
+use crate::assessment::Authorization;
 use crate::assessment::{
     AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
     OperationAssessment, SubsystemReport,
@@ -155,17 +156,36 @@ impl MultitenancyAssessor for ControlPlaneAssessor {
         tenant: &TenantClusterConfig,
         resource: &ControlPlaneResource,
         operation: &ControlPlaneOperation,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Authorization> {
         // Actually try the operation instead of using is_authorized_to
         // This is necessary because some proxies (like Capsule) may allow operations
         // even when is_authorized_to returns false
-        match operation {
-            ControlPlaneOperation::Create => test_autonomy_create(tenant, resource).await,
-            ControlPlaneOperation::Get => test_autonomy_get(tenant, resource).await,
-            ControlPlaneOperation::List => test_autonomy_list(tenant, resource).await,
-            ControlPlaneOperation::Update => test_autonomy_update(tenant, resource).await,
-            ControlPlaneOperation::Delete => test_autonomy_delete(tenant, resource).await,
-        }
+        // `DELETE` answers for itself. It is the probe that has to build its own
+        // victim before it can ask anything, so "could not set the test up" is a
+        // routine outcome there rather than an edge case, and collapsing it to
+        // `false` reported a refusal that never happened — see
+        // [`test_autonomy_delete`].
+        //
+        // The other four still answer with a bool, so a policy refusal and a
+        // failed setup are not yet distinguishable here the way they are in
+        // the data-plane assessors. Mapping `false` to `Forbidden` keeps their
+        // numbers exactly as they were rather than changing them as a side
+        // effect; separating out `Undetermined` needs each probe in
+        // `autonomy.rs` read individually, since several return `false` to
+        // mean "could not set the test up".
+        let permitted = match operation {
+            ControlPlaneOperation::Delete => return test_autonomy_delete(tenant, resource).await,
+            ControlPlaneOperation::Create => test_autonomy_create(tenant, resource).await?,
+            ControlPlaneOperation::Get => test_autonomy_get(tenant, resource).await?,
+            ControlPlaneOperation::List => test_autonomy_list(tenant, resource).await?,
+            ControlPlaneOperation::Update => test_autonomy_update(tenant, resource).await?,
+        };
+
+        Ok(if permitted {
+            Authorization::Allowed
+        } else {
+            Authorization::Forbidden("the tenant could not perform the operation".to_string())
+        })
     }
 
     async fn check_cross_tenant_effect(

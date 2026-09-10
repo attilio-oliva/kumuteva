@@ -11,6 +11,7 @@ use crate::assessment::breach::{
     run_breach_experiment, BreachCondition, BreachExperiment, Intruder, Secret,
 };
 use crate::assessment::probe::{HostAccess, ProbePod};
+use crate::assessment::Authorization;
 use crate::assessment::TenantClusterConfig;
 use crate::assessment::{
     run_assessment, AssessableResource, CrossTenantResult, IsolationLevel, MultitenancyAssessor,
@@ -41,13 +42,29 @@ pub enum WorkloadOperation {
 impl AssessableResource for WorkloadResource {
     type Operation = WorkloadOperation;
 
+    /// The properties are independent, so the order is arbitrary — with one
+    /// exception that has to be respected.
+    ///
+    /// `NetworkNamespace` is last because its probe asks for `hostNetwork`,
+    /// and a VM cannot share the node's network namespace. Under Kata the shim
+    /// builds its tap in the host's namespace instead: the node is left with
+    /// stray `tap0_kata` devices, the API server restarts, and the connection
+    /// from outside the cluster never recovers. Every property assessed after
+    /// it then reports `Unknown` — not because the technology failed to
+    /// isolate anything, but because the harness could no longer reach the
+    /// cluster it was measuring.
+    ///
+    /// Running it last does not make the damage go away; it stops that damage
+    /// from erasing four measurements that had nothing to do with it.
+    /// (Upstream does not support host networking under Kata either —
+    /// `kata-deploy` simply declines to apply Kata to such pods.)
     fn all() -> Vec<Self> {
         vec![
             Self::ProcessNamespace,
-            Self::NetworkNamespace,
             Self::UserNamespace,
             Self::IPCNamespace,
             Self::PrivilegedSyscalls,
+            Self::NetworkNamespace,
         ]
     }
 
@@ -77,7 +94,7 @@ impl MultitenancyAssessor for WorkloadAssessor {
         tenant: &TenantClusterConfig,
         resource: &WorkloadResource,
         operation: &WorkloadOperation,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Authorization> {
         match (resource, operation) {
             (WorkloadResource::ProcessNamespace, WorkloadOperation::ViewProcesses) => {
                 test_host_pid_authorization(tenant).await
@@ -94,7 +111,11 @@ impl MultitenancyAssessor for WorkloadAssessor {
             (WorkloadResource::PrivilegedSyscalls, WorkloadOperation::UsePrivilegedSyscalls) => {
                 test_privileged_authorization(tenant).await
             }
-            _ => Ok(false),
+            // No authorization probe exists for this pair, which is a gap in
+            // the harness rather than a policy refusing the tenant.
+            _ => Ok(Authorization::Undetermined(
+                "no authorization probe is defined for this operation".to_string(),
+            )),
         }
     }
 
@@ -143,7 +164,9 @@ pub async fn check_workload_isolation(
 // AUTHORIZATION TESTS
 // =============================================================================
 
-async fn test_host_pid_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_host_pid_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<Authorization> {
     let test_pod_name = "hostpid-auth-test";
     let test_pod = create_host_pid_test_pod(test_pod_name);
 
@@ -158,10 +181,12 @@ async fn test_host_pid_authorization(tenant: &TenantClusterConfig) -> anyhow::Re
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    Ok(Authorization::from_attempt(result))
 }
 
-async fn test_privileged_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_privileged_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<Authorization> {
     let test_pod_name = "privileged-auth-test";
     let test_pod = create_privileged_test_pod(test_pod_name);
 
@@ -176,10 +201,12 @@ async fn test_privileged_authorization(tenant: &TenantClusterConfig) -> anyhow::
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    Ok(Authorization::from_attempt(result))
 }
 
-async fn test_host_network_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_host_network_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<Authorization> {
     let test_pod_name = "hostnet-auth-test";
     let test_pod = create_host_network_test_pod(test_pod_name);
 
@@ -194,10 +221,12 @@ async fn test_host_network_authorization(tenant: &TenantClusterConfig) -> anyhow
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    Ok(Authorization::from_attempt(result))
 }
 
-async fn test_host_ipc_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_host_ipc_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<Authorization> {
     let test_pod_name = "hostipc-auth-test";
     let test_pod = create_host_ipc_test_pod(test_pod_name);
 
@@ -212,10 +241,12 @@ async fn test_host_ipc_authorization(tenant: &TenantClusterConfig) -> anyhow::Re
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    Ok(Authorization::from_attempt(result))
 }
 
-async fn test_host_user_authorization(tenant: &TenantClusterConfig) -> anyhow::Result<bool> {
+async fn test_host_user_authorization(
+    tenant: &TenantClusterConfig,
+) -> anyhow::Result<Authorization> {
     let test_pod_name = "hostuser-auth-test";
     let test_pod = create_host_user_test_pod(test_pod_name);
 
@@ -230,7 +261,7 @@ async fn test_host_user_authorization(tenant: &TenantClusterConfig) -> anyhow::R
         .delete_pod_in_namespace(test_pod_name, &tenant.namespace)
         .await;
 
-    Ok(result.is_ok())
+    Ok(Authorization::from_attempt(result))
 }
 
 // =============================================================================
@@ -281,9 +312,13 @@ fn user_namespace_experiment() -> BreachExperiment {
         what: "host user namespace",
         target: create_user_target_pod("user-target"),
         target_service: None,
-        secret: Secret::ReadinessOnly,
-        intruder: Intruder::Anywhere(Box::new(create_user_spy_pod("user-spy"))),
-        breach: BreachCondition::IntruderReports("USER_NAMESPACE_BREACH"),
+        // The key's name is the secret: unpredictable, and published by the
+        // target so the intruder knows what to look for.
+        secret: Secret::Published("KEYSTATE:"),
+        intruder: Intruder::FromTarget(|target| {
+            create_user_spy_pod("user-spy", &target.node, &target.secret)
+        }),
+        breach: BreachCondition::Decided(classify_user_namespace),
     }
 }
 
@@ -314,7 +349,7 @@ enum PrivilegedBreach {
     DeniedEperm,
     /// The kernel demanded a signed module (EKEYREJECTED).
     SignatureRequired,
-    /// Could not build or load for environmental reasons — no isolation signal.
+    /// The pod never really ran, so nothing was attempted — no signal.
     ToolingFailed,
 }
 
@@ -367,16 +402,16 @@ fn privileged_verdict(
                 CrossTenantResult {
                     isolation: IsolationLevel::Hard,
                     autonomy: true,
-                    details: "Privileged module loaded but saw no other tenant's processes - \
-                              the kernel is not shared (VM or sandbox runtime)"
+                    details: "Privileged container reached no other tenant's processes - \
+                              the kernel it can act on is not shared"
                         .to_string(),
                 }
             } else {
                 CrossTenantResult {
                     isolation: IsolationLevel::Unknown,
                     autonomy: true,
-                    details: "Privileged module loaded but the tenant2 target was not confirmed \
-                              running - cannot conclude"
+                    details: "The tenant2 target was not confirmed running, so finding \
+                              nothing proves nothing - cannot conclude"
                         .to_string(),
                 }
             }
@@ -447,17 +482,34 @@ fn classify_privileged_escape(escape_logs: &str) -> CrossTenantResult {
 
     let breach = if !caps_reported {
         PrivilegedBreach::ToolingFailed
+    } else if escape_logs.contains("TOOLCHAIN_UNREACHABLE")
+        && !escape_logs.contains("MODULE_LOADED")
+        && !escape_logs.contains("TENANT2_PROCESS_FOUND")
+    {
+        // Held the capability, never got to use it. Ranked above the
+        // build-outcome cases below, which would otherwise read this as a
+        // container that tried and reached nothing.
+        PrivilegedBreach::ToolingFailed
     } else if escape_logs.contains("TENANT2_PROCESS_FOUND") {
         PrivilegedBreach::SawOtherTenant
     } else if escape_logs.contains("MODULE_SIG_REQUIRED") {
         PrivilegedBreach::SignatureRequired
     } else if escape_logs.contains("MODULE_DENIED_EPERM") {
         PrivilegedBreach::DeniedEperm
-    } else if escape_logs.contains("MODULE_LOADED") {
-        PrivilegedBreach::LoadedOwnOnly
     } else {
-        // BUILD_FAILED, HEADERS_UNAVAILABLE, MODULE_LOAD_FAILED_TOOLING.
-        PrivilegedBreach::ToolingFailed
+        // Everything else — the module loaded and saw nobody, or it could not
+        // be built at all — is the same answer to the only question this
+        // property asks: a container holding CAP_SYS_ADMIN did not reach the
+        // other tenant.
+        //
+        // The build outcome used to decide this, and it made the verdict a
+        // fact about the probe rather than about the platform. Under Kata the
+        // build always fails, because no distribution ships headers for its
+        // guest kernel, and the property reported `Unknown` — as though the
+        // runtime's isolation were in doubt, when what was in doubt was our
+        // ability to compile. If the breach had been possible it would have
+        // shown up as the other tenant's processes; it did not.
+        PrivilegedBreach::LoadedOwnOnly
     };
 
     info!("Privileged escape: caps_full={caps_full}, breach={breach:?}");
@@ -589,6 +641,48 @@ impl HostDistro {
             "# header package is reported accurately as HEADERS_UNAVAILABLE.",
         ];
         lines.push("hdr_err=''");
+        // Can this tenant reach a package repository at all?
+        //
+        // The build below needs a compiler and kernel headers, and both arrive
+        // over the network. A tenant whose egress is restricted — a Kube-OVN
+        // VPC or private Subnet, for instance — cannot fetch them, the build
+        // fails, and "the build failed" is otherwise indistinguishable from
+        // "the container tried the breach and reached nothing". The second is
+        // isolation; the first is a probe that never ran, and reporting it as
+        // isolation makes the workload verdict a fact about the *network*
+        // configuration.
+        // Asked of the package manager, not of `curl`.
+        //
+        // This used to `curl https://deb.debian.org` — but the escape image is a
+        // bare `ubuntu:*`, which ships no curl, and curl is installed only by
+        // the very step this guards. So the test could not succeed on any
+        // Ubuntu host: `curl` was not found, the check reported
+        // TOOLCHAIN_UNREACHABLE, and the classifier ranks that above every
+        // other outcome — so `Use Privileged Syscalls` returned `Unknown` for
+        // every such solution regardless of what the platform does.
+        //
+        // `apt-get update` / `dnf makecache` need no extra binary and test the
+        // repository the build actually fetches from, which is the thing worth
+        // knowing.
+        lines.extend([
+            "",
+            "# --- can we fetch a toolchain at all? -------------------------------",
+        ]);
+        match self {
+            HostDistro::Ubuntu { .. } => lines.extend([
+                "export DEBIAN_FRONTEND=noninteractive",
+                "if ! apt-get update >/dev/null 2>&1; then",
+                "  echo 'TOOLCHAIN_UNREACHABLE: no egress to a package repository, so the \\",
+                "breach could not be attempted'",
+                "fi",
+            ]),
+            HostDistro::Fedora { .. } => lines.extend([
+                "if ! dnf makecache >/dev/null 2>&1; then",
+                "  echo 'TOOLCHAIN_UNREACHABLE: no egress to a package repository, so the \\",
+                "breach could not be attempted'",
+                "fi",
+            ]),
+        }
         match self {
             HostDistro::Ubuntu { .. } => lines.extend([
                 "export DEBIAN_FRONTEND=noninteractive",
@@ -722,8 +816,23 @@ impl HostDistro {
             "    if printf '%s' \"$bt\" | grep -q '__SENTINEL__'; then",
             "      echo 'TENANT2_PROCESS_FOUND: walked the global task list and read the tenant2 sentinel from kernel space'",
             "      bpf_verdict=done",
+            // Walking many tasks is NOT the breach.
+            //
+            // This used to declare one whenever the walk returned more than
+            // twenty tasks, on the reasoning that a container seeing that many
+            // must be looking at the host. Inside a VM the tenant is root of
+            // its own kernel and sees its own processes — dozens of them — so
+            // under KubeVirt the probe reported "read the whole host, shared
+            // kernel, no isolation" for two tenants on entirely separate
+            // kernels. It went unnoticed only because the pod never used to be
+            // scheduled at all.
+            //
+            // The breach is reading *the other tenant*, and the sentinel above
+            // is what identifies it: an unpredictable comm the victim planted.
+            // A long task list without it is the intruder looking at its own
+            // machine, which is what a lone tenant sees too.
             "    elif [ \"$bpf_tasks\" -gt 20 ]; then",
-            "      echo 'TENANT2_PROCESS_FOUND: walked the global task list and read the whole host - shared kernel, no isolation'",
+            "      echo \"MODULE_LOADED: walked $bpf_tasks tasks and none was the other tenant's sentinel\"",
             "      bpf_verdict=done",
             "    else",
             // No task lines. Distinguish two very different reasons. We only reach
@@ -817,6 +926,12 @@ fn create_privileged_escape_pod(pod_name: &str, node_name: &str, distro: HostDis
         },
         "spec": {
             "nodeName": node_name,
+            // Stamped explicitly because this manifest predates `ProbePod` and
+            // does not inherit its defaults. Without it the probe runs on the
+            // node's default runtime whatever `--runtime-class` was asked for,
+            // and a sandbox that was never applied reports as a sandbox that
+            // failed.
+            "runtimeClassName": crate::assessment::probe::runtime_class_for_manifest(),
             "containers": [{
                 "name": "kernel-escape",
                 "image": image,
@@ -923,37 +1038,171 @@ fn create_user_target_pod(pod_name: &str) -> Pod {
         .container("user-target")
         .label("app", "user-target")
         .label("workload-test", "target")
-        .command(["sleep", "3600"])
+        // Enough to install keyutils. Inside a Kata guest the default 128Mi
+        // OOM-kills `apk add`, leaving no keyctl and a target that plants
+        // nothing — which the harness correctly reported as `Unknown`, and
+        // which said nothing whatever about the runtime's isolation.
+        .memory_limit("512Mi")
+        // The key's name is generated here, so it cannot be guessed and a
+        // spurious match is impossible: tenant1 finding *this* name in its own
+        // user keyring means the keyring really is shared.
+        .shell(
+            "apk add --no-cache keyutils >/dev/null 2>&1 || true && \
+             name=kumuteva-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \\n') && \
+             if keyctl add user \"$name\" tenant2-user-keyring @u >/dev/null 2>&1; then \
+               echo \"KEYSTATE: $name\"; \
+             else \
+               echo 'KEYSTATE: UNAVAILABLE'; \
+             fi && \
+             sleep 3600",
+        )
         .build()
 }
 
-/// Reads its own UID map to see whether it shares the host user namespace.
+/// Searches its own user keyring for a key planted by the other tenant.
 ///
-/// An identity mapping (`0 0 ...`) means container root is host root, so a
-/// privileged container here is privileged on the node. A remapped one means
-/// the kernel is translating UIDs and the same container is far less dangerous
-/// — the distinction that made a rootless test runner look like an isolation
-/// failure.
-fn create_user_spy_pod(pod_name: &str) -> Pod {
-    let script = "echo 'Testing user namespace isolation...' && \
-                  echo 'Current UID mapping:' && \
-                  cat /proc/self/uid_map && \
-                  uid_map=$(cat /proc/self/uid_map | head -1) && \
-                  first_uid=$(echo $uid_map | awk '{print $1}') && \
-                  second_uid=$(echo $uid_map | awk '{print $2}') && \
-                  echo \"First UID: $first_uid, Second UID: $second_uid\" && \
-                  if [ \"$first_uid\" = \"0\" ] && [ \"$second_uid\" = \"0\" ]; then \
-                    echo 'USER_NAMESPACE_BREACH: Using host user namespace (0->0 mapping)'; \
-                  else \
-                    echo 'User namespace properly isolated (non-host mapping)'; \
-                  fi";
+/// The user keyring `@u` is keyed on `(uid, user namespace)` and on nothing
+/// else — not the mount, PID, IPC or network namespace. So two containers find
+/// each other's keys exactly when they are the same uid in the same user
+/// namespace, which is the question this property asks and the reason this
+/// probe needs no other host access.
+///
+/// It replaces a read of `/proc/self/uid_map`. That inferred a breach from
+/// `0 0 4294967295` without ever attempting one, and under a sandbox it was
+/// simply wrong: the container really is root, of a machine the other tenant
+/// is not on. Here a breach is something the intruder does, not something it
+/// concludes.
+fn create_user_spy_pod(pod_name: &str, node_name: &str, key_name: &str) -> Pod {
+    // Its own key first. If the keyring cannot be used at all — a runtime that
+    // does not implement `keyctl`, or a seccomp profile that blocks it — then
+    // finding nothing says nothing, and the verdict must not be isolation.
+    // When the other tenant could not plant either, search for a name that
+    // cannot exist: the point is no longer to find it but to learn what the
+    // kernel says when asked, which is the answer this property turns on.
+    let wanted = if key_name == "UNAVAILABLE" {
+        "kumuteva-cannot-exist"
+    } else {
+        key_name
+    };
+    let script = format!(
+        "apk add --no-cache keyutils >/dev/null 2>&1 || true && \
+         if keyctl add user kumuteva-selftest own @u >/dev/null 2>&1; then \
+           echo 'KEYRING_USABLE'; \
+         else \
+           echo \"KEYRING_SELFTEST_FAILED: $(keyctl add user kumuteva-selftest own @u 2>&1)\"; \
+         fi && \
+         if keyctl search @u user '{wanted}' >/dev/null 2>&1; then \
+           echo 'KEYRING_KEY_FOUND: reached the other tenant through the shared user keyring'; \
+         else \
+           echo \"KEYRING_SEARCH_FAILED: $(keyctl search @u user '{wanted}' 2>&1)\"; \
+         fi"
+    );
 
     ProbePod::new(pod_name)
         .container("user-spy")
+        .on_node(node_name)
+        // Same reason as the target: it installs keyutils before it can look.
+        .memory_limit("512Mi")
         .requests(HostAccess::Users)
         .run_as_user(0)
         .shell(script)
         .build()
+}
+
+/// Turn the keyring probe's markers into a verdict.
+///
+/// The distinction that matters is *what the kernel said when asked*, which is
+/// the whole of the soft/hard rule: an operation refused is soft, an operation
+/// that does not exist in this context is hard.
+///
+/// gVisor answers `keyctl search` with `ENOSYS` — the keyring interface is not
+/// there at all — so a tenant cannot reach another's keys because there is no
+/// keyring to reach. That is hard, and it is why this cannot key on the
+/// target having planted successfully: under gVisor neither tenant can plant,
+/// and the property would report `Unknown` for a channel that is closed.
+///
+/// The verdict still rests on the intruder's own evidence, never on the
+/// target's failure alone.
+fn classify_user_namespace(intruder_output: &str) -> CrossTenantResult {
+    let says = |needle: &str| {
+        intruder_output
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+    };
+
+    if intruder_output.contains("KEYRING_KEY_FOUND") {
+        return CrossTenantResult {
+            isolation: IsolationLevel::None,
+            autonomy: true,
+            details: "host user namespace: the intruder found the other tenant's key in its \
+                      own user keyring - same uid in the same user namespace"
+                .to_string(),
+        };
+    }
+
+    // ENOSYS. The tenant asked and the kernel it is on has no such facility,
+    // which is exactly what a lone tenant on its own machine would be told.
+    if says("function not implemented") {
+        return CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: "host user namespace: the keyring interface does not exist in this \
+                      context, so no other tenant's keys are reachable through it"
+                .to_string(),
+        };
+    }
+
+    // It could use its own keyring and the other tenant's key was not in it.
+    if intruder_output.contains("KEYRING_USABLE") {
+        return CrossTenantResult {
+            isolation: IsolationLevel::Hard,
+            autonomy: true,
+            details: "host user namespace: the intruder could use its own user keyring and \
+                      the other tenant's key was not in it - the user namespace is not shared"
+                .to_string(),
+        };
+    }
+
+    // EPERM. Something refused it, which tells the tenant a restriction
+    // exists — soft, not hard.
+    if says("permission denied") || says("operation not permitted") {
+        return CrossTenantResult {
+            isolation: IsolationLevel::Soft(
+                "The user keyring was refused to this tenant".to_string(),
+            ),
+            autonomy: false,
+            details: "host user namespace: the platform refused this tenant the user keyring \
+                      rather than giving it one of its own"
+                .to_string(),
+        };
+    }
+
+    // The probe installs `keyutils` at run time, so it can arrive without the
+    // one tool it needs — and then every branch above misses, because the
+    // kernel was never asked anything. Said plainly rather than folded into the
+    // generic case below: "the tool is missing" is a fact about this harness,
+    // and reading it as a fact about the platform is how a broken probe becomes
+    // a verdict.
+    if says("not found") || says("no such file") {
+        return CrossTenantResult {
+            isolation: IsolationLevel::Unknown,
+            autonomy: true,
+            details: "host user namespace: `keyctl` was not present in the probe, so the \
+                      keyring was never asked anything — this measures the probe's own \
+                      tooling, not the platform"
+                .to_string(),
+        };
+    }
+
+    CrossTenantResult {
+        isolation: IsolationLevel::Unknown,
+        autonomy: true,
+        details: format!(
+            "host user namespace: the intruder neither reached the other tenant nor \
+             reported why, so nothing was established — it said: {}",
+            intruder_output.trim().chars().take(160).collect::<String>()
+        ),
+    }
 }
 
 /// Asks to see every process on the node.
@@ -1057,6 +1306,15 @@ fn create_target_process_pod(pod_name: &str) -> Pod {
 /// The container name is preserved deliberately: the script excludes its own
 /// `ps` line by matching the literal `spy-process`, so renaming it would make
 /// the spy find itself and report a breach that is only its own reflection.
+///
+/// **Asks for `hostPid` and nothing else, deliberately.** It used to request
+/// `privileged` as well, which this property does not need — reading `/proc`
+/// from the node's PID namespace requires the namespace, not privilege — and
+/// the extra request quietly changed what was being measured. Under gVisor,
+/// which refuses to start any privileged container, the pod never ran at all,
+/// so the property reported the sandbox declining a privileged request rather
+/// than whether the PID namespace was isolated. Each property must stand on
+/// its own: privilege is what `privileged_syscalls_experiment` measures.
 fn create_process_spy_pod(pod_name: &str, node_name: &str, target_pod_name: &str) -> Pod {
     let script = format!(
         "echo 'Searching for tenant2 processes...' && \
@@ -1077,7 +1335,6 @@ fn create_process_spy_pod(pod_name: &str, node_name: &str, target_pod_name: &str
         .container("spy-process")
         .on_node(node_name)
         .requests(HostAccess::Pid)
-        .requests(HostAccess::Privileged)
         .shell(script)
         .build()
 }
@@ -1264,6 +1521,178 @@ mod tests {
             .clone()
     }
 
+    /// Both keyring probes must have room to install their tool.
+    ///
+    /// At the shared 128Mi default, `apk add` is OOM-killed inside a Kata
+    /// guest; keyctl is then missing, the target plants nothing, and the
+    /// property reports `Unknown` — describing the limit rather than the
+    /// runtime.
+    #[test]
+    fn the_keyring_probes_have_room_to_install_keyutils() {
+        for pod in [
+            create_user_target_pod("user-target"),
+            create_user_spy_pod("user-spy", "node-1", "kumuteva-abc123"),
+        ] {
+            let limit = pod.spec.as_ref().expect("spec").containers[0]
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.limits.as_ref())
+                .and_then(|limits| limits.get("memory"))
+                .expect("probes always declare limits");
+            assert_eq!(limit.0, "512Mi");
+        }
+    }
+
+    /// Finding the other tenant's key is the breach — nothing is inferred.
+    #[test]
+    fn a_key_found_in_the_shared_user_keyring_is_a_breach() {
+        let result = classify_user_namespace(
+            "KEYRING_USABLE\n\
+             KEYRING_KEY_FOUND: reached the other tenant through the shared user keyring",
+        );
+        assert_eq!(result.isolation, IsolationLevel::None);
+    }
+
+    /// Looked, and it was not there.
+    #[test]
+    fn a_usable_keyring_without_the_other_tenants_key_is_isolation() {
+        let result = classify_user_namespace(
+            "KEYRING_USABLE\nKEYRING_SEARCH_FAILED: keyctl_search: Required key not available",
+        );
+        assert_eq!(result.isolation, IsolationLevel::Hard);
+        assert!(result.autonomy);
+    }
+
+    /// gVisor's exact answer. The interface is absent, not forbidden, which is
+    /// the same thing a lone tenant on its own machine would be told — hard.
+    ///
+    /// This reported `Unknown`, because neither tenant could plant a key and
+    /// the executor stopped there. The channel is closed, and saying so is not
+    /// the same as failing to measure.
+    #[test]
+    fn a_missing_keyring_interface_is_hard_not_unknown() {
+        let result = classify_user_namespace(
+            "KEYRING_SELFTEST_FAILED: add_key: Function not implemented\n\
+             KEYRING_SEARCH_FAILED: keyctl_search: Function not implemented",
+        );
+        assert_eq!(result.isolation, IsolationLevel::Hard);
+        assert!(result.autonomy);
+    }
+
+    /// A refusal is soft, and must not be confused with the interface being
+    /// absent — the two arrive as different errno values for a reason.
+    #[test]
+    fn a_refused_keyring_is_soft() {
+        let result = classify_user_namespace(
+            "KEYRING_SELFTEST_FAILED: add_key: Permission denied\n\
+             KEYRING_SEARCH_FAILED: keyctl_search: Permission denied",
+        );
+        assert!(
+            matches!(result.isolation, IsolationLevel::Soft(_)),
+            "{:?}",
+            result.isolation
+        );
+        assert!(!result.autonomy);
+    }
+
+    /// Silence still establishes nothing.
+    #[test]
+    fn an_intruder_that_reported_nothing_concludes_nothing() {
+        assert_eq!(
+            classify_user_namespace("").isolation,
+            IsolationLevel::Unknown
+        );
+    }
+
+    /// The probe must ask for the host user namespace and nothing else — the
+    /// property is independent of every other host namespace, which is why the
+    /// keyring is the medium: `@u` is keyed on the user namespace alone.
+    #[test]
+    fn the_user_spy_asks_only_for_the_user_namespace() {
+        let pod = create_user_spy_pod("user-spy", "node-1", "kumuteva-abc123");
+        let spec = pod.spec.as_ref().expect("spec");
+
+        assert_eq!(spec.host_users, Some(true));
+        assert_eq!(spec.host_pid, None);
+        assert_eq!(spec.host_ipc, None);
+        assert_eq!(spec.host_network, None);
+        assert_ne!(
+            spec.containers[0]
+                .security_context
+                .as_ref()
+                .and_then(|context| context.privileged),
+            Some(true)
+        );
+    }
+
+    /// A tenant that could not fetch its toolchain never attempted anything.
+    ///
+    /// Reported `Hard` on `kubeovn-vpc` and `kubeovn-subnet`, whose egress
+    /// restrictions stop `apt-get` reaching a repository. The build then fails
+    /// and "the build failed" looks exactly like "tried the breach and reached
+    /// nothing" — so the workload verdict became a fact about the network
+    /// configuration rather than about privilege.
+    #[test]
+    fn a_tenant_that_could_not_fetch_a_toolchain_concludes_nothing() {
+        let result = classify_privileged_escape(
+            "CAPS_FULL: CAP_SYS_ADMIN present\n\
+             TOOLCHAIN_UNREACHABLE: no egress to a package repository\n\
+             HEADERS_UNAVAILABLE: no build tree in this image",
+        );
+        assert_eq!(result.isolation, IsolationLevel::Unknown);
+    }
+
+    /// But if it got far enough to load a module, no egress later is beside
+    /// the point — the breach was attempted and reached nothing.
+    #[test]
+    fn an_attempted_breach_still_counts_even_if_egress_was_patchy() {
+        let result = classify_privileged_escape(
+            "CAPS_FULL: CAP_SYS_ADMIN present\n\
+             TOOLCHAIN_UNREACHABLE: no egress to a package repository\n\
+             MODULE_LOADED: tenant_spy inserted",
+        );
+        assert_eq!(result.isolation, IsolationLevel::Hard);
+    }
+
+    /// No breach means safe, whatever stopped the module from building.
+    ///
+    /// This read `Unknown` under Kata: the container really did hold
+    /// CAP_SYS_ADMIN, but no distribution ships headers for Kata's guest
+    /// kernel, so the build failed and the verdict described our compiler
+    /// rather than the platform. The question the property asks is whether a
+    /// privileged container reached the other tenant. It did not.
+    #[test]
+    fn a_failed_build_is_still_a_failed_breach() {
+        let result = classify_privileged_escape(
+            "CAPS_FULL: CAP_SYS_ADMIN present\n\
+             TENANT2_TARGET_STARTED\n\
+             HEADERS_UNAVAILABLE: no build tree for 6.18.35 in this image",
+        );
+
+        assert_eq!(result.isolation, IsolationLevel::Hard);
+        assert!(result.autonomy, "the tenant kept the capability");
+    }
+
+    /// Reaching the other tenant is the one unsafe outcome.
+    #[test]
+    fn reaching_the_other_tenant_is_the_breach() {
+        let result = classify_privileged_escape(
+            "CAPS_FULL: CAP_SYS_ADMIN present\n\
+             TENANT2_TARGET_STARTED\n\
+             TENANT2_PROCESS_FOUND: saw the other tenant",
+        );
+
+        assert_eq!(result.isolation, IsolationLevel::None);
+    }
+
+    /// A container that never ran is still no evidence either way — the one
+    /// case that must stay `Unknown`, or a dead probe scores as isolation.
+    #[test]
+    fn a_probe_that_never_reported_its_capabilities_concludes_nothing() {
+        let result = classify_privileged_escape("some unrelated output");
+        assert_eq!(result.isolation, IsolationLevel::Unknown);
+    }
+
     #[test]
     fn escape_script_runs_ebpf_first_then_falls_back_to_the_module_build() {
         let script = pod_command_script(&create_privileged_escape_pod(
@@ -1290,6 +1719,38 @@ mod tests {
         // eBPF reuses the module marker vocabulary, so the parser is unchanged.
         assert!(script.contains("TENANT2_PROCESS_FOUND"));
         assert!(script.contains("MODULE_DENIED_EPERM"));
+    }
+
+    /// The egress test must not need a binary the image lacks.
+    ///
+    /// It used to `curl` a repository, on a bare `ubuntu:*` image that ships no
+    /// curl and installs it only in the step this guards. Every Ubuntu host
+    /// therefore reported TOOLCHAIN_UNREACHABLE, which outranks every other
+    /// marker, and `Use Privileged Syscalls` came back `Unknown` no matter what
+    /// the platform did.
+    #[test]
+    fn the_toolchain_reachability_test_uses_only_the_package_manager() {
+        for distro in [
+            HostDistro::Ubuntu { release: None },
+            HostDistro::Fedora { release: None },
+        ] {
+            let script = distro.header_setup_lines().join("\n");
+            let guard = script
+                .split("can we fetch a toolchain at all?")
+                .nth(1)
+                .expect("the egress guard is present")
+                .split("TOOLCHAIN_UNREACHABLE")
+                .next()
+                .expect("the guard reports unreachability");
+            assert!(
+                !guard.contains("curl"),
+                "the guard runs before curl is installed: {guard}"
+            );
+            assert!(
+                guard.contains("apt-get update") || guard.contains("dnf makecache"),
+                "the guard must ask the package manager: {guard}"
+            );
+        }
     }
 
     #[test]
@@ -1403,6 +1864,55 @@ mod probe_requests_what_it_claims {
     //! it checks what the API server will actually receive.
 
     use super::*;
+
+    /// Each property must be measured by a probe asking for that property and
+    /// nothing more.
+    ///
+    /// `spy-process` asked for `privileged` on top of `hostPid`. Privilege is
+    /// irrelevant to reading `/proc` from the node's PID namespace, and the
+    /// surplus request changed the answer: gVisor refuses to start any
+    /// privileged container, so under a sandbox the pod never ran and the
+    /// property reported the refusal instead of whether the PID namespace was
+    /// shared. Two independent properties had been welded into one probe.
+    #[test]
+    fn the_process_spy_asks_for_the_pid_namespace_and_no_privilege() {
+        let pod = create_process_spy_pod("spy-process", "node-1", "target-process");
+        let spec = pod.spec.as_ref().expect("the probe must have a spec");
+
+        assert_eq!(
+            spec.host_pid,
+            Some(true),
+            "without hostPID the spy sees only its own processes and reports \
+             isolation it never tested"
+        );
+
+        let privileged = spec.containers[0]
+            .security_context
+            .as_ref()
+            .and_then(|context| context.privileged);
+        assert_ne!(
+            privileged,
+            Some(true),
+            "privilege is what the privileged-syscalls property measures; \
+             asking for it here makes a sandbox refusing the pod look like a \
+             verdict about the PID namespace"
+        );
+    }
+
+    /// The privileged-syscall probe, by contrast, *must* keep asking for it.
+    #[test]
+    fn the_privileged_escape_probe_still_asks_for_privilege() {
+        let pod = create_privileged_escape_pod(
+            "kernel-escape",
+            "node-1",
+            HostDistro::Ubuntu { release: None },
+        );
+        let privileged = pod.spec.as_ref().expect("spec").containers[0]
+            .security_context
+            .as_ref()
+            .and_then(|context| context.privileged);
+        assert_eq!(privileged, Some(true));
+    }
 
     /// The JSON these probes were built from before the builder existed.
     ///
@@ -1527,7 +2037,7 @@ mod probe_requests_what_it_claims {
         let network = create_network_spy_pod("spy", "10.0.0.1");
         assert_eq!(spec(&network).host_network, Some(true));
 
-        let user = create_user_spy_pod("spy");
+        let user = create_user_spy_pod("spy", "node-1", "kumuteva-abc123");
         assert_eq!(spec(&user).host_users, Some(true));
     }
 

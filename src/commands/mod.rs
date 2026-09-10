@@ -19,6 +19,6 @@ pub(crate) mod prelude {
     pub(crate) use crate::cluster::KubernetesClient;
     pub(crate) use crate::{
         setup_logging, setup_test_environment, FairnessCliLayer, FairnessConfigBuilder,
-        RateLimitStrategy, SetupArgs, VerifyArgs,
+        RateLimitStrategy, SetupArgs, SolutionUnderTest, VerifyArgs,
     };
 }

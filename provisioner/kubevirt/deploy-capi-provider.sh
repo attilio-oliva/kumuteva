@@ -120,8 +120,24 @@ wait_for_deployment_ready "capi-kubeadm-control-plane-controller-manager" "capi-
 wait_for_deployment_to_exist "capk-controller-manager" "kubevirt-infrastructure-system"
 wait_for_deployment_ready "capk-controller-manager" "kubevirt-infrastructure-system"
 
-# The validating webhook for KubevirtMachineTemplate is served by this pod. The
-# cluster manifests cannot be applied until it answers.
+# Every webhook that the cluster manifests will touch, not just the
+# infrastructure one.
+#
+# A Deployment reporting Ready is not the same as its Service having endpoints:
+# the rollout completes when the pod passes its readiness probe, and the
+# endpoint slice is written moments later. Applying a Cluster or a
+# KubeadmControlPlane in that window reaches the *conversion* webhook for
+# cluster.x-k8s.io/v1beta1, and the apply dies with
+#
+#   conversion webhook for controlplane.cluster.x-k8s.io/v1beta1,
+#   Kind=KubeadmControlPlane failed: dial tcp ...:443: connect: connection refused
+#
+# after some manifests have already been created — so the failure is both
+# confusing and partial. Only capk-webhook-service was waited for, which is why
+# the infrastructure objects applied and the control-plane ones did not.
+wait_for_endpoints "capi-webhook-service" "capi-system"
+wait_for_endpoints "capi-kubeadm-bootstrap-webhook-service" "capi-kubeadm-bootstrap-system"
+wait_for_endpoints "capi-kubeadm-control-plane-webhook-service" "capi-kubeadm-control-plane-system"
 wait_for_endpoints "capk-webhook-service" "kubevirt-infrastructure-system"
 
 echo "All CAPI controllers are ready!"
