@@ -77,18 +77,22 @@ spec:
               # see `ClusterEnvironmentType::worker_nodes_required`.
               affinity:
                 podAntiAffinity:
-                  requiredDuringSchedulingIgnoredDuringExecution:
-                    - labelSelector:
-                        matchLabels:
-                          kumuteva.io/tenant-vm: "true"
-                      # Each tenant's VM lives in its own namespace, and a bare
-                      # labelSelector only considers pods in the scheduling
-                      # pod's *own* namespace — so without this the rule matches
-                      # nothing and both VMs land on the same node, which is the
-                      # topology that hides the cross-tenant path. An empty
-                      # namespaceSelector means every namespace.
-                      namespaceSelector: {}
-                      topologyKey: kubernetes.io/hostname
+                  # Preferred, not required: with a `/32` CNI the tenants do not
+                  # need separate nodes to reach each other, and a hard rule
+                  # would leave the second tenant's VM Pending on a single-node
+                  # host. Where there are spare nodes it still spreads them.
+                  preferredDuringSchedulingIgnoredDuringExecution:
+                    - weight: 100
+                      podAffinityTerm:
+                        labelSelector:
+                          matchLabels:
+                            kumuteva.io/tenant-vm: "true"
+                        # A bare labelSelector only considers pods in the
+                        # scheduling pod's own namespace, and each tenant's VM
+                        # lives in its own — so without this the rule matches
+                        # nothing at all.
+                        namespaceSelector: {}
+                        topologyKey: kubernetes.io/hostname
               domain:
                 cpu:
                   cores: ${CONTROL_PLANE_VM_CORES}
@@ -207,18 +211,22 @@ spec:
               # see `ClusterEnvironmentType::worker_nodes_required`.
               affinity:
                 podAntiAffinity:
-                  requiredDuringSchedulingIgnoredDuringExecution:
-                    - labelSelector:
-                        matchLabels:
-                          kumuteva.io/tenant-vm: "true"
-                      # Each tenant's VM lives in its own namespace, and a bare
-                      # labelSelector only considers pods in the scheduling
-                      # pod's *own* namespace — so without this the rule matches
-                      # nothing and both VMs land on the same node, which is the
-                      # topology that hides the cross-tenant path. An empty
-                      # namespaceSelector means every namespace.
-                      namespaceSelector: {}
-                      topologyKey: kubernetes.io/hostname
+                  # Preferred, not required: with a `/32` CNI the tenants do not
+                  # need separate nodes to reach each other, and a hard rule
+                  # would leave the second tenant's VM Pending on a single-node
+                  # host. Where there are spare nodes it still spreads them.
+                  preferredDuringSchedulingIgnoredDuringExecution:
+                    - weight: 100
+                      podAffinityTerm:
+                        labelSelector:
+                          matchLabels:
+                            kumuteva.io/tenant-vm: "true"
+                        # A bare labelSelector only considers pods in the
+                        # scheduling pod's own namespace, and each tenant's VM
+                        # lives in its own — so without this the rule matches
+                        # nothing at all.
+                        namespaceSelector: {}
+                        topologyKey: kubernetes.io/hostname
               domain:
                 cpu:
                   cores: ${WORKER_VM_CORES}
