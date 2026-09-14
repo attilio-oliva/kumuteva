@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use super::{ClusterProfile, ClusterProvider, HostCluster, TenantsPortMapping};
+use super::{
+    ClusterProfile, ClusterProvider, HostCluster, KubernetesVersion, TenantsPortMapping,
+};
 use anyhow::Context;
 
 // Type alias for backward compatibility
@@ -30,10 +32,16 @@ impl ClusterProvider for K3sProvider {
             || profile.pod_subnet.is_some()
             || !profile.containerd_config_patches.is_empty()
             || !profile.extra_mounts.is_empty()
+            // A solution that pins its own Kubernetes release cannot be built
+            // here either. Left unchecked, `--type kubezoo --provider k3s`
+            // would quietly produce a current-release cluster and KubeZoo would
+            // fail much later, for a reason that looks nothing like this one.
+            || profile.kubernetes_version != KubernetesVersion::default()
         {
             return Err(anyhow::anyhow!(
                 "the k3s provider does not implement cluster profiles \
-                 (CNI replacement, containerd patches, extra mounts) — use --provider kind"
+                 (CNI replacement, containerd patches, extra mounts, \
+                 Kubernetes version) — use --provider kind"
             ));
         }
 

@@ -1,0 +1,39 @@
+# Vendored from kubewharf/kubezoo
+#   upstream: config/setup/sample_tenant.yaml
+#   commit:   8a3a05f83cfe0576c24d896d898683001bd833e5
+#
+# Changes from upstream:
+#   - metadata.name and spec.id -> ${TENANT_ID}. The id is a six-digit *number*,
+#     not a word: the CRD types spec.id as an integer, and metadata.name is the
+#     same digits as a string. `tnt001` is rejected at validation with
+#     "invalid type ... got string, expected integer".
+#   - the quota is counts only, where the sample sets cpu: 2 / memory: 2G. Two
+#     separate problems with the sample: it is smaller than a single benchmark
+#     pod's request (the data-plane pods ask for 2000m each), and — the reason
+#     no compute resource appears here at all — a quota that constrains cpu or
+#     memory makes those fields *mandatory* on every pod, exactly as an upstream
+#     ResourceQuota does:
+#
+#       admission webhook "clusterresourcequota.kubezoo.io" denied the request:
+#       pods "probe" is forbidden: failed quota: ...: must specify cpu for: probe
+#
+#     Every probe that does not set requests would then be refused, and the
+#     refusal would be scored as KubeZoo's isolation rather than as our own
+#     quota choice. Counts high enough not to bind leave the tenant unconstrained
+#     in what the assessment measures. Overridable through the environment.
+#
+# Pinned rather than fetched so a provisioning run is reproducible and
+# needs no network access to GitHub. Upstream is effectively unmaintained:
+# its only git tag is v0.1.0 while the published images are v0.2.0, which
+# is why this records a commit rather than a tag.
+apiVersion: tenant.kubezoo.io/v1alpha1
+kind: Tenant
+metadata:
+  name: "${TENANT_ID}"
+spec:
+  id: ${TENANT_ID}
+  quota:
+    hard:
+      pods: "${TENANT_POD_QUOTA}"
+      persistentvolumeclaims: "${TENANT_PVC_QUOTA}"
+      services: "${TENANT_SERVICE_QUOTA}"

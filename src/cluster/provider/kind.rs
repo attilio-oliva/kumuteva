@@ -39,7 +39,7 @@ fn cluster_config(
         "name": name,
         "nodes": [{
             "role": "control-plane",
-            "image": "kindest/node:v1.33.4@sha256:25a6018e48dfcaee478f4a59af81157a437f15e6e140bf103f85a2e7cd0cbbf2",
+            "image": profile.kubernetes_version.node_image(),
             // Benchmark pods report their measurements over stdout, which is
             // the only channel every multi-tenancy solution leaves open —
             // `exec` is blocked by the more restrictive ones, and those are
@@ -264,7 +264,7 @@ mod tests {
 #[cfg(test)]
 mod config_tests {
     use super::*;
-    use crate::cluster::PortMapping;
+    use crate::cluster::{KubernetesVersion, PortMapping};
 
     fn mappings() -> TenantsPortMapping {
         TenantsPortMapping {
@@ -353,6 +353,40 @@ mod config_tests {
         assert_eq!(
             keys,
             ["extraPortMappings", "image", "kubeadmConfigPatches", "role"]
+        );
+    }
+
+    /// The Kubernetes release reaches the node image, and the default is still
+    /// the 1.33.4 digest every published result was taken on.
+    ///
+    /// Only KubeZoo moves it, and only because it is an aggregated API server
+    /// that cannot speak to anything newer than 1.24 — a version difference is
+    /// otherwise a confounder in every number the results table reports.
+    #[test]
+    fn the_kubernetes_version_selects_the_node_image() {
+        let default = cluster_config("bench", &mappings(), &ClusterProfile::default());
+        assert!(
+            default["nodes"][0]["image"]
+                .as_str()
+                .expect("a node has an image")
+                .starts_with("kindest/node:v1.33.4@sha256:"),
+            "{default}"
+        );
+
+        let kubezoo = cluster_config(
+            "bench",
+            &mappings(),
+            &ClusterProfile {
+                kubernetes_version: KubernetesVersion::V1_24,
+                ..Default::default()
+            },
+        );
+        assert!(
+            kubezoo["nodes"][0]["image"]
+                .as_str()
+                .expect("a node has an image")
+                .starts_with("kindest/node:v1.24.17@sha256:"),
+            "{kubezoo}"
         );
     }
 

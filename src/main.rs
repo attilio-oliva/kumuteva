@@ -12,8 +12,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use cluster::TenantsPortMapping;
 use cluster::{
     ClusterProfile, CniPlugin, ControlPlaneIsolation, DataPlaneIsolation, KindCluster,
-    KubernetesClient, KubernetesClusterBuilder, NetworkIsolationStrategy, SandboxRuntime,
-    StorageIsolationStrategy,
+    KubernetesClient, KubernetesClusterBuilder, KubernetesVersion, NetworkIsolationStrategy,
+    SandboxRuntime, StorageIsolationStrategy,
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::ListParams, Api, Client};
@@ -334,6 +334,22 @@ impl SolutionUnderTest {
             .join("+")
     }
 
+    /// The Kubernetes release this solution's host cluster must run.
+    ///
+    /// KubeZoo v0.2.0 supports Kubernetes only up to 1.24: it is an aggregated
+    /// API server speaking a fixed set of upstream API versions, so a newer
+    /// host is not a compatibility warning but a gateway that cannot forward.
+    ///
+    /// Everything else stays on the default deliberately — a version
+    /// difference is a confounder in every number the results table reports,
+    /// and this is the one row that cannot avoid it.
+    fn kubernetes_version(control_plane: ClusterEnvironmentType) -> KubernetesVersion {
+        match control_plane {
+            ClusterEnvironmentType::KubeZoo => KubernetesVersion::V1_24,
+            _ => KubernetesVersion::default(),
+        }
+    }
+
     /// The CNI to install on the host cluster.
     ///
     /// Always one, never none: every cluster this harness builds gets an
@@ -397,6 +413,11 @@ impl SolutionUnderTest {
         // afterwards.
         let cni = self.cni().unwrap_or(CniPlugin::DEFAULT);
         let mut combined = ClusterProfile {
+            // The control plane owns the Kubernetes version, and the merge loop
+            // below deliberately does not touch it: a data-plane technology
+            // cannot move the release out from under the solution being
+            // measured.
+            kubernetes_version: Self::kubernetes_version(self.control_plane),
             disable_default_cni: true,
             pod_subnet: Some(cni.pod_subnet().to_string()),
             ..Default::default()
@@ -1492,7 +1513,7 @@ async fn get_or_create_tenant_cluster(
         ClusterEnvironmentType::KubeVirt => ControlPlaneIsolation::KubeVirt(tenant.to_string()),
         ClusterEnvironmentType::Kamaji => ControlPlaneIsolation::Kamaji(tenant.to_string()),
         ClusterEnvironmentType::Native => ControlPlaneIsolation::None(tenant.to_string()),
-        _ => return Err(anyhow!("Unsupported cluster environment type")),
+        ClusterEnvironmentType::KubeZoo => ControlPlaneIsolation::KubeZoo(tenant.to_string()),
     };
 
     let mut builder = KubernetesClusterBuilder::new(host_cluster.clone())
@@ -1648,7 +1669,12 @@ pub async fn setup_test_environment(
     // Before any tenant, because a cluster created with `disableDefaultCNI` has
     // no pod networking until this runs — and the control-plane solution's own
     // operator is a pod.
-    KubernetesClusterBuilder::install_cni(&base_cluster, solution.cni()?).await?;
+    KubernetesClusterBuilder::install_cni(
+        &base_cluster,
+        solution.cni()?,
+        profile.kubernetes_version,
+    )
+    .await?;
 
     // After the CNI, because publishing the RuntimeClass needs a working API
     // path and the node has no pod network until the CNI is up.

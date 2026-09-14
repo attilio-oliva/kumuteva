@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, process::Command, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Ok};
 use k8s_openapi::api::{core::v1::Secret, networking::v1::NetworkPolicy};
@@ -7,7 +12,7 @@ use kube::{api::ObjectMeta, runtime::reflector::Lookup};
 use tokio::time::sleep;
 
 use crate::{
-    cluster::HostClusterType,
+    cluster::{HostClusterType, KubernetesVersion},
     external_crds::{capsule, create_tenant},
 };
 
@@ -36,6 +41,28 @@ const CAPSULE_CHART_VERSION: &str = "0.10.0";
 /// A private tenant subnet has to allow it or the tenant's pods lose their
 /// route to the node, and with it kubelet's health checks.
 const KUBE_OVN_JOIN_CIDR: &str = "100.64.0.0/16";
+
+/// The KubeZoo tenant id standing for a tenant namespace.
+///
+/// Six digits, because KubeZoo's Tenant CRD types `spec.id` as an integer while
+/// `metadata.name` is the same value as a string — a word-shaped id is rejected
+/// with "got string, expected integer". The id also prefixes every namespaced
+/// object's namespace and every cluster-scoped object's name, so it has to fit
+/// inside a DNS label, which is why `tenant1` cannot be used directly.
+///
+/// Fixed rather than derived: the id ends up inside upstream object names
+/// (`100001-tenant1`) that appear in results and have to stay comparable across
+/// runs.
+fn kubezoo_tenant_id(namespace: &str) -> anyhow::Result<&'static str> {
+    match namespace {
+        "tenant1" => std::result::Result::Ok("100001"),
+        "tenant2" => std::result::Result::Ok("100002"),
+        other => Err(anyhow!(
+            "no KubeZoo tenant id is defined for namespace {other}; \
+             ids are six-digit numbers, so one has to be assigned here"
+        )),
+    }
+}
 
 /// How much policy the Capsule Tenant carries.
 ///
@@ -74,6 +101,13 @@ pub enum ControlPlaneIsolation {
     KubeVirt(String),
     /// Kamaji tenant control plane in the given namespace
     Kamaji(String),
+    /// KubeZoo: one shared API gateway that scopes every tenant by name
+    /// prefix.
+    ///
+    /// Unlike vcluster or Kamaji there is no control plane per tenant — both
+    /// tenants reach the same Service and are told apart by their client
+    /// certificate, exactly as with capsule-proxy.
+    KubeZoo(String),
 }
 
 #[allow(dead_code)]
@@ -582,12 +616,26 @@ impl CniPlugin {
 
     /// Pinned: a CNI version is part of what produced a number, and `latest`
     /// would make results irreproducible the moment upstream tags a release.
-    const CALICO_VERSION: &'static str = "v3.30.0";
+    /// Pinned per Kubernetes release, because a CNI's supported range is not
+    /// open-ended. Calico 3.30 dropped 1.24: installed there the manifest
+    /// applies cleanly and `calico-node` never becomes ready, leaving a cluster
+    /// stuck `NotReady` with nothing in the configuration to explain it.
+    const CALICO_VERSION_V1_33: &'static str = "v3.30.0";
+    /// The last Calico line supporting Kubernetes 1.24, which is the newest
+    /// Kubernetes KubeZoo supports. Verified on this host: rolls out and the
+    /// node stays Ready.
+    const CALICO_VERSION_V1_24: &'static str = "v3.26.5";
     const KUBE_OVN_VERSION: &'static str = "v1.16.2";
 
-    fn version(&self) -> &'static str {
+    fn version(&self, kubernetes: KubernetesVersion) -> &'static str {
         match self {
-            CniPlugin::Calico => Self::CALICO_VERSION,
+            CniPlugin::Calico => match kubernetes {
+                KubernetesVersion::V1_33 => Self::CALICO_VERSION_V1_33,
+                KubernetesVersion::V1_24 => Self::CALICO_VERSION_V1_24,
+            },
+            // Kube-OVN is never selected on the 1.24 cluster: that cluster
+            // exists only for KubeZoo, which names no CNI. One pin is therefore
+            // not silently wrong here — it is simply the only case.
             CniPlugin::KubeOvn => Self::KUBE_OVN_VERSION,
         }
     }
@@ -775,6 +823,10 @@ impl KubernetesClusterBuilder {
                 );
                 self.deploy_kamaji_cluster(&namespace).await
             }
+            ControlPlaneIsolation::KubeZoo(namespace) => {
+                println!("Deploying KubeZoo gateway for tenant namespace: {}", namespace);
+                self.deploy_kubezoo(&namespace).await
+            }
         }
     }
 
@@ -825,10 +877,13 @@ impl KubernetesClusterBuilder {
     /// condition kubelet reports only once a CNI has written its configuration
     /// and is serving, so it cannot be satisfied by a manifest that applied
     /// cleanly and then failed to run.
-    fn install_calico(kubeconfig: &std::path::Path) -> anyhow::Result<()> {
+    /// Note the Calico inside a KubeVirt *tenant* cluster is pinned separately,
+    /// in `provisioner/kubevirt/create-kubevirt-cluster.sh`, against that
+    /// cluster's own Kubernetes version. The two are different clusters and the
+    /// pins are not interchangeable.
+    fn install_calico(kubeconfig: &std::path::Path, version: &str) -> anyhow::Result<()> {
         let manifest = format!(
-            "https://raw.githubusercontent.com/projectcalico/calico/{}/manifests/calico.yaml",
-            CniPlugin::CALICO_VERSION
+            "https://raw.githubusercontent.com/projectcalico/calico/{version}/manifests/calico.yaml"
         );
 
         let output = Command::new("kubectl")
@@ -1038,16 +1093,19 @@ impl KubernetesClusterBuilder {
         Ok(())
     }
 
-    pub async fn install_cni(host_cluster: &HostClusterType, cni: CniPlugin) -> anyhow::Result<()> {
+    /// `kubernetes` decides the CNI version, not just the node image: see
+    /// [`CniPlugin::version`].
+    pub async fn install_cni(
+        host_cluster: &HostClusterType,
+        cni: CniPlugin,
+        kubernetes: KubernetesVersion,
+    ) -> anyhow::Result<()> {
         let kubeconfig = host_cluster.kubeconfig_path();
-        println!(
-            "Installing {} ({}) as the cluster CNI",
-            cni.name(),
-            cni.version()
-        );
+        let version = cni.version(kubernetes);
+        println!("Installing {} ({}) as the cluster CNI", cni.name(), version);
 
         match cni {
-            CniPlugin::Calico => Self::install_calico(kubeconfig)?,
+            CniPlugin::Calico => Self::install_calico(kubeconfig, version)?,
             CniPlugin::KubeOvn => Self::install_kube_ovn(kubeconfig)?,
         }
 
@@ -2478,6 +2536,79 @@ impl KubernetesClusterBuilder {
         Ok(())
     }
 
+    /// Install the KubeZoo gateway if it is not there yet, then add this tenant
+    /// to it.
+    ///
+    /// One gateway serves every tenant, distinguished only by the client
+    /// certificate — the same shape as capsule-proxy and unlike vcluster or
+    /// KubeVirt, where each tenant gets an API server of its own. Both tenants
+    /// therefore go through `tenant1`'s port mapping and `tenant2`'s goes
+    /// unused, exactly as `deploy_capsule_proxy` already does.
+    async fn deploy_kubezoo(&self, namespace: &str) -> anyhow::Result<()> {
+        let tenant_mapping = &self.host_cluster.port_mappings().tenant1;
+        let nodeport = tenant_mapping.container_port;
+        let host_port = tenant_mapping.host_port;
+        let tenant_id = kubezoo_tenant_id(namespace)?;
+
+        // Beside the tenant kubeconfigs, so the second tenant's pass finds the
+        // CA and the gateway admin credentials the first one left behind. A
+        // wiped directory is survivable — gen-pki.sh reads the CA back out of
+        // the cluster — but not free, so keep it somewhere durable.
+        let work_dir = self
+            .kubeconfig_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(".kubezoo-{}", self.host_cluster.name()));
+
+        println!(
+            "  Running: provisioner/kubezoo/deploy-kubezoo.sh {} {} {} {}",
+            self.host_cluster.kubeconfig_path().to_string_lossy(),
+            nodeport,
+            host_port,
+            work_dir.to_string_lossy(),
+        );
+        let output = Command::new("provisioner/kubezoo/deploy-kubezoo.sh")
+            .arg(self.host_cluster.kubeconfig_path())
+            .arg(nodeport.to_string())
+            .arg(host_port.to_string())
+            .arg(&work_dir)
+            .output()
+            .context("Failed to execute the KubeZoo deployment script")?;
+        println!(
+            "KubeZoo deployment output: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        }
+
+        println!(
+            "Creating KubeZoo tenant {} for namespace {}...",
+            tenant_id, namespace
+        );
+        let output = Command::new("provisioner/kubezoo/create-kubezoo-tenant.sh")
+            .arg(self.kubeconfig_path.to_str().unwrap())
+            .arg(tenant_id)
+            .arg(host_port.to_string())
+            .arg(&work_dir)
+            .output()
+            .context("Failed to execute the KubeZoo tenant script")?;
+        println!(
+            "KubeZoo tenant output: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if !output.status.success() {
+            return Err(terminal_stderr_to_error(output));
+        }
+
+        // The tenant's own view: `tenant1` here is upstream's `tnt001-tenant1`,
+        // so every probe that targets `--tenant1-ns tenant1` works unchanged.
+        let tenant_cluster = KubernetesClient::load_with_retry(&self.kubeconfig_path, 10).await?;
+        tenant_cluster.create_namespace(namespace).await?;
+
+        Ok(())
+    }
+
     async fn deploy_kamaji_cluster(&self, namespace: &str) -> anyhow::Result<()> {
         // Get port mappings for the tenant
         let tenant_mapping = match namespace {
@@ -3621,5 +3752,43 @@ mod capsule_tenant_policy_tests {
             "restricted"
         );
         assert_eq!(spec["serviceOptions"]["allowedServices"]["nodePort"], false);
+    }
+
+}
+
+#[cfg(test)]
+mod kubezoo_profile_tests {
+    use super::{kubezoo_tenant_id, CniPlugin};
+    use crate::cluster::KubernetesVersion;
+
+    /// The pairing that silently breaks otherwise: Calico 3.30 does not support
+    /// Kubernetes 1.24, and the failure is a cluster that stays NotReady with a
+    /// manifest that applied cleanly.
+    #[test]
+    fn the_calico_version_follows_the_kubernetes_release() {
+        assert_eq!(
+            CniPlugin::Calico.version(KubernetesVersion::V1_33),
+            "v3.30.0"
+        );
+        assert_eq!(
+            CniPlugin::Calico.version(KubernetesVersion::V1_24),
+            "v3.26.5"
+        );
+    }
+
+    /// Six digits: KubeZoo's CRD types `spec.id` as an integer and rejects
+    /// anything longer than six characters as a namespace prefix. Fixed rather
+    /// than derived, because the id appears inside upstream object names that
+    /// have to stay comparable across runs.
+    #[test]
+    fn kubezoo_tenant_ids_are_six_digit_numbers() {
+        assert_eq!(kubezoo_tenant_id("tenant1").unwrap(), "100001");
+        assert_eq!(kubezoo_tenant_id("tenant2").unwrap(), "100002");
+        for ns in ["tenant1", "tenant2"] {
+            let id = kubezoo_tenant_id(ns).unwrap();
+            assert_eq!(id.len(), 6);
+            assert!(id.chars().all(|c| c.is_ascii_digit()), "{id}");
+        }
+        assert!(kubezoo_tenant_id("tenant3").is_err());
     }
 }

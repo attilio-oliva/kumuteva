@@ -44,8 +44,48 @@ pub struct PortMapping {
 /// The default is what every solution measured so far used, so a profile left
 /// empty must produce exactly the cluster the tool produced before this type
 /// existed.
+/// The Kubernetes release the host cluster runs.
+///
+/// One knob rather than a free-form image string, because the version is never
+/// only a node image: a CNI's supported range is keyed on it, and a version
+/// with no matching CNI pin produces a cluster that sits `NotReady` for a
+/// reason nothing in the configuration explains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KubernetesVersion {
+    /// What every solution measured so far ran on.
+    #[default]
+    V1_33,
+    /// The newest release KubeZoo v0.2.0 supports — it is an aggregated API
+    /// server speaking a fixed set of upstream versions, so a newer host is not
+    /// a compatibility warning but a gateway that cannot forward.
+    ///
+    /// Nothing else selects this, and nothing should: a version difference is a
+    /// confounder in every number the results table reports.
+    V1_24,
+}
+
+impl KubernetesVersion {
+    /// Pinned by digest, as the default always was: a floating tag makes a
+    /// result irreproducible the moment kind republishes the image.
+    pub fn node_image(&self) -> &'static str {
+        match self {
+            KubernetesVersion::V1_33 => {
+                "kindest/node:v1.33.4@sha256:25a6018e48dfcaee478f4a59af81157a437f15e6e140bf103f85a2e7cd0cbbf2"
+            }
+            KubernetesVersion::V1_24 => {
+                "kindest/node:v1.24.17@sha256:bad10f9b98d54586cba05a7eaa1b61c6b90bfc4ee174fdc43a7b75ca75c95e51"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ClusterProfile {
+    /// Kubernetes release the node image provides.
+    ///
+    /// Defaults to what every other solution runs; only KubeZoo moves it, and
+    /// only because it cannot be measured on anything later.
+    pub kubernetes_version: KubernetesVersion,
     /// Skip the provider's built-in CNI because another one will be installed.
     ///
     /// The cluster stays `NotReady` until that happens, so whatever sets this
