@@ -38,9 +38,13 @@ DRY_RUN=false
 KEEP_CLUSTER=false
 SKIP_SETUP=false
 
-# Solutions `kumuteva setup` can provision. KubeZoo is deliberately absent: the
-# CLI rejects it, so it has to be brought up by hand.
-SUPPORTED="capsule capsule-proxy vcluster kubevirt native kamaji"
+# Solutions `kumuteva setup` can provision.
+#
+# KubeZoo's cluster is not the same cluster as the others': it runs Kubernetes
+# 1.24.17 with Calico 3.26.5, because KubeZoo is an aggregated API server that
+# supports nothing newer and Calico 3.30 does not support 1.24. That divergence
+# belongs beside any number taken from this row.
+SUPPORTED="capsule capsule-proxy vcluster kubevirt native kamaji kubezoo"
 
 usage() {
     cat <<'EOF'

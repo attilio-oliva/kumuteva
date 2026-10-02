@@ -1,0 +1,26 @@
+# Python environment for the fairness analysis notebook and its build scripts.
+#
+#   python -m venv ../.venv
+#   ../.venv/bin/pip install -r requirements.txt
+#
+# Pinned rather than bounded, for the same reason the run manifests record a
+# chart version: a figure is only reproducible if the thing that drew it is.
+#
+# pyarrow is not optional. `analysis._read_csv` reads through `pyarrow.csv`,
+# which is 5x faster than pandas' own parser on the campaign's largest files
+# (0.23 s against 1.21 s on a 374 MB, 9.9M-row network run) and, with
+# `to_pandas(self_destruct=True)`, at a third of the peak memory that pandas'
+# own pyarrow engine needs.
+
+pandas==3.0.5
+numpy==2.5.1
+pyarrow==25.0.1
+matplotlib==3.11.1
+PyYAML==6.0.3
+
+# Notebook: rendering the tab groups, and building a shareable copy that carries
+# its widget state (see build_shareable.py).
+ipywidgets==8.1.8
+ipykernel==7.2.0
+nbclient==0.11.0
+nbconvert==7.17.1

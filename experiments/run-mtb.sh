@@ -5,7 +5,7 @@
 #
 #   experiments/run-mtb.sh capsule capsule-proxy vcluster kubevirt
 #   experiments/run-mtb.sh --dry-run capsule
-#   experiments/run-mtb.sh --skip-setup kubezoo        # provisioned by hand
+#   experiments/run-mtb.sh --skip-setup kubezoo        # against a cluster already up
 #
 # Standalone by design. It neither requires nor triggers a fairness run: which
 # of the two to run, and in what order, is the operator's decision.

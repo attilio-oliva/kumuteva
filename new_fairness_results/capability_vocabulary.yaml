@@ -1,0 +1,185 @@
+# The one vocabulary both tools are described against.
+#
+# Why this file exists: a feature table is only honest if "absent" is computed
+# rather than decided. If each tool were described in its own terms, every gap
+# would be an editorial choice. Here both are projected onto the same list of
+# capabilities, and a cell reads absent precisely because nothing on that side
+# claims the capability.
+#
+# The names are capabilities, not topics. That distinction is load-bearing.
+# "Network" would invite partial credit, because kubectl-mtb does have a
+# NodePort benchmark; "cross-tenant network reachability" does not, because
+# nothing upstream sends a packet. Naming the row after what is actually
+# established removes the judgement call from the cell.
+#
+# Two sides feed it:
+#   - kubectl-mtb, via the `capability` field on each entry of mtb_mapping.yaml
+#   - KUMUTEVA, via `properties` below, matched against
+#     `kumuteva verify --list-properties`, plus `fairness_metrics` matched
+#     against the keys of a fairness run manifest
+#
+# A test asserts every property string here exists in the inventory, for the
+# same reason mtb_mapping.yaml is checked: a typo matches nothing, the
+# capability silently loses its evidence, and the cell flips to absent while
+# looking like a finding.
+
+version: 1
+
+# Order matters: it is the row order of the generated table.
+capabilities:
+
+  # --------------------------------------------------------------- tabulated
+
+  control_plane:
+    label: Control plane
+    group: control_plane
+    description: >
+      Whether a tenant can read or modify another tenant's API objects, and
+      cluster-scoped objects it has no business touching.
+
+  host_resource_policy:
+    label: Pod-spec policy for host resources
+    group: data_plane
+    description: >
+      Whether a pod asking for a host resource — hostPath, hostPID,
+      hostNetwork, a NodePort — is refused. This is the one capability where
+      kubectl-mtb is on equal footing, and saying so is what earns the rows
+      below it.
+
+  cross_tenant_network:
+    label: Cross-tenant network reachability
+    group: data_plane
+    description: >
+      Whether traffic actually crosses the tenant boundary: a connection opened
+      to the other tenant's pod or service, a name resolved that should not be.
+      Establishing this requires sending the packet.
+
+  cross_tenant_storage:
+    label: Cross-tenant storage data access
+    group: data_plane
+    description: >
+      Whether one tenant can read or overwrite another's volume contents, or
+      recover data a released volume should have destroyed. Establishing this
+      requires reading the bytes.
+
+  kernel_escape:
+    label: Shared-kernel escape
+    group: data_plane
+    description: >
+      Whether a privileged container reaches state belonging to the host or to
+      another tenant through the shared kernel — namespaces it should not see,
+      or a loaded module walking the global task list.
+
+  performance_isolation:
+    label: Performance isolation under contention
+    group: data_plane
+    description: >
+      How much a tenant's latency degrades while a neighbour saturates the
+      resource. A measurement under load; no configuration check substitutes
+      for it.
+
+  throughput_retention:
+    label: Throughput retention under contention
+    group: data_plane
+    description: >
+      What fraction of its offered rate the well-behaved tenant still delivers
+      while contended. The companion to the above: a tenant can hold its
+      latency only by dropping throughput, and reporting one without the other
+      hides the trade.
+
+  # ----------------------------------------------------------- not tabulated
+  # Recorded, deliberately, but kept out of the table. Each is a capability one
+  # tool has and the other does not, and neither belongs to the argument the
+  # table is making. Dropping them from the vocabulary entirely would be the
+  # dishonest option: `image_provenance` is a gap on OUR side, and a vocabulary
+  # that quietly omits our own gaps is not a shared vocabulary. They surface in
+  # the caption and in mtb_evidence_facts.md instead.
+
+  autonomy:
+    label: Tenant self-service autonomy
+    group: not_tabulated
+    description: >
+      Whether the tenant can do what it is supposed to be able to do. Both
+      tools cover it, at very different resolution — two benchmarks against a
+      flag on every control-plane property — so a shared symbol would say
+      little. Reported as counts in the Method block instead.
+
+  quota_configuration:
+    label: Resource quota configuration
+    group: not_tabulated
+    description: >
+      Whether a ResourceQuota object exists and constrains CPU, memory or
+      object counts. kubectl-mtb only. Deliberately NOT filed under
+      performance_isolation: it asserts a configuration, where
+      performance_isolation measures an outcome, and a quota can be present
+      while the neighbour still triples the owner's latency. Filing it there
+      would let a config assertion answer for a measurement.
+
+  image_provenance:
+    label: Image-layer data isolation
+    group: not_tabulated
+    description: >
+      Whether a tenant can use another tenant's cached private image by
+      skipping the registry pull that would re-check credentials. kubectl-mtb
+      checks it; KUMUTEVA does not probe it at all. A genuine gap on our side,
+      and the standing proof that the cell rules can return a non-supported
+      verdict for us.
+
+# --- KUMUTEVA's side of the vocabulary --------------------------------------
+#
+# Property triples, matched exactly against `verify --list-properties`.
+# `control_plane: all` means every property of that subsystem, which avoids
+# listing 140 rows that would then have to be kept in step with the code.
+
+kumuteva:
+
+  control_plane:
+    subsystems: [control_plane]
+
+  autonomy:
+    subsystems: [control_plane]
+    note: the autonomy flag carried by every control-plane property
+
+  # Each property belongs to exactly one capability. The partition is by what
+  # the probe establishes at its strongest, not by which pod-spec field it
+  # happens to touch — otherwise the workload probes would sit in two places at
+  # once, since kubectl-mtb reaches the same fields by reading the spec.
+  host_resource_policy:
+    properties:
+      - [storage, Volume, Use HostPath in a Volume]
+      - [storage, Volume, Use HostPath through a PersistentVolume]
+      - [network, Service Network, Expose NodePort]
+
+  cross_tenant_network:
+    properties:
+      - [network, Pod Network, Connect to Pod]
+      - [network, Service Network, Connect to Service]
+      - [network, DNS Resolution, Resolve DNS]
+
+  cross_tenant_storage:
+    properties:
+      - [storage, Volume, Create And Mount Volume (unsetted Reclaim Policy)]
+      - [storage, Volume, Create And Mount Volume with Retain Reclaim Policy]
+
+  # The whole workload subsystem. kubectl-mtb reaches four of these five fields
+  # (hostPID, hostIPC, hostNetwork, privileged) by asking whether the pod spec
+  # was admitted; KUMUTEVA settles each by observing state that only a shared
+  # kernel could expose — enumerating the processes, attaching to the IPC
+  # segment, loading a module that walks the global task list. Same fields,
+  # different thing established, so they are filed here rather than under
+  # host_resource_policy.
+  kernel_escape:
+    properties:
+      - [workload, Privileged Syscalls, Use Privileged Syscalls]
+      - [workload, Process Namespace, View Processes]
+      - [workload, IPC Namespace, Access IPC Resources]
+      - [workload, Network Namespace, Create Network Connections]
+      - [workload, User Namespace, Access Host User Namespace]
+
+  # Not properties of `verify` — these come from the fairness run manifests,
+  # keyed on the field that carries the number.
+  performance_isolation:
+    fairness_metric: latency_degradation
+
+  throughput_retention:
+    fairness_metric: throughput_retention

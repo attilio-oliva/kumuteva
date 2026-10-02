@@ -27,6 +27,7 @@ matters — a run that lasted longer would otherwise dominate the pooled shape a
 the figure would describe that run rather than the set.
 """
 
+import fnmatch
 from dataclasses import dataclass
 
 import numpy as np
@@ -151,11 +152,69 @@ def _subsample(frame, budget):
     return frame.iloc[positions]
 
 
-def load(src_dir, systems, selection="latest", samples_per_run=SAMPLES_PER_RUN, confidence=0.95):
+def select_solutions(available, patterns):
+    """Resolve an allow-list of shell-style patterns against the solutions on disk.
+
+    `None` keeps everything. Otherwise each entry is matched with `fnmatch`, so
+    an exact name works as itself and `native*` picks up `native` together with
+    every `native+<technology>` row the data-plane campaign produces — which is
+    the whole reason for globbing rather than a plain list of names, since those
+    labels are composed at run time and change as technologies are added.
+
+    Matching is case-sensitive: solution labels come from the campaign scripts
+    and are always lower-case, so a case-insensitive match would only ever hide
+    a typo.
+
+    A pattern that matches nothing is reported rather than ignored. Quietly
+    dropping it would leave a figure with fewer solutions than asked for and no
+    way to tell that from a solution genuinely having no data.
+    """
+    available = sorted(available)
+    if patterns is None:
+        return set(available)
+    if isinstance(patterns, str):
+        patterns = [patterns]
+
+    kept, unmatched = set(), []
+    for pattern in patterns:
+        hits = {s for s in available if fnmatch.fnmatchcase(s, pattern)}
+        if hits:
+            kept |= hits
+        else:
+            unmatched.append(pattern)
+
+    if unmatched:
+        print(
+            f"warning: no solution matches {', '.join(repr(p) for p in unmatched)}"
+            f" — available: {', '.join(available)}"
+        )
+    if not kept:
+        raise ValueError(
+            f"solution filter {patterns!r} matched nothing;"
+            f" available: {', '.join(available)}"
+        )
+    return kept
+
+
+def load(
+    src_dir,
+    systems,
+    selection="latest",
+    samples_per_run=SAMPLES_PER_RUN,
+    confidence=0.95,
+    solutions=None,
+):
     """Load `src_dir` and return `(measurements, experiments, report)`.
 
     `selection` is `"latest"` for the most recent run of each
     (solution, subsystem), or `"all"` for every run.
+
+    `solutions` is an optional allow-list of `fnmatch` patterns — `None` for
+    everything, `["native", "capsule"]` for those two, `["native*"]` for native
+    and every `native+<technology>` row. It is applied before any CSV is read,
+    so excluding a solution costs nothing rather than loading it and discarding
+    it afterwards; on this data set that is the difference between a few
+    seconds and minutes at several GB of peak RSS.
 
     `measurements` holds one `stats.FairnessMeasurement` per *run*, each computed
     from that run's complete data. Pass it to `stats.aggregate_runs` to combine
@@ -170,6 +229,9 @@ def load(src_dir, systems, selection="latest", samples_per_run=SAMPLES_PER_RUN, 
         raise ValueError(f"selection must be 'latest' or 'all', got {selection!r}")
 
     pairs = _index_runs(src_dir, systems)
+    if solutions is not None:
+        keep = select_solutions({solution for solution, _ in pairs}, solutions)
+        pairs = {key: value for key, value in pairs.items() if key[0] in keep}
     if selection == "latest":
         pairs = {key: [max(timestamps)] for key, timestamps in pairs.items()}
 

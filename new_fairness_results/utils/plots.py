@@ -10,6 +10,8 @@ other; that class of bug is why the mapping below is explicit.
     Baseline-to-stress transition    plot_latency_transition           {system}_latency_transition
     API latency over time            plot_latency_over_time            {system}_latency_over_time
     Latency distribution by role     plot_latency_distribution         {system}_latency_distribution
+    Owner-only distribution          plot_owner_latency_distribution   {system}_owner_latency_distribution
+    Owner p95 shift (dumbbell)       plot_owner_p95_dumbbell           {system}_owner_p95_dumbbell
     95th percentile comparison       plot_p95_comparison               {system}_p95_comparison
     Latency distribution (violin)    plot_latency_violin               {system}_latency_violin
     Degradation with CIs             plot_degradation                  {system}_degradation
@@ -18,15 +20,18 @@ other; that class of bug is why the mapping below is explicit.
 """
 
 import numpy as np
-from matplotlib.patches import Patch
+from matplotlib.collections import Collection
+from matplotlib.colors import to_rgb
+from matplotlib.patches import Patch, PathPatch
 
 from . import stats
-from matplotlib.ticker import FuncFormatter
 
 from .style import (
+    HATCH_LINEWIDTH,
     PLOT_DURATION_LIMIT,
     TICK_FONT_SIZE,
     categorical_xaxis,
+    log_scale,
     marker_size,
     legend_above,
     palette,
@@ -37,19 +42,38 @@ from .style import (
 # Shared outline for every filled mark — boxes, bars, violins — so the figures
 # read as one family. Previously the boxes carried a thin black outline and the
 # bars had none, which made them look like they came from different papers.
+#
+# 0.8 pt rather than the 0.4 pt used before: at 0.4 the outline vanished once the
+# figure was scaled into the column, and the boxes lost their edges in print.
 FILL_ALPHA = 0.8
-OUTLINE = {"edgecolor": "black", "linewidth": 0.4}
+OUTLINE = {"edgecolor": "black", "linewidth": 0.8}
+MEDIAN_LINE = {"color": "black", "linewidth": 1.2}
+
+# Box plots are shorter than the default figure because their legend sits above
+# the axes and `bbox_inches="tight"` grows the saved image to fit it. At the
+# default aspect the output came out taller than the legacy figures, which kept
+# the legend inside; this brings the saved image back to their proportions.
+BOX_PLOT_ASPECT_RATIO = 0.6
+
+# Hatches are drawn in a tint of their own fill, not in the outline's black. On a
+# dark fill such as the palette's blue, black strokes were nearly invisible, so
+# the redundant channel the hatching exists for was lost. A fill darker than
+# `HATCH_LUMINANCE_THRESHOLD` gets a light tint, a lighter one a dark shade, each
+# `HATCH_CONTRAST` of the way towards white or black.
+HATCH_LUMINANCE_THRESHOLD = 0.35
+HATCH_CONTRAST = 0.85
 
 # A second, redundant channel alongside colour, so the figures survive greyscale
 # printing and the common forms of colour blindness.
 #
-# Fine and dense rather than bold and sparse: a few thick strokes across a small
-# box read as competing content, while a close-set fine texture reads as a fill.
-# Stroke weight is set once via `style.HATCH_LINEWIDTH`; the repeat count here
-# controls only how close the strokes sit.
+# The repeat count sets how close the strokes sit and, for dots, how big each dot
+# is: matplotlib scales a dot with its spacing. Five repeats made stripes and dots
+# too fine to spot on a box a few millimetres wide in print. Stripes keep four so
+# a narrow box still shows several; dots drop to three so each is large enough to
+# see. Stroke weight is set once via `style.HATCH_LINEWIDTH`.
 #
 # Index matches the series order: baseline, owner, intruder.
-SERIES_HATCHES = ("", "/////", ".....")
+SERIES_HATCHES = ("", "////", "...")
 
 # Line figures get markers instead, thinned out so the line shape stays visible.
 LINE_MARKERS = ("o", "s", "^", "D", "v")
@@ -76,9 +100,36 @@ MARKER_STAGGER = 1.0
 
 # Order solutions consistently across every figure, weakest isolation first, so
 # the reader can compare panels without re-reading legends.
-DEFAULT_SOLUTION_ORDER = ["capsule", "capsule-proxy", "kubezoo", "vcluster", "kubevirt"]
+DEFAULT_SOLUTION_ORDER = [
+    "native",
+    "capsule",
+    "capsule-hardened",
+    "capsule-proxy",
+    "kubezoo",
+    "vcluster",
+    "kamaji",
+    "kubevirt",
+]
+
+
+def solution_sort_key(solution):
+    """Order a solution for display, tolerating names this list has never seen.
+
+    Known solutions keep the canonical order above; anything else follows,
+    alphabetically. That matters because the campaign now produces composed
+    labels — `native+gvisor`, `native+kata`, `capsule+calico` — and sorting
+    with `DEFAULT_SOLUTION_ORDER.index` raised `x not in list` on the first one
+    of them, which took out the whole analysis rather than one row.
+
+    A missing label is a naming question, not a reason to render nothing.
+    """
+    try:
+        return (0, DEFAULT_SOLUTION_ORDER.index(solution), "")
+    except ValueError:
+        return (1, 0, str(solution))
 
 DISPLAY_NAMES = {
+    "native": "Native",
     "capsule": "Capsule",
     "capsule-proxy": "Capsule\nProxy",
     "kubezoo": "KubeZoo",
@@ -108,6 +159,12 @@ SYSTEM_NAMES = {
 BASELINE_LABEL = "Baseline"
 OWNER_STRESS_LABEL = "Owner"
 INTRUDER_STRESS_LABEL = "Intruder"
+
+# The owner-only figures drop the intruder series, and with it the reason the
+# middle series was called "Owner": with nothing to distinguish it from, the
+# useful contrast is what the owner was subjected to, not who it is. Both series
+# are the same tenant at the same nominal rate — only the neighbour changed.
+INTERFERENCE_LABEL = "Interference"
 
 
 def figure_label(system, description):
@@ -258,7 +315,7 @@ def plot_latency_over_time(
             markevery=_marker_indices(centres, index, len(LINE_MARKERS)),
         )
 
-    ax.set_yscale("log")
+    log_scale(ax, "y")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Latency (ms)")
     legend_above(ax, ncol=3)
@@ -351,7 +408,7 @@ def plot_latency_transition(
 
     ax.axvline(baseline_seconds, color="black", linestyle="--", linewidth=0.5)
 
-    ax.set_yscale("log")
+    log_scale(ax, "y")
     # Floor at 1 ms where the data allows, matching the original control-plane
     # figure, but drop below it when a subsystem is faster than that. Storage
     # latencies are sub-millisecond, and a hardcoded floor of 1 put every point
@@ -368,11 +425,6 @@ def plot_latency_transition(
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Latency (ms)")
     ax.tick_params(axis="y", which="minor", left=True)
-
-    # Integer tick labels above 1 ms, one decimal below, as in the original.
-    ax.yaxis.set_major_formatter(
-        FuncFormatter(lambda value, _: f"{value:.1f}" if value < 1 else f"{int(value)}")
-    )
 
     # Name the two regimes: the vertical rule alone does not say which side is
     # which. Positioned in axes fraction on the y axis so the labels stay pinned
@@ -429,23 +481,61 @@ def _role_series(experiments, system, solutions):
 # the point: width and offset used to be two unrelated magic numbers picked per
 # figure, which silently left the box plot with a 0.04 gap and the bar plot with
 # 0.02 — different spacing in two figures meant to be read side by side.
-GROUP_PADDING = 0.25
+GROUP_PADDING = 0.2
 BAR_SPACING = 0.15
 
+#   MARK_WIDTH     how wide one box or bar is, as a fraction of the distance
+#                  between categories. THIS is the knob for "make the marks
+#                  wider": raise it, and the gap between groups shrinks to pay
+#                  for it. GROUP_PADDING above is now only the manual override.
+#
+# Width is primary and the between-group gap falls out of it, which is the
+# reverse of how this started. Deriving width from GROUP_PADDING tied it to the
+# series count: two marks sharing the pitch that GROUP_PADDING leaves came out
+# far wider than three did, so a two-series panel had boxes wider than the space
+# separating one pair from the next and the eye grouped whatever was adjacent.
+# It also left no direct way to ask for "wider" — only to lower a padding
+# constant and see what happened, which reads backwards.
+#
+# Fixing the width instead keeps marks identical across figures whatever their
+# series count, so a two-series panel and a three-series panel can be read side
+# by side, and puts the spare pitch into the between-group gap, which is the
+# separation that actually needs defending.
+MARK_WIDTH = 0.25
 
-def _grouped_positions(count, series=3, group_padding=GROUP_PADDING, bar_spacing=BAR_SPACING):
+# Floor on the between-group gap. Without it a figure with enough series derives
+# a group wider than the 1.0 pitch and adjacent groups overlap; past that point
+# the marks are squeezed rather than the gap.
+MIN_GROUP_PADDING = 0.1
+
+
+def _grouped_positions(
+    count,
+    series=3,
+    mark_width=None,
+    group_padding=None,
+    bar_spacing=BAR_SPACING,
+):
     """Centre positions for `series` side-by-side marks in each of `count` groups.
 
     Returns `(positions, mark_width)`, where `positions[i]` holds the centres of
     the i-th series. Categories sit 1.0 apart, so
 
-        group_width = 1 - group_padding
-                    = series * width + (series - 1) * bar_spacing * width
+        group_width = series * width + (series - 1) * bar_spacing * width
 
-    and solving for `width` keeps intra-group gaps equal by construction.
+    which keeps intra-group gaps equal by construction.
+
+    Width comes from `MARK_WIDTH` unless overridden: pass `mark_width` to set it
+    for one figure, or `group_padding` to pin the between-group gap instead and
+    let the width fall out of it, which is the original behaviour.
     """
-    group_width = 1.0 - group_padding
-    mark_width = group_width / (series + (series - 1) * bar_spacing)
+    span = series + (series - 1) * bar_spacing
+    if group_padding is not None:
+        group_width = 1.0 - group_padding
+    else:
+        width = MARK_WIDTH if mark_width is None else mark_width
+        group_width = min(1.0 - MIN_GROUP_PADDING, width * span)
+    mark_width = group_width / span
     gap = bar_spacing * mark_width
 
     first_offset = -group_width / 2 + mark_width / 2
@@ -456,6 +546,82 @@ def _grouped_positions(count, series=3, group_padding=GROUP_PADDING, bar_spacing
     return positions, mark_width
 
 
+def relative_luminance(color):
+    """WCAG relative luminance of `color`, from 0 for black to 1 for white."""
+    red, green, blue = (
+        channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+        for channel in to_rgb(color)
+    )
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def hatch_color(fill_color):
+    """Colour for hatching drawn over `fill_color`: a tint on dark fills, a shade on light ones."""
+    target = 1.0 if relative_luminance(fill_color) < HATCH_LUMINANCE_THRESHOLD else 0.0
+    return tuple(
+        channel + (target - channel) * HATCH_CONTRAST for channel in to_rgb(fill_color)
+    )
+
+
+OUTLINE_LAYER = {"facecolor": "none", **OUTLINE}
+
+
+def fill_style(color, hatch=""):
+    """Keyword arguments for the textured layer of a filled mark.
+
+    The hatch is stroked in the layer's own edge colour and width, because that
+    is the only hatch styling the PGF backend honours: it ignores `hatchcolor`
+    and `hatch.linewidth` and reuses the patch's stroke, which drew every hatch
+    in the outline's black. The layer's edge is then covered by `add_outline`.
+    """
+    return {
+        "facecolor": color,
+        "alpha": FILL_ALPHA,
+        "hatch": hatch,
+        "edgecolor": hatch_color(color),
+        "linewidth": HATCH_LINEWIDTH,
+    }
+
+
+def add_outline(ax, artist):
+    """Stroke the edge of `artist` with `OUTLINE`, on top of its textured layer."""
+    paths = artist.get_paths() if isinstance(artist, Collection) else [artist.get_path()]
+    for path in paths:
+        ax.add_patch(
+            PathPatch(
+                path,
+                transform=artist.get_transform(),
+                zorder=artist.get_zorder(),
+                **OUTLINE_LAYER,
+            )
+        )
+
+
+def legend_handle(color, hatch, label):
+    """Legend entry drawn like the mark it names: textured layer under its outline."""
+    return (Patch(label=label, **fill_style(color, hatch)), Patch(**OUTLINE_LAYER))
+
+
+def _draw_box_series(ax, series, positions, width, color, hatch, label):
+    """Draw one series of a grouped box plot and return its legend handle."""
+    data = [s if len(s) else np.array([np.nan]) for s in series]
+    box = ax.boxplot(
+        data,
+        positions=positions,
+        widths=width,
+        patch_artist=True,
+        showfliers=False,
+        medianprops=MEDIAN_LINE,
+        boxprops=OUTLINE,
+        whiskerprops={"linewidth": OUTLINE["linewidth"]},
+        capprops={"linewidth": OUTLINE["linewidth"]},
+    )
+    for patch in box["boxes"]:
+        patch.set(**fill_style(color, hatch))
+        add_outline(ax, patch)
+    return legend_handle(color, hatch, label)
+
+
 def plot_latency_distribution(experiments, system, out_dir="./", save=True):
     """Grouped box plot: baseline, regular under stress, intruder under stress.
 
@@ -464,46 +630,143 @@ def plot_latency_distribution(experiments, system, out_dir="./", save=True):
     its nominal rate while the intruder escalates — not the owner generating
     high load, which the original legend could be read as implying.
     """
-    fig, ax = paper_figure()
+    fig, ax = paper_figure(aspect_ratio=BOX_PLOT_ASPECT_RATIO)
     colors = palette()
     solutions = ordered_solutions(experiments)
     baseline, regular, malicious = _role_series(experiments, system, solutions)
     (left, centre, right), width = _grouped_positions(len(solutions), series=3)
 
-    handles = []
-    for index, (positions, series, color, label) in enumerate((
-        (left, baseline, colors[0], BASELINE_LABEL),
-        (centre, regular, colors[1], OWNER_STRESS_LABEL),
-        (right, malicious, colors[2], INTRUDER_STRESS_LABEL),
-    )):
-        hatch = SERIES_HATCHES[index % len(SERIES_HATCHES)]
-        data = [s if len(s) else np.array([np.nan]) for s in series]
-        box = ax.boxplot(
-            data,
-            positions=positions,
-            widths=width,
-            patch_artist=True,
-            showfliers=False,
-            medianprops={"color": "black", "linewidth": 0.6},
-            boxprops=OUTLINE,
-            whiskerprops={"linewidth": OUTLINE["linewidth"]},
-            capprops={"linewidth": OUTLINE["linewidth"]},
+    handles = [
+        _draw_box_series(
+            ax, series, positions, width, color,
+            SERIES_HATCHES[index % len(SERIES_HATCHES)], label,
         )
-        for patch in box["boxes"]:
-            patch.set_facecolor(color)
-            patch.set_alpha(FILL_ALPHA)
-            patch.set_hatch(hatch)
-        handles.append(
-            Patch(facecolor=color, alpha=FILL_ALPHA, hatch=hatch, label=label, **OUTLINE)
-        )
+        for index, (positions, series, color, label) in enumerate((
+            (left, baseline, colors[0], BASELINE_LABEL),
+            (centre, regular, colors[1], OWNER_STRESS_LABEL),
+            (right, malicious, colors[2], INTRUDER_STRESS_LABEL),
+        ))
+    ]
 
     categorical_xaxis(ax, np.arange(len(solutions)), [display_name(s) for s in solutions])
-    ax.set_yscale("log")
+    log_scale(ax, "y")
     ax.set_ylabel("Latency (ms)")
     legend_above(ax, ncol=3, handles=handles)
 
     if save:
         save_plot(fig, f"{out_dir}/{system}_latency_distribution")
+    return fig, ax
+
+
+def plot_owner_latency_distribution(experiments, system, out_dir="./", save=True):
+    """Grouped box plot of the owner alone: baseline against interference.
+
+    The same data as `plot_latency_distribution` with the intruder series
+    dropped. That series answers a different question — how much load the
+    attacker sustained — and on a shared log axis it dominates the scale, since
+    an intruder running 10x to 20x the owner's rate sits an order of magnitude
+    higher. Removing it lets the axis resolve the shift this paper is actually
+    claiming, which is what happened to the *victim*.
+
+    Both boxes are the same tenant issuing the same nominal rate. Only the
+    neighbour differs, which is why they are labelled by phase.
+    """
+    fig, ax = paper_figure(aspect_ratio=BOX_PLOT_ASPECT_RATIO)
+    colors = palette()
+    solutions = ordered_solutions(experiments)
+    baseline, regular, _ = _role_series(experiments, system, solutions)
+    (left, right), width = _grouped_positions(len(solutions), series=2)
+
+    handles = [
+        _draw_box_series(
+            ax, series, positions, width, color,
+            SERIES_HATCHES[index % len(SERIES_HATCHES)], label,
+        )
+        for index, (positions, series, color, label) in enumerate((
+            (left, baseline, colors[0], BASELINE_LABEL),
+            (right, regular, colors[1], INTERFERENCE_LABEL),
+        ))
+    ]
+
+    categorical_xaxis(ax, np.arange(len(solutions)), [display_name(s) for s in solutions])
+    log_scale(ax, "y")
+    ax.set_ylabel("Latency (ms)")
+    legend_above(ax, ncol=2, handles=handles)
+
+    if save:
+        save_plot(fig, f"{out_dir}/{system}_owner_latency_distribution")
+    return fig, ax
+
+
+# Dumbbell geometry. The connector carries the meaning — its length *is* the
+# degradation — so it is drawn under the markers and thick enough to read at
+# single-column width without competing with them.
+DUMBBELL_LINE_WIDTH = 1.2
+DUMBBELL_MARKER = "o"
+
+
+def plot_owner_p95_dumbbell(experiments, system, out_dir="./", save=True):
+    """Owner p95 latency, baseline to interference, one connector per solution.
+
+    The box-plot pair above shows both distributions; this shows only where each
+    one's tail landed and how far it moved. Two marks joined by a line encode a
+    before/after shift more directly than two bars do: the bars share no visual
+    connection, so the reader compares heights across a gap, whereas here the
+    quantity of interest — the distance — is drawn.
+
+    Horizontal, because solution names are long enough to need rotating on an
+    x-axis and the connectors then run vertically, which reads as a bar chart
+    with extra steps. Laid out with the same ordering as every other figure, so
+    a solution keeps its position across panels.
+    """
+    fig, ax = paper_figure()
+    colors = palette()
+    solutions = ordered_solutions(experiments)
+    baseline, regular, _ = _role_series(experiments, system, solutions)
+
+    percentile = lambda values: np.percentile(values, 95) if len(values) else np.nan
+    starts = np.array([percentile(s) for s in baseline])
+    ends = np.array([percentile(s) for s in regular])
+
+    # Top-to-bottom in the canonical order: matplotlib's y-axis grows upward, so
+    # without the flip the first solution lands at the bottom and the figure
+    # reads in the opposite order to every other panel.
+    rows = np.arange(len(solutions))[::-1]
+
+    for row, start, end in zip(rows, starts, ends):
+        if np.isnan(start) or np.isnan(end):
+            continue
+        ax.plot(
+            [start, end], [row, row],
+            color="black", linewidth=DUMBBELL_LINE_WIDTH,
+            solid_capstyle="round", zorder=1,
+        )
+
+    size = marker_size(DUMBBELL_MARKER)
+    for values, color, label in (
+        (starts, colors[0], BASELINE_LABEL),
+        (ends, colors[1], INTERFERENCE_LABEL),
+    ):
+        ax.scatter(
+            values, rows,
+            s=size ** 2, color=color, label=label,
+            edgecolor=OUTLINE["edgecolor"], linewidth=OUTLINE["linewidth"],
+            zorder=2, clip_on=False,
+        )
+
+    ax.set_yticks(rows)
+    ax.set_yticklabels(
+        [display_name(s).replace("\n", " ") for s in solutions], fontsize=TICK_FONT_SIZE
+    )
+    ax.set_ylim(-0.1, len(solutions) - 0.4)
+    log_scale(ax, "x")
+    ax.set_xlabel("p95 latency (ms)")
+    ax.grid(axis="x", linewidth=0.3, alpha=0.5)
+    ax.set_axisbelow(True)
+    legend_above(ax, ncol=2)
+
+    if save:
+        save_plot(fig, f"{out_dir}/{system}_owner_p95_dumbbell")
     return fig, ax
 
 
@@ -519,21 +782,22 @@ def plot_p95_comparison(experiments, system, out_dir="./", save=True):
         np.percentile(s, 95) if len(s) else np.nan for s in series
     ]
 
+    handles = []
     for index, (positions, series, color, label) in enumerate((
         (left, baseline, colors[0], BASELINE_LABEL),
         (centre, regular, colors[1], OWNER_STRESS_LABEL),
         (right, malicious, colors[2], INTRUDER_STRESS_LABEL),
     )):
-        ax.bar(
-            positions, percentile(series), width=width,
-            color=color, alpha=FILL_ALPHA, label=label,
-            hatch=SERIES_HATCHES[index % len(SERIES_HATCHES)], **OUTLINE,
-        )
+        hatch = SERIES_HATCHES[index % len(SERIES_HATCHES)]
+        bars = ax.bar(positions, percentile(series), width=width, **fill_style(color, hatch))
+        for bar in bars:
+            add_outline(ax, bar)
+        handles.append(legend_handle(color, hatch, label))
 
     categorical_xaxis(ax, np.arange(len(solutions)), [display_name(s) for s in solutions])
-    ax.set_yscale("log")
+    log_scale(ax, "y")
     ax.set_ylabel("p95 latency (ms)")
-    legend_above(ax, ncol=3)
+    legend_above(ax, ncol=3, handles=handles)
 
     if save:
         save_plot(fig, f"{out_dir}/{system}_p95_comparison")
@@ -561,14 +825,9 @@ def plot_latency_violin(experiments, system, out_dir="./", save=True):
         data = [np.log10(s[s > 0]) if len(s[s > 0]) else np.array([0.0]) for s in series]
         parts = ax.violinplot(data, positions=series_positions, widths=width, showextrema=False)
         for body in parts["bodies"]:
-            body.set_facecolor(color)
-            body.set_alpha(FILL_ALPHA)
-            body.set_edgecolor(OUTLINE["edgecolor"])
-            body.set_linewidth(OUTLINE["linewidth"])
-            body.set_hatch(hatch)
-        handles.append(
-            Patch(facecolor=color, alpha=FILL_ALPHA, hatch=hatch, label=label, **OUTLINE)
-        )
+            body.set(**fill_style(color, hatch))
+            add_outline(ax, body)
+        handles.append(legend_handle(color, hatch, label))
 
     categorical_xaxis(ax, positions, [display_name(s) for s in solutions])
     ax.set_ylabel(r"$\log_{10}$ latency (ms)")
@@ -605,18 +864,17 @@ def plot_degradation(measurements, system, out_dir="./", save=True):
     sustained_color, throttled_color = colors[0], colors[1]
     throttled_hatch = SERIES_HATCHES[1]
 
-    bar_colors = [throttled_color if m.owner_throttled else sustained_color for m in rows]
-    bars = ax.bar(
-        positions, values, yerr=[lower, upper], capsize=1.5,
-        color=bar_colors, alpha=FILL_ALPHA, **OUTLINE,
-    )
+    bars = ax.bar(positions, values, yerr=[lower, upper], capsize=1.5)
     for bar, measurement in zip(bars, rows):
         if measurement.owner_throttled:
-            bar.set_hatch(throttled_hatch)
+            bar.set(**fill_style(throttled_color, throttled_hatch))
+        else:
+            bar.set(**fill_style(sustained_color))
+        add_outline(ax, bar)
 
     ax.axhline(1.0, color="grey", linewidth=0.5, linestyle="--")
     categorical_xaxis(ax, positions, [display_name(m.solution) for m in rows])
-    ax.set_yscale("log")
+    log_scale(ax, "y")
     ax.set_ylabel(r"Degradation factor $\delta$")
 
     # Without this the hatching is unexplained, and the hatched bars are exactly
@@ -625,10 +883,8 @@ def plot_degradation(measurements, system, out_dir="./", save=True):
         ax,
         ncol=1,
         handles=[
-            Patch(facecolor=sustained_color, alpha=FILL_ALPHA,
-                  label="Rate sustained", **OUTLINE),
-            Patch(facecolor=throttled_color, alpha=FILL_ALPHA, hatch=throttled_hatch,
-                  label=r"Owner throttled", **OUTLINE),
+            legend_handle(sustained_color, "", "Rate sustained"),
+            legend_handle(throttled_color, throttled_hatch, "Owner throttled"),
         ],
     )
 

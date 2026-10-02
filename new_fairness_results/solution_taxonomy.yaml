@@ -1,0 +1,113 @@
+# How each solution classifies under the paper's tenancy taxonomy.
+#
+# Hand-authored, and it has to be: the taxonomy is a definition made in the
+# journal submission, not a property the code can be asked about. Two solutions
+# can provision identically and still sit in different classes depending on
+# where the paper draws the line, so inferring this from the provisioner would
+# be inventing an answer rather than recording one.
+#
+# >>> PLACEHOLDER <<<
+# The values below were reconstructed from src/cluster/builder.rs and must be
+# replaced with the classification given in the submission before any table
+# generated from this file is quoted. The rule applied here was: a tenant whose
+# API server is a workload running on the shared host cluster is
+# partially-shared; only a control plane on its own kernel is dedicated.
+# Cite the section once that is settled:
+#
+#   Source: <journal submission, Sec. N, Table N>
+#
+# Classes, as used by build_comparison_table.py:
+#
+#   shared             one API server, the tenant is a namespace under RBAC
+#   partially-shared   the tenant gets its own API endpoint, but it is served
+#                      by the host cluster (a proxy, a gateway, or a control
+#                      plane running as a workload on it)
+#   dedicated          the tenant's control plane runs on its own kernel
+#
+# `build_paper_csv.py` additionally reads three presentational keys per
+# solution, all optional and all blank until someone fills them in:
+#
+#   display_name   overrides the label used in the figures
+#   version        the version evaluated — left blank deliberately, because
+#                  guessing it would put a number in the paper that no run
+#                  recorded
+#   strategy       one short phrase per section (control/storage/network/
+#                  workload), e.g. `control: RBAC`. A claim the paper makes
+#                  about the mechanism, not something measurable, so it is
+#                  written here rather than inferred.
+#
+# `data_plane` is classified separately from `control_plane` on purpose: almost
+# every solution that isolates the control plane still schedules tenant pods
+# onto shared nodes, and that asymmetry is the reason the data plane has to be
+# measured rather than assumed.
+
+version: 1
+
+classes: [shared, partially-shared, dedicated]
+
+solutions:
+  native:
+    control_plane: shared
+    data_plane: shared
+    note: >
+      No isolation at all — the tenant reuses the host admin kubeconfig
+      (builder.rs:722). Included as the floor of the comparison.
+
+  capsule:
+    control_plane: shared
+    data_plane: shared
+    note: >
+      One API server. The tenant is a client certificate (CN=<tenant>-admin)
+      scoped by a Capsule Tenant CR (builder.rs:492).
+
+  capsule-hardened:
+    control_plane: shared
+    data_plane: shared
+    note: >
+      The same Capsule at the same version as `capsule`, differing only in the
+      Tenant CR: Pod Security Admission labels, compute and object quotas,
+      NodePort forbidden, imagePullPolicy pinned to Always
+      (builder.rs, capsule_tenant_spec). The taxonomy class is deliberately
+      identical, because none of that changes where the tenant runs — it is one
+      API server and shared nodes either way. Any difference a tool reports
+      between this row and `capsule` is a difference in policy configuration,
+      not in tenancy architecture, which is exactly what the pair exists to
+      show.
+
+  capsule-proxy:
+    control_plane: shared
+    data_plane: shared
+    note: >
+      Same identity as capsule, reached through the capsule-proxy NodePort
+      (builder.rs:412). The proxy filters responses but does not terminate the
+      request on a separate API server, so this stays shared.
+
+  kubezoo:
+    control_plane: partially-shared
+    data_plane: shared
+    note: >
+      A gateway presents a per-tenant API endpoint and rewrites objects onto one
+      upstream cluster. The only partially-shared case that is not a virtual
+      API server, which makes it the run that genuinely tests that row.
+
+  vcluster:
+    control_plane: partially-shared
+    data_plane: shared
+    note: >
+      The tenant's API server is a StatefulSet on the host cluster
+      (builder.rs:574); its pods are synced down and run on the host's nodes.
+
+  kamaji:
+    control_plane: partially-shared
+    data_plane: shared
+    note: >
+      A hosted control plane — a TenantControlPlane object served by the
+      management cluster (builder.rs:1176), with worker capacity shared.
+
+  kubevirt:
+    control_plane: dedicated
+    data_plane: dedicated
+    note: >
+      A real kubeadm cluster inside VMs (provisioner/kubevirt). The tenant's
+      control plane and its workloads run on their own kernel, which is why it
+      is the only solution where the workload probe can report Hard.

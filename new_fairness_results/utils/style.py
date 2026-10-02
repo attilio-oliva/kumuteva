@@ -18,7 +18,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import markers
-from matplotlib.ticker import NullLocator
+from matplotlib.ticker import LogFormatter, NullLocator
 import scienceplots  # noqa: F401  (registers the 'science' styles on import)
 from cycler import cycler
 
@@ -27,9 +27,12 @@ SINGLE_COLUMN_WIDTH_IN = 3.31314
 DEFAULT_ASPECT_RATIO = 6 / 8
 DEFAULT_DPI = 300
 
-# Seconds of each phase to plot. The stress phase runs longer than this; the
-# published figures crop to the first minute.
-PLOT_DURATION_LIMIT = 60
+# Seconds of each phase to plot, matching `testDurationSeconds` in
+# experiments/campaign.yaml. This is a crop, not a window into a longer run: set
+# above the phase length the x-axis simply ends early with dead space, and set
+# below it the figure silently hides the tail. It was 60 while the campaign ran
+# 60 s phases; the campaign now runs 30.
+PLOT_DURATION_LIMIT = 30
 
 # Font sizes are given as matplotlib's relative keywords rather than points.
 # They scale off `font.size`, which the IEEE style sets to 8 pt, so the figures
@@ -54,12 +57,12 @@ _SCIENCEPLOTS_STYLES = ["science", "ieee", "vibrant"]
 _DROPPED_COLOR_INDEX = 3
 
 
-# Hatch stroke width. Matplotlib defaults to 1.0 pt, which is more than twice
-# the 0.4 pt outline these figures use, so hatching drew as a set of heavy bars
-# competing with the data. Matching the outline weight makes the fill read as
-# texture. Note this is independent of density: how *close* the strokes sit is
-# the repeat count in the hatch string ("//" vs "////"), not this.
-HATCH_LINEWIDTH = 0.3
+# Hatch stroke width. Matplotlib defaults to 1.0 pt, which drew hatching as a set
+# of heavy bars competing with the data. Matched to the 0.8 pt outline: finer
+# strokes, especially light ones on a dark fill, disappeared once the figure was
+# printed at column width. Note this is independent of density: how *close* the
+# strokes sit is the repeat count in the hatch string ("//" vs "////"), not this.
+HATCH_LINEWIDTH = 0.8
 
 # Marker sizing. `MARKER_REFERENCE_SIZE` is the markersize of a square; every
 # other shape is scaled to look like it. `MARKER_AREA_WEIGHT` picks how that
@@ -207,6 +210,57 @@ def marker_size(marker, reference=None, area_weight=None):
     )
 
 
+def plain_log_label(value, _=None):
+    """Format a log-axis tick as a number: 10, 100, 1000 — not 10^1, 10^2.
+
+    Powers-of-ten notation costs the reader a mental exponentiation on every
+    glance, which is a poor trade when the values are latencies in milliseconds
+    and the interesting comparisons are ratios between neighbouring ticks.
+
+    Below 1 the value is printed at its natural precision (`0.5`, `0.1`,
+    `0.05`) rather than rounded to zero, since the network subsystem's
+    sub-millisecond ticks are exactly where rounding would erase the axis.
+    """
+    if value <= 0:
+        return ""
+    return f"{value:.0f}" if value >= 1 else f"{value:g}"
+
+
+class PlainLogFormatter(LogFormatter):
+    """`LogFormatter` that writes 10, 100, 1000 instead of 10^1, 10^2, 10^3.
+
+    Subclassed rather than replaced with a plain `FuncFormatter`, because the
+    exponent is not the only thing `LogFormatter` decides. It also chooses
+    *which* minor ticks deserve a label: none across a wide range, a few (2, 5)
+    when the axis spans about a decade, more when it spans less. A
+    `FuncFormatter` has no such logic and labels every tick it is handed —
+    which on a four-decade latency axis stacks 2,3,4...9 in every decade into an
+    unreadable smear.
+
+    Overriding `_num_to_string` keeps that selection intact and changes only the
+    notation, so both major and minor ticks can use one formatter.
+    """
+
+    def _num_to_string(self, x, vmin, vmax):
+        return plain_log_label(x)
+
+
+def log_scale(ax, axis="y"):
+    """Put `axis` on a log scale with plain-number ticks.
+
+    One call rather than `set_yscale` plus a formatter, because the two were
+    only ever correct together: a bare `set_yscale("log")` reverts the axis to
+    `10^n` labels, and that is how one figure ends up in a different notation
+    from the rest of the paper.
+    """
+    for name in axis:
+        target = ax.yaxis if name == "y" else ax.xaxis
+        (ax.set_yscale if name == "y" else ax.set_xscale)("log")
+        target.set_major_formatter(PlainLogFormatter())
+        target.set_minor_formatter(PlainLogFormatter(labelOnlyBase=False))
+    return ax
+
+
 def categorical_xaxis(ax, positions, labels, fontsize=TICK_FONT_SIZE):
     """Label a categorical x-axis: one major tick per category, no minor ticks.
 
@@ -230,10 +284,18 @@ def legend_above(ax, ncol=3, handles=None, fontsize=LEGEND_FONT_SIZE):
 
     Pass `handles` for figures whose marks are not legend-able on their own
     (box plots and violins), so every figure routes through one implementation
-    rather than repeating this keyword list inline.
+    rather than repeating this keyword list inline. A handle may be a tuple of
+    artists drawn on top of each other, labelled by its first artist.
     """
+    entries = {}
+    if handles is not None:
+        entries["handles"] = handles
+        entries["labels"] = [
+            (handle[0] if isinstance(handle, tuple) else handle).get_label()
+            for handle in handles
+        ]
     return ax.legend(
-        **({"handles": handles} if handles is not None else {}),
+        **entries,
         loc="lower center",
         bbox_to_anchor=(0.5, 1.02),
         ncol=ncol,
