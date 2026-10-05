@@ -17,7 +17,7 @@
 #   subsystem      owner            intruder          unit
 #   control plane    150              1,500            req/s
 #   storage       10,000            100,000            IOPS
-#   network       15,625            156,250            pkt/s  (125 Mbps -> 1.25 Gbps one-way)
+#   network       12,500            125,000            pkt/s  (100 Mbps -> 1.0 Gbps one-way)
 #   workload           5                 50            req/s
 #
 # For storage, network and workload `rate` is *per pod or pair*, so the total
@@ -28,7 +28,7 @@ apiVersion: v1
 
 global:
   baselineDurationSeconds: 30
-  testDurationSeconds: 60
+  testDurationSeconds: 30
 
   # Never `unlimited`: that makes the rate limiter a no-op and every rate below
   # is silently ignored, which is how the first campaign ended up unable to
@@ -75,11 +75,13 @@ global:
 
 controlPlane:
   enabled: true
-  rate: 150.0
-  # Owner: 5 workers at 30 req/s = 150. Intruder: 5 x 10 = 50 workers, still
-  # 30 req/s each, totalling 1500. That per-worker figure is roughly 5% of what
+  rate: 100.0
+  # Owner: 5 workers at 20 req/s = 100. Intruder: 5 x 20 = 100 workers, still
+  # 20 req/s each, totalling 2000. That per-worker figure is roughly 5% of what
   # a single blocking worker can sustain, so the schedule is never the limit.
   requesters: 5
+  # 20x rather than the global 10x to reach 2000 req/s total, which is the 10x escalation of the owner at 200 req/s. The
+  podMultiplier: 20.0
 
 storage:
   enabled: true
@@ -95,13 +97,13 @@ storage:
 
 network:
   enabled: true
-  # 125 Mbps one-way at a 1000-byte payload: 125e6 / 8 / 1000 = 15,625 pkt/s.
-  # The probe is an echo, so the link carries twice this. The paper quotes the
-  # one-way figure and should say so.
-  rate: 15625.0
+  # 150 Mbps one-way at a 1000-byte payload: 150e6 / 8 / 1000 = 18750 pkt/s.
+  # The probe is an echo, so the link carries twice this (300 Mbps).
+  rate: 18750.0
   packetSizeBytes: 1000
   streams: 5
   podPairs: 1
+  
 
 workload:
   enabled: true
